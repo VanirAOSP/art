@@ -207,7 +207,7 @@ class Dex2Oat {
       LOG(ERROR) << "Failed to open zip file " << zip_filename;
       return NULL;
     }
-    UniquePtr<ZipEntry> zip_entry(zip_archive->Find(image_classes_filename));
+    UniquePtr<ZipEntry> zip_entry(zip_archive->Find(image_classes_filename, error_msg));
     if (zip_entry.get() == NULL) {
       LOG(ERROR) << "Failed to find " << image_classes_filename << " within " << zip_filename;
       return NULL;

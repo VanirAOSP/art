@@ -76,7 +76,7 @@ static jstring VMClassLoader_getBootClassPathResource(JNIEnv* env, jclass, jstri
   if (zip_archive.get() == NULL) {
     return NULL;
   }
-  UniquePtr<ZipEntry> zip_entry(zip_archive->Find(name.c_str()));
+  UniquePtr<ZipEntry> zip_entry(zip_archive->Find(name.c_str(), &error_msg));
   if (zip_entry.get() == NULL) {
     return NULL;
   }
