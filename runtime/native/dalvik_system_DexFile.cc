@@ -102,7 +102,6 @@ static jint DexFile_openDexFileNative(JNIEnv* env, jclass, jstring javaSourceNam
     ThrowLocation throw_location = soa.Self()->GetCurrentLocationForThrow();
     soa.Self()->ThrowNewExceptionF(throw_location, "Ljava/io/IOException;",
                                    "Unable to get checksum of dex file: %s", dex_location.c_str());
-    return 0;
   }
 
   ClassLinker* linker = Runtime::Current()->GetClassLinker();
