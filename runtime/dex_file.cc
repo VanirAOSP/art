@@ -537,21 +537,19 @@ bool DexFile::CreateTypeList(uint16_t* return_type_idx, std::vector<uint16_t>* p
   size_t end = signature.size();
   bool process_return = false;
   while (offset < end) {
+    size_t start_offset = offset;
     char c = signature[offset];
     offset++;
     if (c == ')') {
       process_return = true;
       continue;
     }
-    std::string descriptor;
-    descriptor += c;
     while (c == '[') {  // process array prefix
       if (offset >= end) {  // expect some descriptor following [
         return false;
       }
       c = signature[offset];
       offset++;
-      descriptor += c;
     }
     if (c == 'L') {  // process type descriptors
       do {
@@ -560,9 +558,10 @@ bool DexFile::CreateTypeList(uint16_t* return_type_idx, std::vector<uint16_t>* p
         }
         c = signature[offset];
         offset++;
-        descriptor += c;
       } while (c != ';');
     }
+    // TODO: avoid creating a std::string just to get a 0-terminated char array
+    std::string descriptor(signature.data() + start_offset, offset - start_offset);
     const DexFile::StringId* string_id = FindStringId(descriptor.c_str());
     if (string_id == NULL) {
       return false;
