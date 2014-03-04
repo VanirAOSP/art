@@ -27,7 +27,7 @@ ANDROID_COMMON_MK = true
 # Beware that tests may use the non-debug build for performance, notable 055-enum-performance
 #
 ART_BUILD_TARGET_NDEBUG ?= true
-ART_BUILD_TARGET_DEBUG ?= true
+ART_BUILD_TARGET_DEBUG ?= false
 ART_BUILD_HOST_NDEBUG ?= $(WITH_HOST_DALVIK)
 ART_BUILD_HOST_DEBUG ?= $(WITH_HOST_DALVIK)
 
