@@ -498,7 +498,7 @@ class ClassLinker {
       LOCKS_EXCLUDED(dex_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   const OatFile* FindOpenedOatFileFromDexLocation(const std::string& dex_location,
-                                                  const uint32_t* const dex_location_checksum)
+                                                  uint32_t dex_location_checksum)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_, dex_lock_);
   const OatFile* FindOpenedOatFileFromOatLocation(const std::string& oat_location)
       SHARED_LOCKS_REQUIRED(dex_lock_);

@@ -37,8 +37,8 @@ class MemMap;
 
 class ZipEntry {
  public:
-  bool ExtractToFile(File& file, std::string* error_msg);
-  MemMap* ExtractToMemMap(const char* entry_filename, std::string* error_msg);
+  bool ExtractToFile(File& file);
+  MemMap* ExtractToMemMap(const char* entry_filename);
 
   uint32_t GetUncompressedLength();
   uint32_t GetCrc32();
@@ -57,10 +57,10 @@ class ZipEntry {
 class ZipArchive {
  public:
   // return new ZipArchive instance on success, NULL on error.
-  static ZipArchive* Open(const char* filename, std::string* error_msg);
-  static ZipArchive* OpenFromFd(int fd, const char* filename, std::string* error_msg);
+  static ZipArchive* Open(const char* filename);
+  static ZipArchive* OpenFromFd(int fd, const char* filename);
 
-  ZipEntry* Find(const char* name, std::string* error_msg) const;
+  ZipEntry* Find(const char* name) const;
 
   ~ZipArchive() {
     CloseArchive(handle_);

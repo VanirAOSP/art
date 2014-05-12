@@ -675,12 +675,12 @@ const OatFile* ClassLinker::FindOpenedOatFileForDexFile(const DexFile& dex_file)
 }
 
 const OatFile* ClassLinker::FindOpenedOatFileFromDexLocation(const std::string& dex_location,
-                                                             const uint32_t* const dex_location_checksum) {
+                                                             uint32_t dex_location_checksum) {
   for (size_t i = 0; i < oat_files_.size(); i++) {
     const OatFile* oat_file = oat_files_[i];
     DCHECK(oat_file != NULL);
     const OatFile::OatDexFile* oat_dex_file = oat_file->GetOatDexFile(dex_location,
-                                                                      dex_location_checksum,
+                                                                      &dex_location_checksum,
                                                                       false);
     if (oat_dex_file != NULL) {
       return oat_file;

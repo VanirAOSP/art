@@ -202,12 +202,12 @@ class Dex2Oat {
   // Reads the class names (java.lang.Object) and returns a set of descriptors (Ljava/lang/Object;)
   CompilerDriver::DescriptorSet* ReadImageClassesFromZip(const std::string& zip_filename,
                                                          const char* image_classes_filename) {
-    UniquePtr<ZipArchive> zip_archive(ZipArchive::Open(zip_filename));
+    UniquePtr<ZipArchive> zip_archive(ZipArchive::Open(zip_filename.c_str()));
     if (zip_archive.get() == NULL) {
       LOG(ERROR) << "Failed to open zip file " << zip_filename;
       return NULL;
     }
-    UniquePtr<ZipEntry> zip_entry(zip_archive->Find(image_classes_filename, error_msg));
+    UniquePtr<ZipEntry> zip_entry(zip_archive->Find(image_classes_filename));
     if (zip_entry.get() == NULL) {
       LOG(ERROR) << "Failed to find " << image_classes_filename << " within " << zip_filename;
       return NULL;
@@ -416,7 +416,6 @@ static size_t OpenDexFiles(const std::vector<const char*>& dex_filenames,
   for (size_t i = 0; i < dex_filenames.size(); i++) {
     const char* dex_filename = dex_filenames[i];
     const char* dex_location = dex_locations[i];
-    std::string error_msg;
     if (!OS::FileExists(dex_filename)) {
       LOG(WARNING) << "Skipping non-existent dex file '" << dex_filename << "'";
       continue;
@@ -907,7 +906,7 @@ static int dex2oat(int argc, char** argv) {
     dex_files = Runtime::Current()->GetClassLinker()->GetBootClassPath();
   } else {
     if (dex_filenames.empty()) {
-      UniquePtr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(zip_fd));
+      UniquePtr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(zip_fd, image_classes_zip_filename));
       if (zip_archive.get() == NULL) {
         LOG(ERROR) << "Failed to open zip from file descriptor for " << zip_location;
         return EXIT_FAILURE;
