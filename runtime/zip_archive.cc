@@ -123,7 +123,7 @@ ZipEntry* ZipArchive::Find(const char* name) const {
   UniquePtr< ::ZipEntry> zip_entry(new ::ZipEntry);
   const int32_t error = FindEntry(handle_, name, zip_entry.get());
   if (error) {
-    PLOG(WARNING) << "ZipEntry: failed to Find " << std::string(ErrorCodeString(error));
+    PLOG(WARNING) << "ZipEntry: failed to Find " << name << " (" << std::string(ErrorCodeString(error)) << ")";
     return nullptr;
   }
 
