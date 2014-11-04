@@ -18,7 +18,7 @@
 
 #include "base/mutex.h"
 #include "runtime.h"
-#include "thread.h"
+#include "thread-inl.h"
 #include "UniquePtr.h"
 #include "utils.h"
 
@@ -26,12 +26,14 @@ namespace art {
 
 LogVerbosity gLogVerbosity;
 
+std::vector<std::string> gVerboseMethods;
+
 unsigned int gAborting = 0;
 
 static LogSeverity gMinimumLogSeverity = INFO;
-static UniquePtr<std::string> gCmdLine;
-static UniquePtr<std::string> gProgramInvocationName;
-static UniquePtr<std::string> gProgramInvocationShortName;
+static std::unique_ptr<std::string> gCmdLine;
+static std::unique_ptr<std::string> gProgramInvocationName;
+static std::unique_ptr<std::string> gProgramInvocationShortName;
 
 const char* GetCmdLine() {
   return (gCmdLine.get() != nullptr) ? gCmdLine->c_str() : nullptr;
@@ -159,92 +161,6 @@ LogMessage::~LogMessage() {
   if (data_->severity == FATAL) {
     Runtime::Abort();
   }
-}
-
-HexDump::HexDump(const void* address, size_t byte_count, bool show_actual_addresses)
-    : address_(address), byte_count_(byte_count), show_actual_addresses_(show_actual_addresses) {
-}
-
-void HexDump::Dump(std::ostream& os) const {
-  if (byte_count_ == 0) {
-    return;
-  }
-
-  if (address_ == NULL) {
-    os << "00000000:";
-    return;
-  }
-
-  static const char gHexDigit[] = "0123456789abcdef";
-  const unsigned char* addr = reinterpret_cast<const unsigned char*>(address_);
-  char out[76];           /* exact fit */
-  unsigned int offset;    /* offset to show while printing */
-
-  if (show_actual_addresses_) {
-    offset = reinterpret_cast<int>(addr);
-  } else {
-    offset = 0;
-  }
-  memset(out, ' ', sizeof(out)-1);
-  out[8] = ':';
-  out[sizeof(out)-1] = '\0';
-
-  size_t byte_count = byte_count_;
-  int gap = static_cast<int>(offset & 0x0f);
-  while (byte_count) {
-    unsigned int line_offset = offset & ~0x0f;
-
-    char* hex = out;
-    char* asc = out + 59;
-
-    for (int i = 0; i < 8; i++) {
-      *hex++ = gHexDigit[line_offset >> 28];
-      line_offset <<= 4;
-    }
-    hex++;
-    hex++;
-
-    int count = std::min(static_cast<int>(byte_count), 16 - gap);
-    CHECK_NE(count, 0);
-    CHECK_LE(count + gap, 16);
-
-    if (gap) {
-      /* only on first line */
-      hex += gap * 3;
-      asc += gap;
-    }
-
-    int i;
-    for (i = gap ; i < count+gap; i++) {
-      *hex++ = gHexDigit[*addr >> 4];
-      *hex++ = gHexDigit[*addr & 0x0f];
-      hex++;
-      if (*addr >= 0x20 && *addr < 0x7f /*isprint(*addr)*/) {
-        *asc++ = *addr;
-      } else {
-        *asc++ = '.';
-      }
-      addr++;
-    }
-    for (; i < 16; i++) {
-      /* erase extra stuff; only happens on last line */
-      *hex++ = ' ';
-      *hex++ = ' ';
-      hex++;
-      *asc++ = ' ';
-    }
-
-    os << out;
-
-    gap = 0;
-    byte_count -= count;
-    offset += count;
-  }
-}
-
-std::ostream& operator<<(std::ostream& os, const HexDump& rhs) {
-  rhs.Dump(os);
-  return os;
 }
 
 }  // namespace art

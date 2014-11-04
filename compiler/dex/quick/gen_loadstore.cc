@@ -27,7 +27,7 @@ namespace art {
  * Load an immediate value into a fixed or temp register.  Target
  * register is clobbered, and marked in_use.
  */
-LIR* Mir2Lir::LoadConstant(int r_dest, int value) {
+LIR* Mir2Lir::LoadConstant(RegStorage r_dest, int value) {
   if (IsTemp(r_dest)) {
     Clobber(r_dest);
     MarkInUse(r_dest);
@@ -40,7 +40,7 @@ LIR* Mir2Lir::LoadConstant(int r_dest, int value) {
  * promoted floating point register, also copy a zero into the int/ref identity of
  * that sreg.
  */
-void Mir2Lir::Workaround7250540(RegLocation rl_dest, int zero_reg) {
+void Mir2Lir::Workaround7250540(RegLocation rl_dest, RegStorage zero_reg) {
   if (rl_dest.fp) {
     int pmap_index = SRegToPMap(rl_dest.s_reg_low);
     if (promotion_map_[pmap_index].fp_location == kLocPhysReg) {
@@ -55,33 +55,24 @@ void Mir2Lir::Workaround7250540(RegLocation rl_dest, int zero_reg) {
       if (!used_as_reference) {
         return;
       }
-      int temp_reg = zero_reg;
-      if (temp_reg == INVALID_REG) {
+      RegStorage temp_reg = zero_reg;
+      if (!temp_reg.Valid()) {
         temp_reg = AllocTemp();
         LoadConstant(temp_reg, 0);
       }
       if (promotion_map_[pmap_index].core_location == kLocPhysReg) {
         // Promoted - just copy in a zero
-        OpRegCopy(promotion_map_[pmap_index].core_reg, temp_reg);
+        OpRegCopy(RegStorage::Solo32(promotion_map_[pmap_index].core_reg), temp_reg);
       } else {
         // Lives in the frame, need to store.
-        StoreBaseDisp(TargetReg(kSp), SRegOffset(rl_dest.s_reg_low), temp_reg, kWord);
+        ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+        StoreBaseDisp(TargetPtrReg(kSp), SRegOffset(rl_dest.s_reg_low), temp_reg, k32, kNotVolatile);
       }
-      if (zero_reg == INVALID_REG) {
+      if (!zero_reg.Valid()) {
         FreeTemp(temp_reg);
       }
     }
   }
-}
-
-/* Load a word at base + displacement.  Displacement must be word multiple */
-LIR* Mir2Lir::LoadWordDisp(int rBase, int displacement, int r_dest) {
-  return LoadBaseDisp(rBase, displacement, r_dest, kWord,
-                      INVALID_SREG);
-}
-
-LIR* Mir2Lir::StoreWordDisp(int rBase, int displacement, int r_src) {
-  return StoreBaseDisp(rBase, displacement, r_src, kWord);
 }
 
 /*
@@ -89,16 +80,23 @@ LIR* Mir2Lir::StoreWordDisp(int rBase, int displacement, int r_src) {
  * using this routine, as it doesn't perform any bookkeeping regarding
  * register liveness.  That is the responsibility of the caller.
  */
-void Mir2Lir::LoadValueDirect(RegLocation rl_src, int r_dest) {
+void Mir2Lir::LoadValueDirect(RegLocation rl_src, RegStorage r_dest) {
   rl_src = UpdateLoc(rl_src);
   if (rl_src.location == kLocPhysReg) {
-    OpRegCopy(r_dest, rl_src.low_reg);
+    OpRegCopy(r_dest, rl_src.reg);
   } else if (IsInexpensiveConstant(rl_src)) {
+    // On 64-bit targets, will sign extend.  Make sure constant reference is always NULL.
+    DCHECK(!rl_src.ref || (mir_graph_->ConstantValue(rl_src) == 0));
     LoadConstantNoClobber(r_dest, mir_graph_->ConstantValue(rl_src));
   } else {
     DCHECK((rl_src.location == kLocDalvikFrame) ||
            (rl_src.location == kLocCompilerTemp));
-    LoadWordDisp(TargetReg(kSp), SRegOffset(rl_src.s_reg_low), r_dest);
+    ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+    if (rl_src.ref) {
+      LoadRefDisp(TargetPtrReg(kSp), SRegOffset(rl_src.s_reg_low), r_dest, kNotVolatile);
+    } else {
+      Load32Disp(TargetPtrReg(kSp), SRegOffset(rl_src.s_reg_low), r_dest);
+    }
   }
 }
 
@@ -107,7 +105,7 @@ void Mir2Lir::LoadValueDirect(RegLocation rl_src, int r_dest) {
  * register.  Should be used when loading to a fixed register (for example,
  * loading arguments to an out of line call.
  */
-void Mir2Lir::LoadValueDirectFixed(RegLocation rl_src, int r_dest) {
+void Mir2Lir::LoadValueDirectFixed(RegLocation rl_src, RegStorage r_dest) {
   Clobber(r_dest);
   MarkInUse(r_dest);
   LoadValueDirect(rl_src, r_dest);
@@ -118,18 +116,17 @@ void Mir2Lir::LoadValueDirectFixed(RegLocation rl_src, int r_dest) {
  * using this routine, as it doesn't perform any bookkeeping regarding
  * register liveness.  That is the responsibility of the caller.
  */
-void Mir2Lir::LoadValueDirectWide(RegLocation rl_src, int reg_lo,
-             int reg_hi) {
+void Mir2Lir::LoadValueDirectWide(RegLocation rl_src, RegStorage r_dest) {
   rl_src = UpdateLocWide(rl_src);
   if (rl_src.location == kLocPhysReg) {
-    OpRegCopyWide(reg_lo, reg_hi, rl_src.low_reg, rl_src.high_reg);
+    OpRegCopyWide(r_dest, rl_src.reg);
   } else if (IsInexpensiveConstant(rl_src)) {
-    LoadConstantWide(reg_lo, reg_hi, mir_graph_->ConstantValueWide(rl_src));
+    LoadConstantWide(r_dest, mir_graph_->ConstantValueWide(rl_src));
   } else {
     DCHECK((rl_src.location == kLocDalvikFrame) ||
            (rl_src.location == kLocCompilerTemp));
-    LoadBaseDispWide(TargetReg(kSp), SRegOffset(rl_src.s_reg_low),
-                     reg_lo, reg_hi, INVALID_SREG);
+    ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+    LoadBaseDisp(TargetPtrReg(kSp), SRegOffset(rl_src.s_reg_low), r_dest, k64, kNotVolatile);
   }
 }
 
@@ -138,23 +135,39 @@ void Mir2Lir::LoadValueDirectWide(RegLocation rl_src, int reg_lo,
  * registers.  Should be used when loading to a fixed registers (for example,
  * loading arguments to an out of line call.
  */
-void Mir2Lir::LoadValueDirectWideFixed(RegLocation rl_src, int reg_lo,
-                                       int reg_hi) {
-  Clobber(reg_lo);
-  Clobber(reg_hi);
-  MarkInUse(reg_lo);
-  MarkInUse(reg_hi);
-  LoadValueDirectWide(rl_src, reg_lo, reg_hi);
+void Mir2Lir::LoadValueDirectWideFixed(RegLocation rl_src, RegStorage r_dest) {
+  Clobber(r_dest);
+  MarkInUse(r_dest);
+  LoadValueDirectWide(rl_src, r_dest);
 }
 
 RegLocation Mir2Lir::LoadValue(RegLocation rl_src, RegisterClass op_kind) {
-  rl_src = EvalLoc(rl_src, op_kind, false);
-  if (IsInexpensiveConstant(rl_src) || rl_src.location != kLocPhysReg) {
-    LoadValueDirect(rl_src, rl_src.low_reg);
-    rl_src.location = kLocPhysReg;
-    MarkLive(rl_src.low_reg, rl_src.s_reg_low);
+  DCHECK(!rl_src.ref || op_kind == kRefReg);
+  rl_src = UpdateLoc(rl_src);
+  if (rl_src.location == kLocPhysReg) {
+    if (!RegClassMatches(op_kind, rl_src.reg)) {
+      // Wrong register class, realloc, copy and transfer ownership.
+      RegStorage new_reg = AllocTypedTemp(rl_src.fp, op_kind);
+      OpRegCopy(new_reg, rl_src.reg);
+      // Clobber the old reg.
+      Clobber(rl_src.reg);
+      // ...and mark the new one live.
+      rl_src.reg = new_reg;
+      MarkLive(rl_src);
+    }
+    return rl_src;
   }
+
+  DCHECK_NE(rl_src.s_reg_low, INVALID_SREG);
+  rl_src.reg = AllocTypedTemp(rl_src.fp, op_kind);
+  LoadValueDirect(rl_src, rl_src.reg);
+  rl_src.location = kLocPhysReg;
+  MarkLive(rl_src);
   return rl_src;
+}
+
+RegLocation Mir2Lir::LoadValue(RegLocation rl_src) {
+  return LoadValue(rl_src, LocToRegClass(rl_src));
 }
 
 void Mir2Lir::StoreValue(RegLocation rl_dest, RegLocation rl_src) {
@@ -175,34 +188,37 @@ void Mir2Lir::StoreValue(RegLocation rl_dest, RegLocation rl_src) {
   rl_src = UpdateLoc(rl_src);
   rl_dest = UpdateLoc(rl_dest);
   if (rl_src.location == kLocPhysReg) {
-    if (IsLive(rl_src.low_reg) ||
-      IsPromoted(rl_src.low_reg) ||
+    if (IsLive(rl_src.reg) ||
+      IsPromoted(rl_src.reg) ||
       (rl_dest.location == kLocPhysReg)) {
       // Src is live/promoted or Dest has assigned reg.
-      rl_dest = EvalLoc(rl_dest, kAnyReg, false);
-      OpRegCopy(rl_dest.low_reg, rl_src.low_reg);
+      rl_dest = EvalLoc(rl_dest, rl_dest.ref || rl_src.ref ? kRefReg : kAnyReg, false);
+      OpRegCopy(rl_dest.reg, rl_src.reg);
     } else {
       // Just re-assign the registers.  Dest gets Src's regs
-      rl_dest.low_reg = rl_src.low_reg;
-      Clobber(rl_src.low_reg);
+      rl_dest.reg = rl_src.reg;
+      Clobber(rl_src.reg);
     }
   } else {
     // Load Src either into promoted Dest or temps allocated for Dest
-    rl_dest = EvalLoc(rl_dest, kAnyReg, false);
-    LoadValueDirect(rl_src, rl_dest.low_reg);
+    rl_dest = EvalLoc(rl_dest, rl_dest.ref ? kRefReg : kAnyReg, false);
+    LoadValueDirect(rl_src, rl_dest.reg);
   }
 
   // Dest is now live and dirty (until/if we flush it to home location)
-  MarkLive(rl_dest.low_reg, rl_dest.s_reg_low);
+  MarkLive(rl_dest);
   MarkDirty(rl_dest);
 
 
   ResetDefLoc(rl_dest);
-  if (IsDirty(rl_dest.low_reg) &&
-      oat_live_out(rl_dest.s_reg_low)) {
+  if (IsDirty(rl_dest.reg) && LiveOut(rl_dest.s_reg_low)) {
     def_start = last_lir_insn_;
-    StoreBaseDisp(TargetReg(kSp), SRegOffset(rl_dest.s_reg_low),
-                  rl_dest.low_reg, kWord);
+    ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+    if (rl_dest.ref) {
+      StoreRefDisp(TargetPtrReg(kSp), SRegOffset(rl_dest.s_reg_low), rl_dest.reg, kNotVolatile);
+    } else {
+      Store32Disp(TargetPtrReg(kSp), SRegOffset(rl_dest.s_reg_low), rl_dest.reg);
+    }
     MarkClean(rl_dest);
     def_end = last_lir_insn_;
     if (!rl_dest.ref) {
@@ -214,13 +230,27 @@ void Mir2Lir::StoreValue(RegLocation rl_dest, RegLocation rl_src) {
 
 RegLocation Mir2Lir::LoadValueWide(RegLocation rl_src, RegisterClass op_kind) {
   DCHECK(rl_src.wide);
-  rl_src = EvalLoc(rl_src, op_kind, false);
-  if (IsInexpensiveConstant(rl_src) || rl_src.location != kLocPhysReg) {
-    LoadValueDirectWide(rl_src, rl_src.low_reg, rl_src.high_reg);
-    rl_src.location = kLocPhysReg;
-    MarkLive(rl_src.low_reg, rl_src.s_reg_low);
-    MarkLive(rl_src.high_reg, GetSRegHi(rl_src.s_reg_low));
+  rl_src = UpdateLocWide(rl_src);
+  if (rl_src.location == kLocPhysReg) {
+    if (!RegClassMatches(op_kind, rl_src.reg)) {
+      // Wrong register class, realloc, copy and transfer ownership.
+      RegStorage new_regs = AllocTypedTempWide(rl_src.fp, op_kind);
+      OpRegCopyWide(new_regs, rl_src.reg);
+      // Clobber the old regs.
+      Clobber(rl_src.reg);
+      // ...and mark the new ones live.
+      rl_src.reg = new_regs;
+      MarkLive(rl_src);
+    }
+    return rl_src;
   }
+
+  DCHECK_NE(rl_src.s_reg_low, INVALID_SREG);
+  DCHECK_NE(GetSRegHi(rl_src.s_reg_low), INVALID_SREG);
+  rl_src.reg = AllocTypedTempWide(rl_src.fp, op_kind);
+  LoadValueDirectWide(rl_src, rl_src.reg);
+  rl_src.location = kLocPhysReg;
+  MarkLive(rl_src);
   return rl_src;
 }
 
@@ -237,62 +267,174 @@ void Mir2Lir::StoreValueWide(RegLocation rl_dest, RegLocation rl_src) {
   }
   LIR* def_start;
   LIR* def_end;
-  DCHECK_EQ(IsFpReg(rl_src.low_reg), IsFpReg(rl_src.high_reg));
   DCHECK(rl_dest.wide);
   DCHECK(rl_src.wide);
+  rl_src = UpdateLocWide(rl_src);
+  rl_dest = UpdateLocWide(rl_dest);
   if (rl_src.location == kLocPhysReg) {
-    if (IsLive(rl_src.low_reg) ||
-        IsLive(rl_src.high_reg) ||
-        IsPromoted(rl_src.low_reg) ||
-        IsPromoted(rl_src.high_reg) ||
+    if (IsLive(rl_src.reg) ||
+        IsPromoted(rl_src.reg) ||
         (rl_dest.location == kLocPhysReg)) {
-      // Src is live or promoted or Dest has assigned reg.
+      /*
+       * If src reg[s] are tied to the original Dalvik vreg via liveness or promotion, we
+       * can't repurpose them.  Similarly, if the dest reg[s] are tied to Dalvik vregs via
+       * promotion, we can't just re-assign.  In these cases, we have to copy.
+       */
       rl_dest = EvalLoc(rl_dest, kAnyReg, false);
-      OpRegCopyWide(rl_dest.low_reg, rl_dest.high_reg,
-                    rl_src.low_reg, rl_src.high_reg);
+      OpRegCopyWide(rl_dest.reg, rl_src.reg);
     } else {
       // Just re-assign the registers.  Dest gets Src's regs
-      rl_dest.low_reg = rl_src.low_reg;
-      rl_dest.high_reg = rl_src.high_reg;
-      Clobber(rl_src.low_reg);
-      Clobber(rl_src.high_reg);
+      rl_dest.reg = rl_src.reg;
+      Clobber(rl_src.reg);
     }
   } else {
     // Load Src either into promoted Dest or temps allocated for Dest
     rl_dest = EvalLoc(rl_dest, kAnyReg, false);
-    LoadValueDirectWide(rl_src, rl_dest.low_reg, rl_dest.high_reg);
+    LoadValueDirectWide(rl_src, rl_dest.reg);
   }
 
   // Dest is now live and dirty (until/if we flush it to home location)
-  MarkLive(rl_dest.low_reg, rl_dest.s_reg_low);
-  MarkLive(rl_dest.high_reg, GetSRegHi(rl_dest.s_reg_low));
+  MarkLive(rl_dest);
+  MarkWide(rl_dest.reg);
   MarkDirty(rl_dest);
-  MarkPair(rl_dest.low_reg, rl_dest.high_reg);
-
 
   ResetDefLocWide(rl_dest);
-  if ((IsDirty(rl_dest.low_reg) ||
-      IsDirty(rl_dest.high_reg)) &&
-      (oat_live_out(rl_dest.s_reg_low) ||
-      oat_live_out(GetSRegHi(rl_dest.s_reg_low)))) {
+  if (IsDirty(rl_dest.reg) && (LiveOut(rl_dest.s_reg_low) ||
+      LiveOut(GetSRegHi(rl_dest.s_reg_low)))) {
     def_start = last_lir_insn_;
     DCHECK_EQ((mir_graph_->SRegToVReg(rl_dest.s_reg_low)+1),
               mir_graph_->SRegToVReg(GetSRegHi(rl_dest.s_reg_low)));
-    StoreBaseDispWide(TargetReg(kSp), SRegOffset(rl_dest.s_reg_low),
-                      rl_dest.low_reg, rl_dest.high_reg);
+    ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+    StoreBaseDisp(TargetPtrReg(kSp), SRegOffset(rl_dest.s_reg_low), rl_dest.reg, k64, kNotVolatile);
     MarkClean(rl_dest);
     def_end = last_lir_insn_;
     MarkDefWide(rl_dest, def_start, def_end);
   }
 }
 
+void Mir2Lir::StoreFinalValue(RegLocation rl_dest, RegLocation rl_src) {
+  DCHECK_EQ(rl_src.location, kLocPhysReg);
+
+  if (rl_dest.location == kLocPhysReg) {
+    OpRegCopy(rl_dest.reg, rl_src.reg);
+  } else {
+    // Just re-assign the register.  Dest gets Src's reg.
+    rl_dest.location = kLocPhysReg;
+    rl_dest.reg = rl_src.reg;
+    Clobber(rl_src.reg);
+  }
+
+  // Dest is now live and dirty (until/if we flush it to home location)
+  MarkLive(rl_dest);
+  MarkDirty(rl_dest);
+
+
+  ResetDefLoc(rl_dest);
+  if (IsDirty(rl_dest.reg) && LiveOut(rl_dest.s_reg_low)) {
+    LIR *def_start = last_lir_insn_;
+    ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+    Store32Disp(TargetPtrReg(kSp), SRegOffset(rl_dest.s_reg_low), rl_dest.reg);
+    MarkClean(rl_dest);
+    LIR *def_end = last_lir_insn_;
+    if (!rl_dest.ref) {
+      // Exclude references from store elimination
+      MarkDef(rl_dest, def_start, def_end);
+    }
+  }
+}
+
+void Mir2Lir::StoreFinalValueWide(RegLocation rl_dest, RegLocation rl_src) {
+  DCHECK(rl_dest.wide);
+  DCHECK(rl_src.wide);
+  DCHECK_EQ(rl_src.location, kLocPhysReg);
+
+  if (rl_dest.location == kLocPhysReg) {
+    OpRegCopyWide(rl_dest.reg, rl_src.reg);
+  } else {
+    // Just re-assign the registers.  Dest gets Src's regs.
+    rl_dest.location = kLocPhysReg;
+    rl_dest.reg = rl_src.reg;
+    Clobber(rl_src.reg);
+  }
+
+  // Dest is now live and dirty (until/if we flush it to home location).
+  MarkLive(rl_dest);
+  MarkWide(rl_dest.reg);
+  MarkDirty(rl_dest);
+
+  ResetDefLocWide(rl_dest);
+  if (IsDirty(rl_dest.reg) && (LiveOut(rl_dest.s_reg_low) ||
+      LiveOut(GetSRegHi(rl_dest.s_reg_low)))) {
+    LIR *def_start = last_lir_insn_;
+    DCHECK_EQ((mir_graph_->SRegToVReg(rl_dest.s_reg_low)+1),
+              mir_graph_->SRegToVReg(GetSRegHi(rl_dest.s_reg_low)));
+    ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+    StoreBaseDisp(TargetPtrReg(kSp), SRegOffset(rl_dest.s_reg_low), rl_dest.reg, k64, kNotVolatile);
+    MarkClean(rl_dest);
+    LIR *def_end = last_lir_insn_;
+    MarkDefWide(rl_dest, def_start, def_end);
+  }
+}
+
 /* Utilities to load the current Method* */
-void Mir2Lir::LoadCurrMethodDirect(int r_tgt) {
+void Mir2Lir::LoadCurrMethodDirect(RegStorage r_tgt) {
   LoadValueDirectFixed(mir_graph_->GetMethodLoc(), r_tgt);
 }
 
 RegLocation Mir2Lir::LoadCurrMethod() {
-  return LoadValue(mir_graph_->GetMethodLoc(), kCoreReg);
+  return LoadValue(mir_graph_->GetMethodLoc(), kRefReg);
+}
+
+RegLocation Mir2Lir::ForceTemp(RegLocation loc) {
+  DCHECK(!loc.wide);
+  DCHECK(loc.location == kLocPhysReg);
+  DCHECK(!loc.reg.IsFloat());
+  if (IsTemp(loc.reg)) {
+    Clobber(loc.reg);
+  } else {
+    RegStorage temp_low = AllocTemp();
+    OpRegCopy(temp_low, loc.reg);
+    loc.reg = temp_low;
+  }
+
+  // Ensure that this doesn't represent the original SR any more.
+  loc.s_reg_low = INVALID_SREG;
+  return loc;
+}
+
+RegLocation Mir2Lir::ForceTempWide(RegLocation loc) {
+  DCHECK(loc.wide);
+  DCHECK(loc.location == kLocPhysReg);
+  DCHECK(!loc.reg.IsFloat());
+
+  if (!loc.reg.IsPair()) {
+    if (IsTemp(loc.reg)) {
+      Clobber(loc.reg);
+    } else {
+      RegStorage temp = AllocTempWide();
+      OpRegCopy(temp, loc.reg);
+      loc.reg = temp;
+    }
+  } else {
+    if (IsTemp(loc.reg.GetLow())) {
+      Clobber(loc.reg.GetLow());
+    } else {
+      RegStorage temp_low = AllocTemp();
+      OpRegCopy(temp_low, loc.reg.GetLow());
+      loc.reg.SetLowReg(temp_low.GetReg());
+    }
+    if (IsTemp(loc.reg.GetHigh())) {
+      Clobber(loc.reg.GetHigh());
+    } else {
+      RegStorage temp_high = AllocTemp();
+      OpRegCopy(temp_high, loc.reg.GetHigh());
+      loc.reg.SetHighReg(temp_high.GetReg());
+    }
+  }
+
+  // Ensure that this doesn't represent the original SR any more.
+  loc.s_reg_low = INVALID_SREG;
+  return loc;
 }
 
 }  // namespace art

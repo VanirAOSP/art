@@ -14,19 +14,47 @@
  * limitations under the License.
  */
 
-#include "indirect_reference_table.h"
+#include "indirect_reference_table-inl.h"
+
 #include "jni_internal.h"
 #include "reference_table.h"
 #include "runtime.h"
 #include "scoped_thread_state_change.h"
 #include "thread.h"
 #include "utils.h"
+#include "verify_object-inl.h"
 
 #include <cstdlib>
 
 namespace art {
 
-static void AbortMaybe() {
+template<typename T>
+class MutatorLockedDumpable {
+ public:
+  explicit MutatorLockedDumpable(T& value)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) : value_(value) {
+  }
+
+  void Dump(std::ostream& os) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    value_.Dump(os);
+  }
+
+ private:
+  T& value_;
+
+  DISALLOW_COPY_AND_ASSIGN(MutatorLockedDumpable);
+};
+
+template<typename T>
+std::ostream& operator<<(std::ostream& os, const MutatorLockedDumpable<T>& rhs)
+// TODO: should be SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) however annotalysis
+//       currently fails for this.
+    NO_THREAD_SAFETY_ANALYSIS {
+  rhs.Dump(os);
+  return os;
+}
+
+void IndirectReferenceTable::AbortIfNoCheckJNI() {
   // If -Xcheck:jni is on, it'll give a more detailed error before aborting.
   if (!Runtime::Current()->GetJavaVM()->check_jni) {
     // Otherwise, we want to abort rather than hand back a bad reference.
@@ -38,14 +66,26 @@ IndirectReferenceTable::IndirectReferenceTable(size_t initialCount,
                                                size_t maxCount, IndirectRefKind desiredKind) {
   CHECK_GT(initialCount, 0U);
   CHECK_LE(initialCount, maxCount);
-  CHECK_NE(desiredKind, kSirtOrInvalid);
+  CHECK_NE(desiredKind, kHandleScopeOrInvalid);
 
-  table_ = reinterpret_cast<const mirror::Object**>(malloc(initialCount * sizeof(const mirror::Object*)));
-  CHECK(table_ != NULL);
-  memset(table_, 0xd1, initialCount * sizeof(const mirror::Object*));
+  std::string error_str;
+  const size_t initial_bytes = initialCount * sizeof(const mirror::Object*);
+  const size_t table_bytes = maxCount * sizeof(const mirror::Object*);
+  table_mem_map_.reset(MemMap::MapAnonymous("indirect ref table", nullptr, table_bytes,
+                                            PROT_READ | PROT_WRITE, false, &error_str));
+  CHECK(table_mem_map_.get() != nullptr) << error_str;
+  CHECK_EQ(table_mem_map_->Size(), table_bytes);
 
-  slot_data_ = reinterpret_cast<IndirectRefSlot*>(calloc(initialCount, sizeof(IndirectRefSlot)));
-  CHECK(slot_data_ != NULL);
+  table_ = reinterpret_cast<GcRoot<mirror::Object>*>(table_mem_map_->Begin());
+  CHECK(table_ != nullptr);
+  memset(table_, 0xd1, initial_bytes);
+
+  const size_t slot_bytes = maxCount * sizeof(IndirectRefSlot);
+  slot_mem_map_.reset(MemMap::MapAnonymous("indirect ref table slots", nullptr, slot_bytes,
+                                           PROT_READ | PROT_WRITE, false, &error_str));
+  CHECK(slot_mem_map_.get() != nullptr) << error_str;
+  slot_data_ = reinterpret_cast<IndirectRefSlot*>(slot_mem_map_->Begin());
+  CHECK(slot_data_ != nullptr);
 
   segment_state_.all = IRT_FIRST_SEGMENT;
   alloc_entries_ = initialCount;
@@ -54,35 +94,15 @@ IndirectReferenceTable::IndirectReferenceTable(size_t initialCount,
 }
 
 IndirectReferenceTable::~IndirectReferenceTable() {
-  free(table_);
-  free(slot_data_);
-  table_ = NULL;
-  slot_data_ = NULL;
-  alloc_entries_ = max_entries_ = -1;
 }
 
-// Make sure that the entry at "idx" is correctly paired with "iref".
-bool IndirectReferenceTable::CheckEntry(const char* what, IndirectRef iref, int idx) const {
-  const mirror::Object* obj = table_[idx];
-  IndirectRef checkRef = ToIndirectRef(obj, idx);
-  if (UNLIKELY(checkRef != iref)) {
-    LOG(ERROR) << "JNI ERROR (app bug): attempt to " << what
-               << " stale " << kind_ << " " << iref
-               << " (should be " << checkRef << ")";
-    AbortMaybe();
-    return false;
-  }
-  return true;
-}
-
-IndirectRef IndirectReferenceTable::Add(uint32_t cookie, const mirror::Object* obj) {
+IndirectRef IndirectReferenceTable::Add(uint32_t cookie, mirror::Object* obj) {
   IRTSegmentState prevState;
   prevState.all = cookie;
   size_t topIndex = segment_state_.parts.topIndex;
 
-  DCHECK(obj != NULL);
-  // TODO: stronger sanity check on the object (such as in heap)
-  DCHECK_ALIGNED(reinterpret_cast<uintptr_t>(obj), 8);
+  CHECK(obj != NULL);
+  VerifyObject(obj);
   DCHECK(table_ != NULL);
   DCHECK_LE(alloc_entries_, max_entries_);
   DCHECK_GE(segment_state_.parts.numHoles, prevState.parts.numHoles);
@@ -101,20 +121,6 @@ IndirectRef IndirectReferenceTable::Add(uint32_t cookie, const mirror::Object* o
     }
     DCHECK_GT(newSize, alloc_entries_);
 
-    table_ = reinterpret_cast<const mirror::Object**>(realloc(table_, newSize * sizeof(const mirror::Object*)));
-    slot_data_ = reinterpret_cast<IndirectRefSlot*>(realloc(slot_data_,
-                                                            newSize * sizeof(IndirectRefSlot)));
-    if (table_ == NULL || slot_data_ == NULL) {
-      LOG(FATAL) << "JNI ERROR (app bug): unable to expand "
-                 << kind_ << " table (from "
-                 << alloc_entries_ << " to " << newSize
-                 << ", max=" << max_entries_ << ")\n"
-                 << MutatorLockedDumpable<IndirectReferenceTable>(*this);
-    }
-
-    // Clear the newly-allocated slot_data_ elements.
-    memset(slot_data_ + alloc_entries_, 0, (newSize - alloc_entries_) * sizeof(IndirectRefSlot));
-
     alloc_entries_ = newSize;
   }
 
@@ -126,20 +132,22 @@ IndirectRef IndirectReferenceTable::Add(uint32_t cookie, const mirror::Object* o
   if (numHoles > 0) {
     DCHECK_GT(topIndex, 1U);
     // Find the first hole; likely to be near the end of the list.
-    const mirror::Object** pScan = &table_[topIndex - 1];
-    DCHECK(*pScan != NULL);
-    while (*--pScan != NULL) {
+    GcRoot<mirror::Object>* pScan = &table_[topIndex - 1];
+    DCHECK(!pScan->IsNull());
+    --pScan;
+    while (!pScan->IsNull()) {
       DCHECK_GE(pScan, table_ + prevState.parts.topIndex);
+      --pScan;
     }
     UpdateSlotAdd(obj, pScan - table_);
-    result = ToIndirectRef(obj, pScan - table_);
-    *pScan = obj;
+    result = ToIndirectRef(pScan - table_);
+    *pScan = GcRoot<mirror::Object>(obj);
     segment_state_.parts.numHoles--;
   } else {
     // Add to the end.
     UpdateSlotAdd(obj, topIndex);
-    result = ToIndirectRef(obj, topIndex);
-    table_[topIndex++] = obj;
+    result = ToIndirectRef(topIndex);
+    table_[topIndex++] = GcRoot<mirror::Object>(obj);
     segment_state_.parts.topIndex = topIndex;
   }
   if (false) {
@@ -157,54 +165,6 @@ void IndirectReferenceTable::AssertEmpty() {
     LOG(FATAL) << "Internal Error: non-empty local reference table\n"
                << MutatorLockedDumpable<IndirectReferenceTable>(*this);
   }
-}
-
-// Verifies that the indirect table lookup is valid.
-// Returns "false" if something looks bad.
-bool IndirectReferenceTable::GetChecked(IndirectRef iref) const {
-  if (UNLIKELY(iref == NULL)) {
-    LOG(WARNING) << "Attempt to look up NULL " << kind_;
-    return false;
-  }
-  if (UNLIKELY(GetIndirectRefKind(iref) == kSirtOrInvalid)) {
-    LOG(ERROR) << "JNI ERROR (app bug): invalid " << kind_ << " " << iref;
-    AbortMaybe();
-    return false;
-  }
-
-  int topIndex = segment_state_.parts.topIndex;
-  int idx = ExtractIndex(iref);
-  if (UNLIKELY(idx >= topIndex)) {
-    LOG(ERROR) << "JNI ERROR (app bug): accessed stale " << kind_ << " "
-               << iref << " (index " << idx << " in a table of size " << topIndex << ")";
-    AbortMaybe();
-    return false;
-  }
-
-  if (UNLIKELY(table_[idx] == NULL)) {
-    LOG(ERROR) << "JNI ERROR (app bug): accessed deleted " << kind_ << " " << iref;
-    AbortMaybe();
-    return false;
-  }
-
-  if (UNLIKELY(!CheckEntry("use", iref, idx))) {
-    return false;
-  }
-
-  return true;
-}
-
-static int Find(mirror::Object* direct_pointer, int bottomIndex, int topIndex, const mirror::Object** table) {
-  for (int i = bottomIndex; i < topIndex; ++i) {
-    if (table[i] == direct_pointer) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-bool IndirectReferenceTable::ContainsDirectPointer(mirror::Object* direct_pointer) const {
-  return Find(direct_pointer, 0, segment_state_.parts.topIndex, table_) != -1;
 }
 
 // Removes an object. We extract the table offset bits from "iref"
@@ -227,19 +187,10 @@ bool IndirectReferenceTable::Remove(uint32_t cookie, IndirectRef iref) {
 
   int idx = ExtractIndex(iref);
 
-  JavaVMExt* vm = Runtime::Current()->GetJavaVM();
-  if (GetIndirectRefKind(iref) == kSirtOrInvalid &&
-      Thread::Current()->SirtContains(reinterpret_cast<jobject>(iref))) {
-    LOG(WARNING) << "Attempt to remove local SIRT entry from IRT, ignoring";
+  if (GetIndirectRefKind(iref) == kHandleScopeOrInvalid &&
+      Thread::Current()->HandleScopeContains(reinterpret_cast<jobject>(iref))) {
+    LOG(WARNING) << "Attempt to remove local handle scope entry from IRT, ignoring";
     return true;
-  }
-  if (GetIndirectRefKind(iref) == kSirtOrInvalid && vm->work_around_app_jni_bugs) {
-    mirror::Object* direct_pointer = reinterpret_cast<mirror::Object*>(iref);
-    idx = Find(direct_pointer, bottomIndex, topIndex, table_);
-    if (idx == -1) {
-      LOG(WARNING) << "Trying to work around app JNI bugs, but didn't find " << iref << " in table!";
-      return false;
-    }
   }
 
   if (idx < bottomIndex) {
@@ -258,19 +209,20 @@ bool IndirectReferenceTable::Remove(uint32_t cookie, IndirectRef iref) {
   if (idx == topIndex-1) {
     // Top-most entry.  Scan up and consume holes.
 
-    if (!vm->work_around_app_jni_bugs && !CheckEntry("remove", iref, idx)) {
+    if (!CheckEntry("remove", iref, idx)) {
       return false;
     }
 
-    table_[idx] = NULL;
+    table_[idx] = GcRoot<mirror::Object>(nullptr);
     int numHoles = segment_state_.parts.numHoles - prevState.parts.numHoles;
     if (numHoles != 0) {
       while (--topIndex > bottomIndex && numHoles != 0) {
         if (false) {
           LOG(INFO) << "+++ checking for hole at " << topIndex-1
-                    << " (cookie=" << cookie << ") val=" << table_[topIndex - 1];
+                    << " (cookie=" << cookie << ") val="
+                    << table_[topIndex - 1].Read<kWithoutReadBarrier>();
         }
-        if (table_[topIndex-1] != NULL) {
+        if (!table_[topIndex-1].IsNull()) {
           break;
         }
         if (false) {
@@ -290,15 +242,15 @@ bool IndirectReferenceTable::Remove(uint32_t cookie, IndirectRef iref) {
     // Not the top-most entry.  This creates a hole.  We NULL out the
     // entry to prevent somebody from deleting it twice and screwing up
     // the hole count.
-    if (table_[idx] == NULL) {
+    if (table_[idx].IsNull()) {
       LOG(INFO) << "--- WEIRD: removing null entry " << idx;
       return false;
     }
-    if (!vm->work_around_app_jni_bugs && !CheckEntry("remove", iref, idx)) {
+    if (!CheckEntry("remove", iref, idx)) {
       return false;
     }
 
-    table_[idx] = NULL;
+    table_[idx] = GcRoot<mirror::Object>(nullptr);
     segment_state_.parts.numHoles++;
     if (false) {
       LOG(INFO) << "+++ left hole at " << idx << ", holes=" << segment_state_.parts.numHoles;
@@ -308,19 +260,28 @@ bool IndirectReferenceTable::Remove(uint32_t cookie, IndirectRef iref) {
   return true;
 }
 
-void IndirectReferenceTable::VisitRoots(RootVisitor* visitor, void* arg) {
+void IndirectReferenceTable::VisitRoots(RootCallback* callback, void* arg, uint32_t tid,
+                                        RootType root_type) {
   for (auto ref : *this) {
-    visitor(*ref, arg);
+    callback(ref, arg, tid, root_type);
+    DCHECK(*ref != nullptr);
   }
 }
 
 void IndirectReferenceTable::Dump(std::ostream& os) const {
   os << kind_ << " table dump:\n";
-  std::vector<const mirror::Object*> entries(table_, table_ + Capacity());
-  // Remove NULLs.
-  for (int i = entries.size() - 1; i >= 0; --i) {
-    if (entries[i] == NULL) {
-      entries.erase(entries.begin() + i);
+  ReferenceTable::Table entries;
+  for (size_t i = 0; i < Capacity(); ++i) {
+    mirror::Object* obj = table_[i].Read<kWithoutReadBarrier>();
+    if (UNLIKELY(obj == nullptr)) {
+      // Remove NULLs.
+    } else if (UNLIKELY(obj == kClearedJniWeakGlobal)) {
+      // ReferenceTable::Dump() will handle kClearedJniWeakGlobal
+      // while the read barrier won't.
+      entries.push_back(GcRoot<mirror::Object>(obj));
+    } else {
+      obj = table_[i].Read();
+      entries.push_back(GcRoot<mirror::Object>(obj));
     }
   }
   ReferenceTable::Dump(os, entries);

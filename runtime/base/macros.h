@@ -18,8 +18,28 @@
 #define ART_RUNTIME_BASE_MACROS_H_
 
 #include <stddef.h>  // for size_t
+#include <unistd.h>  // for TEMP_FAILURE_RETRY
+
+// bionic and glibc both have TEMP_FAILURE_RETRY, but eg Mac OS' libc doesn't.
+#ifndef TEMP_FAILURE_RETRY
+#define TEMP_FAILURE_RETRY(exp) ({ \
+  decltype(exp) _rc; \
+  do { \
+    _rc = (exp); \
+  } while (_rc == -1 && errno == EINTR); \
+  _rc; })
+#endif
 
 #define GCC_VERSION (__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__)
+
+// C++11 final and override keywords that were introduced in GCC version 4.7.
+#if defined(__clang__) || GCC_VERSION >= 40700
+#define OVERRIDE override
+#define FINAL final
+#else
+#define OVERRIDE
+#define FINAL
+#endif
 
 // The COMPILE_ASSERT macro can be used to verify that a compile time
 // expression is true. For example, you could use it to verify the
@@ -130,74 +150,70 @@ char (&ArraySizeHelper(T (&array)[N]))[N];
 #define LIKELY(x)       __builtin_expect((x), true)
 #define UNLIKELY(x)     __builtin_expect((x), false)
 
+// Stringify the argument.
+#define QUOTE(x) #x
+#define STRINGIFY(x) QUOTE(x)
+
 #ifndef NDEBUG
 #define ALWAYS_INLINE
 #else
 #define ALWAYS_INLINE  __attribute__ ((always_inline))
 #endif
 
+#ifdef __clang__
+/* clang doesn't like attributes on lambda functions */
+#define ALWAYS_INLINE_LAMBDA
+#else
+#define ALWAYS_INLINE_LAMBDA ALWAYS_INLINE
+#endif
+
 #if defined (__APPLE__)
 #define HOT_ATTR
+#define COLD_ATTR
 #else
 #define HOT_ATTR __attribute__ ((hot))
+#define COLD_ATTR __attribute__ ((cold))
 #endif
 
 #define PURE __attribute__ ((__pure__))
-
-// bionic and glibc both have TEMP_FAILURE_RETRY, but Mac OS' libc doesn't.
-#ifndef TEMP_FAILURE_RETRY
-#define TEMP_FAILURE_RETRY(exp) ({ \
-  typeof(exp) _rc; \
-  do { \
-    _rc = (exp); \
-  } while (_rc == -1 && errno == EINTR); \
-  _rc; })
-#endif
+#define WARN_UNUSED __attribute__((warn_unused_result))
 
 template<typename T> void UNUSED(const T&) {}
 
-#if defined(__SUPPORT_TS_ANNOTATION__)
-
-#define ACQUIRED_AFTER(...) __attribute__ ((acquired_after(__VA_ARGS__)))
-#define ACQUIRED_BEFORE(...) __attribute__ ((acquired_before(__VA_ARGS__)))
-#define EXCLUSIVE_LOCK_FUNCTION(...) __attribute__ ((exclusive_lock(__VA_ARGS__)))
-#define EXCLUSIVE_LOCKS_REQUIRED(...) __attribute__ ((exclusive_locks_required(__VA_ARGS__)))
-#define EXCLUSIVE_TRYLOCK_FUNCTION(...) __attribute__ ((exclusive_trylock(__VA_ARGS__)))
-#define GUARDED_BY(x) __attribute__ ((guarded_by(x)))
-#define GUARDED_VAR __attribute__ ((guarded))
-#define LOCKABLE __attribute__ ((lockable))
-#define LOCK_RETURNED(x) __attribute__ ((lock_returned(x)))
-#define LOCKS_EXCLUDED(...) __attribute__ ((locks_excluded(__VA_ARGS__)))
-#define NO_THREAD_SAFETY_ANALYSIS __attribute__ ((no_thread_safety_analysis))
-#define PT_GUARDED_BY(x) __attribute__ ((point_to_guarded_by(x)))
-#define PT_GUARDED_VAR __attribute__ ((point_to_guarded))
-#define SCOPED_LOCKABLE __attribute__ ((scoped_lockable))
-#define SHARED_LOCK_FUNCTION(...) __attribute__ ((shared_lock(__VA_ARGS__)))
-#define SHARED_LOCKS_REQUIRED(...) __attribute__ ((shared_locks_required(__VA_ARGS__)))
-#define SHARED_TRYLOCK_FUNCTION(...) __attribute__ ((shared_trylock(__VA_ARGS__)))
-#define UNLOCK_FUNCTION(...) __attribute__ ((unlock(__VA_ARGS__)))
-
+// Annotalysis thread-safety analysis support.
+#if defined(__SUPPORT_TS_ANNOTATION__) || defined(__clang__)
+#define THREAD_ANNOTATION_ATTRIBUTE__(x)   __attribute__((x))
 #else
+#define THREAD_ANNOTATION_ATTRIBUTE__(x)   // no-op
+#endif
 
-#define ACQUIRED_AFTER(...)
-#define ACQUIRED_BEFORE(...)
-#define EXCLUSIVE_LOCK_FUNCTION(...)
-#define EXCLUSIVE_LOCKS_REQUIRED(...)
-#define EXCLUSIVE_TRYLOCK_FUNCTION(...)
-#define GUARDED_BY(x)
-#define GUARDED_VAR
-#define LOCKABLE
-#define LOCK_RETURNED(x)
-#define LOCKS_EXCLUDED(...)
-#define NO_THREAD_SAFETY_ANALYSIS
+#define ACQUIRED_AFTER(...) THREAD_ANNOTATION_ATTRIBUTE__(acquired_after(__VA_ARGS__))
+#define ACQUIRED_BEFORE(...) THREAD_ANNOTATION_ATTRIBUTE__(acquired_before(__VA_ARGS__))
+#define EXCLUSIVE_LOCKS_REQUIRED(...) THREAD_ANNOTATION_ATTRIBUTE__(exclusive_locks_required(__VA_ARGS__))
+#define GUARDED_BY(x) THREAD_ANNOTATION_ATTRIBUTE__(guarded_by(x))
+#define GUARDED_VAR THREAD_ANNOTATION_ATTRIBUTE__(guarded)
+#define LOCKABLE THREAD_ANNOTATION_ATTRIBUTE__(lockable)
+#define LOCK_RETURNED(x) THREAD_ANNOTATION_ATTRIBUTE__(lock_returned(x))
+#define LOCKS_EXCLUDED(...) THREAD_ANNOTATION_ATTRIBUTE__(locks_excluded(__VA_ARGS__))
+#define NO_THREAD_SAFETY_ANALYSIS THREAD_ANNOTATION_ATTRIBUTE__(no_thread_safety_analysis)
 #define PT_GUARDED_BY(x)
-#define PT_GUARDED_VAR
-#define SCOPED_LOCKABLE
-#define SHARED_LOCK_FUNCTION(...)
-#define SHARED_LOCKS_REQUIRED(...)
-#define SHARED_TRYLOCK_FUNCTION(...)
-#define UNLOCK_FUNCTION(...)
+// THREAD_ANNOTATION_ATTRIBUTE__(point_to_guarded_by(x))
+#define PT_GUARDED_VAR THREAD_ANNOTATION_ATTRIBUTE__(point_to_guarded)
+#define SCOPED_LOCKABLE THREAD_ANNOTATION_ATTRIBUTE__(scoped_lockable)
+#define SHARED_LOCKS_REQUIRED(...) THREAD_ANNOTATION_ATTRIBUTE__(shared_locks_required(__VA_ARGS__))
 
-#endif  // defined(__SUPPORT_TS_ANNOTATION__)
+#if defined(__clang__)
+#define EXCLUSIVE_LOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(exclusive_lock_function(__VA_ARGS__))
+#define EXCLUSIVE_TRYLOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(exclusive_trylock_function(__VA_ARGS__))
+#define SHARED_LOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(shared_lock_function(__VA_ARGS__))
+#define SHARED_TRYLOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(shared_trylock_function(__VA_ARGS__))
+#define UNLOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(unlock_function(__VA_ARGS__))
+#else
+#define EXCLUSIVE_LOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(exclusive_lock(__VA_ARGS__))
+#define EXCLUSIVE_TRYLOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(exclusive_trylock(__VA_ARGS__))
+#define SHARED_LOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(shared_lock(__VA_ARGS__))
+#define SHARED_TRYLOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(shared_trylock(__VA_ARGS__))
+#define UNLOCK_FUNCTION(...) THREAD_ANNOTATION_ATTRIBUTE__(unlock(__VA_ARGS__))
+#endif
 
 #endif  // ART_RUNTIME_BASE_MACROS_H_

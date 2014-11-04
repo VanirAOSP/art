@@ -18,12 +18,7 @@
 #define ART_COMPILER_DEX_FRONTEND_H_
 
 #include "dex_file.h"
-#include "dex_instruction.h"
-
-
-
-
-
+#include "invoke_type.h"
 
 namespace llvm {
   class Module;
@@ -49,6 +44,8 @@ enum opt_control_vector {
   kLoadHoisting,
   kSuppressLoads,
   kNullCheckElimination,
+  kClassInitCheckElimination,
+  kGlobalValueNumbering,
   kPromoteRegs,
   kTrackLiveTemps,
   kSafeOptimizations,
@@ -56,6 +53,8 @@ enum opt_control_vector {
   kMatch,
   kPromoteCompilerTemps,
   kBranchFusing,
+  kSuppressExceptionEdges,
+  kSuppressMethodInlining,
 };
 
 // Force code generation paths for testing.
@@ -78,6 +77,8 @@ enum debugControlVector {
   kDebugVerifyBitcode,
   kDebugShowSummaryMemoryUsage,
   kDebugShowFilterStats,
+  kDebugTimings,
+  kDebugCodegenDump
 };
 
 class LLVMInfo {
@@ -102,14 +103,14 @@ class LLVMInfo {
     }
 
   private:
-    UniquePtr< ::llvm::LLVMContext> llvm_context_;
+    std::unique_ptr< ::llvm::LLVMContext> llvm_context_;
     ::llvm::Module* llvm_module_;  // Managed by context_.
-    UniquePtr<art::llvm::IntrinsicHelper> intrinsic_helper_;
-    UniquePtr<art::llvm::IRBuilder> ir_builder_;
+    std::unique_ptr<art::llvm::IntrinsicHelper> intrinsic_helper_;
+    std::unique_ptr<art::llvm::IRBuilder> ir_builder_;
 };
 
-struct CompilationUnit;
-struct BasicBlock;
+class CompiledMethod;
+class CompilerDriver;
 
 }  // namespace art
 

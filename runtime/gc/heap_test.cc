@@ -14,18 +14,19 @@
  * limitations under the License.
  */
 
-#include "common_test.h"
+#include "common_runtime_test.h"
 #include "gc/accounting/card_table-inl.h"
 #include "gc/accounting/space_bitmap-inl.h"
+#include "handle_scope-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
-#include "sirt_ref.h"
+#include "scoped_thread_state_change.h"
 
 namespace art {
 namespace gc {
 
-class HeapTest : public CommonTest {};
+class HeapTest : public CommonRuntimeTest {};
 
 TEST_F(HeapTest, ClearGrowthLimit) {
   Heap* heap = Runtime::Current()->GetHeap();
@@ -43,12 +44,17 @@ TEST_F(HeapTest, GarbageCollectClassLinkerInit) {
     ScopedObjectAccess soa(Thread::Current());
     // garbage is created during ClassLinker::Init
 
-    mirror::Class* c = class_linker_->FindSystemClass("[Ljava/lang/Object;");
+    StackHandleScope<1> hs(soa.Self());
+    Handle<mirror::Class> c(
+        hs.NewHandle(class_linker_->FindSystemClass(soa.Self(), "[Ljava/lang/Object;")));
     for (size_t i = 0; i < 1024; ++i) {
-      SirtRef<mirror::ObjectArray<mirror::Object> > array(soa.Self(),
-          mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(), c, 2048));
+      StackHandleScope<1> hs(soa.Self());
+      Handle<mirror::ObjectArray<mirror::Object>> array(hs.NewHandle(
+          mirror::ObjectArray<mirror::Object>::Alloc(soa.Self(), c.Get(), 2048)));
       for (size_t j = 0; j < 2048; ++j) {
-        array->Set(j, mirror::String::AllocFromModifiedUtf8(soa.Self(), "hello, world!"));
+        mirror::String* string = mirror::String::AllocFromModifiedUtf8(soa.Self(), "hello, world!");
+        // handle scope operator -> deferences the handle scope before running the method.
+        array->Set<false>(j, string);
       }
     }
   }
@@ -57,13 +63,11 @@ TEST_F(HeapTest, GarbageCollectClassLinkerInit) {
 
 TEST_F(HeapTest, HeapBitmapCapacityTest) {
   byte* heap_begin = reinterpret_cast<byte*>(0x1000);
-  const size_t heap_capacity = accounting::SpaceBitmap::kAlignment * (sizeof(intptr_t) * 8 + 1);
-  UniquePtr<accounting::SpaceBitmap> bitmap(accounting::SpaceBitmap::Create("test bitmap",
-                                                                            heap_begin,
-                                                                            heap_capacity));
+  const size_t heap_capacity = kObjectAlignment * (sizeof(intptr_t) * 8 + 1);
+  std::unique_ptr<accounting::ContinuousSpaceBitmap> bitmap(
+      accounting::ContinuousSpaceBitmap::Create("test bitmap", heap_begin, heap_capacity));
   mirror::Object* fake_end_of_heap_object =
-      reinterpret_cast<mirror::Object*>(&heap_begin[heap_capacity -
-                                                    accounting::SpaceBitmap::kAlignment]);
+      reinterpret_cast<mirror::Object*>(&heap_begin[heap_capacity - kObjectAlignment]);
   bitmap->Set(fake_end_of_heap_object);
 }
 

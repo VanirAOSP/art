@@ -14,17 +14,35 @@
  * limitations under the License.
  */
 
-#ifndef ART_RUNTIME_ARCH_X86_ASM_SUPPORT_X86_S_
-#define ART_RUNTIME_ARCH_X86_ASM_SUPPORT_X86_S_
+#ifndef ART_RUNTIME_ARCH_ARM_ASM_SUPPORT_ARM_S_
+#define ART_RUNTIME_ARCH_ARM_ASM_SUPPORT_ARM_S_
 
 #include "asm_support_arm.h"
 
-.cfi_sections   .debug_frame
+// Define special registers.
+
+// Register holding suspend check count down.
+#define rSUSPEND r4
+// Register holding Thread::Current().
+#define rSELF r9
+
 .syntax unified
 .arch armv7-a
 .thumb
 
 .macro ENTRY name
+    .thumb_func
+    .type \name, #function
+    .hidden \name  // Hide this as a global symbol, so we do not incur plt calls.
+    .global \name
+    /* Cache alignment for function entry */
+    .balign 16
+\name:
+    .cfi_startproc
+    .fnstart
+.endm
+
+.macro ENTRY_NO_HIDE name
     .thumb_func
     .type \name, #function
     .global \name
@@ -35,7 +53,22 @@
     .fnstart
 .endm
 
+
 .macro ARM_ENTRY name
+    .arm
+    .type \name, #function
+    .hidden \name  // Hide this as a global symbol, so we do not incur plt calls.
+    .global \name
+    /* Cache alignment for function entry */
+    .balign 16
+\name:
+    .cfi_startproc
+     /* Ensure we get a sane starting CFA. */
+    .cfi_def_cfa sp,0
+    .fnstart
+.endm
+
+.macro ARM_ENTRY_NO_HIDE name
     .arm
     .type \name, #function
     .global \name
@@ -43,6 +76,8 @@
     .balign 16
 \name:
     .cfi_startproc
+     /* Ensure we get a sane starting CFA. */
+    .cfi_def_cfa sp,0
     .fnstart
 .endm
 

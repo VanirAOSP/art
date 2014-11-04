@@ -17,34 +17,48 @@
 #ifndef ART_RUNTIME_MIRROR_ARRAY_H_
 #define ART_RUNTIME_MIRROR_ARRAY_H_
 
+#include "gc_root.h"
+#include "gc/allocator_type.h"
 #include "object.h"
+#include "object_callbacks.h"
 
 namespace art {
+
+template<class T> class Handle;
+
 namespace mirror {
 
 class MANAGED Array : public Object {
  public:
-  // A convenience for code that doesn't know the component size,
-  // and doesn't want to have to work it out itself.
-  static Array* Alloc(Thread* self, Class* array_class, int32_t component_count)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // The size of a java.lang.Class representing an array.
+  static uint32_t ClassSize();
 
+  // Allocates an array with the given properties, if fill_usable is true the array will be of at
+  // least component_count size, however, if there's usable space at the end of the allocation the
+  // array will fill it.
+  template <bool kIsInstrumented>
   static Array* Alloc(Thread* self, Class* array_class, int32_t component_count,
-                      size_t component_size)
+                      size_t component_size, gc::AllocatorType allocator_type,
+                      bool fill_usable = false)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  static Array* CreateMultiArray(Thread* self, Class* element_class, IntArray* dimensions)
+  static Array* CreateMultiArray(Thread* self, Handle<Class> element_class,
+                                 Handle<IntArray> dimensions)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  size_t SizeOf() const;
-
-  int32_t GetLength() const {
-    return GetField32(OFFSET_OF_OBJECT_MEMBER(Array, length_), false);
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags,
+           ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
+  size_t SizeOf() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  int32_t GetLength() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return GetField32<kVerifyFlags>(OFFSET_OF_OBJECT_MEMBER(Array, length_));
   }
 
-  void SetLength(int32_t length) {
+  void SetLength(int32_t length) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     CHECK_GE(length, 0);
-    SetField32(OFFSET_OF_OBJECT_MEMBER(Array, length_), length, false);
+    // We use non transactional version since we can't undo this write. We also disable checking
+    // since it would fail during a transaction.
+    SetField32<false, false, kVerifyNone>(OFFSET_OF_OBJECT_MEMBER(Array, length_), length);
   }
 
   static MemberOffset LengthOffset() {
@@ -60,32 +74,31 @@ class MANAGED Array : public Object {
     }
   }
 
-  void* GetRawData(size_t component_size) {
-    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset(component_size).Int32Value();
+  void* GetRawData(size_t component_size, int32_t index)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset(component_size).Int32Value() +
+        + (index * component_size);
     return reinterpret_cast<void*>(data);
   }
 
-  const void* GetRawData(size_t component_size) const {
-    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset(component_size).Int32Value();
-    return reinterpret_cast<const void*>(data);
+  const void* GetRawData(size_t component_size, int32_t index) const {
+    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset(component_size).Int32Value() +
+        + (index * component_size);
+    return reinterpret_cast<void*>(data);
   }
 
-  bool IsValidIndex(int32_t index) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    if (UNLIKELY(static_cast<uint32_t>(index) >= static_cast<uint32_t>(GetLength()))) {
-      ThrowArrayIndexOutOfBoundsException(index);
-      return false;
-    }
-    return true;
-  }
+  // Returns true if the index is valid. If not, throws an ArrayIndexOutOfBoundsException and
+  // returns false.
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  bool CheckIsValidIndex(int32_t index) ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  protected:
-  void ThrowArrayIndexOutOfBoundsException(int32_t index) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void ThrowArrayStoreException(Object* object) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void ThrowArrayStoreException(Object* object) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  private:
+  void ThrowArrayIndexOutOfBoundsException(int32_t index)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
   // The number of array elements.
   int32_t length_;
   // Marker for the data (used by generated code)
@@ -94,7 +107,7 @@ class MANAGED Array : public Object {
   DISALLOW_IMPLICIT_CONSTRUCTORS(Array);
 };
 
-template<class T>
+template<typename T>
 class MANAGED PrimitiveArray : public Array {
  public:
   typedef T ElementType;
@@ -102,42 +115,70 @@ class MANAGED PrimitiveArray : public Array {
   static PrimitiveArray<T>* Alloc(Thread* self, size_t length)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  const T* GetData() const {
-    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset(sizeof(T)).Int32Value();
-    return reinterpret_cast<T*>(data);
+  const T* GetData() const ALWAYS_INLINE  SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return reinterpret_cast<const T*>(GetRawData(sizeof(T), 0));
   }
 
-  T* GetData() {
-    intptr_t data = reinterpret_cast<intptr_t>(this) + DataOffset(sizeof(T)).Int32Value();
-    return reinterpret_cast<T*>(data);
+  T* GetData() ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return reinterpret_cast<T*>(GetRawData(sizeof(T), 0));
   }
 
-  T Get(int32_t i) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    if (!IsValidIndex(i)) {
-      return T(0);
-    }
+  T Get(int32_t i) ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  T GetWithoutChecks(int32_t i) ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    DCHECK(CheckIsValidIndex(i));
     return GetData()[i];
   }
 
-  void Set(int32_t i, T value) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    if (IsValidIndex(i)) {
-      GetData()[i] = value;
-    }
-  }
+  void Set(int32_t i, T value) ALWAYS_INLINE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  // TODO fix thread safety analysis broken by the use of template. This should be
+  // SHARED_LOCKS_REQUIRED(Locks::mutator_lock_).
+  template<bool kTransactionActive, bool kCheckTransaction = true>
+  void Set(int32_t i, T value) ALWAYS_INLINE NO_THREAD_SAFETY_ANALYSIS;
+
+  // TODO fix thread safety analysis broken by the use of template. This should be
+  // SHARED_LOCKS_REQUIRED(Locks::mutator_lock_).
+  template<bool kTransactionActive, bool kCheckTransaction = true>
+  void SetWithoutChecks(int32_t i, T value) ALWAYS_INLINE NO_THREAD_SAFETY_ANALYSIS;
+
+  /*
+   * Works like memmove(), except we guarantee not to allow tearing of array values (ie using
+   * smaller than element size copies). Arguments are assumed to be within the bounds of the array
+   * and the arrays non-null.
+   */
+  void Memmove(int32_t dst_pos, PrimitiveArray<T>* src, int32_t src_pos, int32_t count)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  /*
+   * Works like memcpy(), except we guarantee not to allow tearing of array values (ie using
+   * smaller than element size copies). Arguments are assumed to be within the bounds of the array
+   * and the arrays non-null.
+   */
+  void Memcpy(int32_t dst_pos, PrimitiveArray<T>* src, int32_t src_pos, int32_t count)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   static void SetArrayClass(Class* array_class) {
-    CHECK(array_class_ == NULL);
-    CHECK(array_class != NULL);
-    array_class_ = array_class;
+    CHECK(array_class_.IsNull());
+    CHECK(array_class != nullptr);
+    array_class_ = GcRoot<Class>(array_class);
+  }
+
+  static Class* GetArrayClass() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    DCHECK(!array_class_.IsNull());
+    return array_class_.Read();
   }
 
   static void ResetArrayClass() {
-    CHECK(array_class_ != NULL);
-    array_class_ = NULL;
+    CHECK(!array_class_.IsNull());
+    array_class_ = GcRoot<Class>(nullptr);
   }
 
+  static void VisitRoots(RootCallback* callback, void* arg)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
  private:
-  static Class* array_class_;
+  static GcRoot<Class> array_class_;
 
   DISALLOW_IMPLICIT_CONSTRUCTORS(PrimitiveArray);
 };

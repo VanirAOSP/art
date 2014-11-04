@@ -20,43 +20,59 @@
 #include "class-inl.h"
 #include "gc/accounting/card_table-inl.h"
 #include "object-inl.h"
+#include "handle_scope-inl.h"
 #include "string.h"
 
 namespace art {
 namespace mirror {
 
-Class* StackTraceElement::java_lang_StackTraceElement_ = NULL;
+GcRoot<Class> StackTraceElement::java_lang_StackTraceElement_;
 
 void StackTraceElement::SetClass(Class* java_lang_StackTraceElement) {
-  CHECK(java_lang_StackTraceElement_ == NULL);
+  CHECK(java_lang_StackTraceElement_.IsNull());
   CHECK(java_lang_StackTraceElement != NULL);
-  java_lang_StackTraceElement_ = java_lang_StackTraceElement;
+  java_lang_StackTraceElement_ = GcRoot<Class>(java_lang_StackTraceElement);
 }
 
 void StackTraceElement::ResetClass() {
-  CHECK(java_lang_StackTraceElement_ != NULL);
-  java_lang_StackTraceElement_ = NULL;
+  CHECK(!java_lang_StackTraceElement_.IsNull());
+  java_lang_StackTraceElement_ = GcRoot<Class>(nullptr);
 }
 
-StackTraceElement* StackTraceElement::Alloc(Thread* self,
-                                            String* declaring_class,
-                                            String* method_name,
-                                            String* file_name,
+StackTraceElement* StackTraceElement::Alloc(Thread* self, Handle<String> declaring_class,
+                                            Handle<String> method_name, Handle<String> file_name,
                                             int32_t line_number) {
   StackTraceElement* trace =
       down_cast<StackTraceElement*>(GetStackTraceElement()->AllocObject(self));
   if (LIKELY(trace != NULL)) {
-    trace->SetFieldObject(OFFSET_OF_OBJECT_MEMBER(StackTraceElement, declaring_class_),
-                          const_cast<String*>(declaring_class), false);
-    trace->SetFieldObject(OFFSET_OF_OBJECT_MEMBER(StackTraceElement, method_name_),
-                          const_cast<String*>(method_name), false);
-    trace->SetFieldObject(OFFSET_OF_OBJECT_MEMBER(StackTraceElement, file_name_),
-                          const_cast<String*>(file_name), false);
-    trace->SetField32(OFFSET_OF_OBJECT_MEMBER(StackTraceElement, line_number_),
-                      line_number, false);
+    if (Runtime::Current()->IsActiveTransaction()) {
+      trace->Init<true>(declaring_class, method_name, file_name, line_number);
+    } else {
+      trace->Init<false>(declaring_class, method_name, file_name, line_number);
+    }
   }
   return trace;
 }
+
+template<bool kTransactionActive>
+void StackTraceElement::Init(Handle<String> declaring_class, Handle<String> method_name,
+                             Handle<String> file_name, int32_t line_number) {
+  SetFieldObject<kTransactionActive>(OFFSET_OF_OBJECT_MEMBER(StackTraceElement, declaring_class_),
+                                     declaring_class.Get());
+  SetFieldObject<kTransactionActive>(OFFSET_OF_OBJECT_MEMBER(StackTraceElement, method_name_),
+                                     method_name.Get());
+  SetFieldObject<kTransactionActive>(OFFSET_OF_OBJECT_MEMBER(StackTraceElement, file_name_),
+                                     file_name.Get());
+  SetField32<kTransactionActive>(OFFSET_OF_OBJECT_MEMBER(StackTraceElement, line_number_),
+                                 line_number);
+}
+
+void StackTraceElement::VisitRoots(RootCallback* callback, void* arg) {
+  if (!java_lang_StackTraceElement_.IsNull()) {
+    java_lang_StackTraceElement_.VisitRoot(callback, arg, 0, kRootStickyClass);
+  }
+}
+
 
 }  // namespace mirror
 }  // namespace art

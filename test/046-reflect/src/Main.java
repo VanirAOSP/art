@@ -335,11 +335,12 @@ public class Main {
             System.out.println("  cantTouchThis is " + intVal);
             try {
                 field.setInt(instance, 99);
+                System.out.println("ERROR: set-final did not throw exception");
             } catch (IllegalAccessException iae) {
-                System.out.println("ERROR: set-final failed");
+                System.out.println("  as expected: set-final throws exception");
             }
             intVal = field.getInt(instance);
-            System.out.println("  cantTouchThis is now " + intVal);
+            System.out.println("  cantTouchThis is still " + intVal);
 
             System.out.println("  " + field + " accessible=" + field.isAccessible());
             field.setAccessible(true);
@@ -360,6 +361,27 @@ public class Main {
             System.out.println("cons modifiers=" + cons.getModifiers());
             targ = cons.newInstance(args);
             targ.myMethod(17);
+
+            try {
+                Thrower thrower = Thrower.class.newInstance();
+                System.out.println("ERROR: Class.newInstance did not throw exception");
+            } catch (UnsupportedOperationException uoe) {
+                System.out.println("got expected exception for Class.newInstance");
+            } catch (Exception e) {
+                System.out.println("ERROR: Class.newInstance got unexpected exception: " +
+                                   e.getClass().getName());
+            }
+
+            try {
+                Constructor<Thrower> constructor = Thrower.class.getDeclaredConstructor();
+                Thrower thrower = constructor.newInstance();
+                System.out.println("ERROR: Constructor.newInstance did not throw exception");
+            } catch (InvocationTargetException ite) {
+                System.out.println("got expected exception for Constructor.newInstance");
+            } catch (Exception e) {
+                System.out.println("ERROR: Constructor.newInstance got unexpected exception: " +
+                                   e.getClass().getName());
+            }
 
         } catch (Exception ex) {
             System.out.println("----- unexpected exception -----");
@@ -667,4 +689,10 @@ class MethodNoisyInitUser {
   }
   public static void staticMethod() {}
   public void createMethodNoisyInit(MethodNoisyInit ni) {}
+}
+
+class Thrower {
+  public Thrower() throws UnsupportedOperationException {
+    throw new UnsupportedOperationException();
+  }
 }

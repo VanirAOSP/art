@@ -17,12 +17,14 @@
 #ifndef ART_RUNTIME_GC_SPACE_SPACE_H_
 #define ART_RUNTIME_GC_SPACE_SPACE_H_
 
+#include <memory>
 #include <string>
 
-#include "UniquePtr.h"
+#include "atomic.h"
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "gc/accounting/space_bitmap.h"
+#include "gc/collector/garbage_collector.h"
 #include "globals.h"
 #include "image.h"
 #include "mem_map.h"
@@ -34,17 +36,21 @@ namespace mirror {
 
 namespace gc {
 
-namespace accounting {
-  class SpaceBitmap;
-}  // namespace accounting
-
 class Heap;
 
 namespace space {
 
+class AllocSpace;
+class BumpPointerSpace;
+class ContinuousMemMapAllocSpace;
+class ContinuousSpace;
+class DiscontinuousSpace;
+class MallocSpace;
 class DlMallocSpace;
+class RosAllocSpace;
 class ImageSpace;
 class LargeObjectSpace;
+class ZygoteSpace;
 
 static constexpr bool kDebugSpaces = kIsDebugBuild;
 
@@ -62,8 +68,9 @@ std::ostream& operator<<(std::ostream& os, const GcRetentionPolicy& policy);
 
 enum SpaceType {
   kSpaceTypeImageSpace,
-  kSpaceTypeAllocSpace,
+  kSpaceTypeMallocSpace,
   kSpaceTypeZygoteSpace,
+  kSpaceTypeBumpPointerSpace,
   kSpaceTypeLargeObjectSpace,
 };
 std::ostream& operator<<(std::ostream& os, const SpaceType& space_type);
@@ -84,11 +91,6 @@ class Space {
     return gc_retention_policy_;
   }
 
-  // Does the space support allocation?
-  virtual bool CanAllocateInto() const {
-    return true;
-  }
-
   // Is the given object contained within this space?
   virtual bool Contains(const mirror::Object* obj) const = 0;
 
@@ -102,22 +104,62 @@ class Space {
   ImageSpace* AsImageSpace();
 
   // Is this a dlmalloc backed allocation space?
-  bool IsDlMallocSpace() const {
+  bool IsMallocSpace() const {
     SpaceType type = GetType();
-    return type == kSpaceTypeAllocSpace || type == kSpaceTypeZygoteSpace;
+    return type == kSpaceTypeMallocSpace;
   }
-  DlMallocSpace* AsDlMallocSpace();
+  MallocSpace* AsMallocSpace();
 
-  // Is this the space allocated into by the Zygote and no-longer in use?
+  virtual bool IsDlMallocSpace() const {
+    return false;
+  }
+  virtual DlMallocSpace* AsDlMallocSpace();
+
+  virtual bool IsRosAllocSpace() const {
+    return false;
+  }
+  virtual RosAllocSpace* AsRosAllocSpace();
+
+  // Is this the space allocated into by the Zygote and no-longer in use for allocation?
   bool IsZygoteSpace() const {
     return GetType() == kSpaceTypeZygoteSpace;
   }
+  virtual ZygoteSpace* AsZygoteSpace();
+
+  // Is this space a bump pointer space?
+  bool IsBumpPointerSpace() const {
+    return GetType() == kSpaceTypeBumpPointerSpace;
+  }
+  virtual BumpPointerSpace* AsBumpPointerSpace();
 
   // Does this space hold large objects and implement the large object space abstraction?
   bool IsLargeObjectSpace() const {
     return GetType() == kSpaceTypeLargeObjectSpace;
   }
   LargeObjectSpace* AsLargeObjectSpace();
+
+  virtual bool IsContinuousSpace() const {
+    return false;
+  }
+  ContinuousSpace* AsContinuousSpace();
+
+  virtual bool IsDiscontinuousSpace() const {
+    return false;
+  }
+  DiscontinuousSpace* AsDiscontinuousSpace();
+
+  virtual bool IsAllocSpace() const {
+    return false;
+  }
+  virtual AllocSpace* AsAllocSpace();
+
+  virtual bool IsContinuousMemMapAllocSpace() const {
+    return false;
+  }
+  virtual ContinuousMemMapAllocSpace* AsContinuousMemMapAllocSpace();
+
+  // Returns true if objects in the space are movable.
+  virtual bool CanMoveObjects() const = 0;
 
   virtual ~Space() {}
 
@@ -131,13 +173,13 @@ class Space {
   // Name of the space that may vary due to the Zygote fork.
   std::string name_;
 
- private:
+ protected:
   // When should objects within this space be reclaimed? Not constant as we vary it in the case
   // of Zygote forking.
   GcRetentionPolicy gc_retention_policy_;
 
+ private:
   friend class art::gc::Heap;
-
   DISALLOW_COPY_AND_ASSIGN(Space);
 };
 std::ostream& operator<<(std::ostream& os, const Space& space);
@@ -149,18 +191,23 @@ class AllocSpace {
   virtual uint64_t GetBytesAllocated() = 0;
   // Number of objects currently allocated.
   virtual uint64_t GetObjectsAllocated() = 0;
-  // Number of bytes allocated since the space was created.
-  virtual uint64_t GetTotalBytesAllocated() = 0;
-  // Number of objects allocated since the space was created.
-  virtual uint64_t GetTotalObjectsAllocated() = 0;
 
   // Allocate num_bytes without allowing growth. If the allocation
   // succeeds, the output parameter bytes_allocated will be set to the
   // actually allocated bytes which is >= num_bytes.
-  virtual mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated) = 0;
+  // Alloc can be called from multiple threads at the same time and must be thread-safe.
+  virtual mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated,
+                                size_t* usable_size) = 0;
+
+  // Thread-unsafe allocation for when mutators are suspended, used by the semispace collector.
+  virtual mirror::Object* AllocThreadUnsafe(Thread* self, size_t num_bytes, size_t* bytes_allocated,
+                                            size_t* usable_size)
+      EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return Alloc(self, num_bytes, bytes_allocated, usable_size);
+  }
 
   // Return the storage space required by obj.
-  virtual size_t AllocationSize(const mirror::Object* obj) = 0;
+  virtual size_t AllocationSize(mirror::Object* obj, size_t* usable_size) = 0;
 
   // Returns how many bytes were freed.
   virtual size_t Free(Thread* self, mirror::Object* ptr) = 0;
@@ -168,7 +215,25 @@ class AllocSpace {
   // Returns how many bytes were freed.
   virtual size_t FreeList(Thread* self, size_t num_ptrs, mirror::Object** ptrs) = 0;
 
+  // Revoke any sort of thread-local buffers that are used to speed up allocations for the given
+  // thread, if the alloc space implementation uses any.
+  virtual void RevokeThreadLocalBuffers(Thread* thread) = 0;
+
+  // Revoke any sort of thread-local buffers that are used to speed up allocations for all the
+  // threads, if the alloc space implementation uses any.
+  virtual void RevokeAllThreadLocalBuffers() = 0;
+
+  virtual void LogFragmentationAllocFailure(std::ostream& os, size_t failed_alloc_bytes) = 0;
+
  protected:
+  struct SweepCallbackContext {
+    SweepCallbackContext(bool swap_bitmaps, space::Space* space);
+    const bool swap_bitmaps;
+    space::Space* const space;
+    Thread* const self;
+    collector::ObjectBytePair freed;
+  };
+
   AllocSpace() {}
   virtual ~AllocSpace() {}
 
@@ -180,14 +245,29 @@ class AllocSpace {
 // continuous spaces can be marked in the card table.
 class ContinuousSpace : public Space {
  public:
-  // Address at which the space begins
+  // Address at which the space begins.
   byte* Begin() const {
     return begin_;
   }
 
-  // Address at which the space ends, which may vary as the space is filled.
+  // Current address at which the space ends, which may vary as the space is filled.
   byte* End() const {
-    return end_;
+    return end_.LoadRelaxed();
+  }
+
+  // The end of the address range covered by the space.
+  byte* Limit() const {
+    return limit_;
+  }
+
+  // Change the end of the space. Be careful with use since changing the end of a space to an
+  // invalid value may break the GC.
+  void SetEnd(byte* end) {
+    end_.StoreRelaxed(end);
+  }
+
+  void SetLimit(byte* limit) {
+    limit_ = limit;
   }
 
   // Current size of space
@@ -195,34 +275,45 @@ class ContinuousSpace : public Space {
     return End() - Begin();
   }
 
-  virtual accounting::SpaceBitmap* GetLiveBitmap() const = 0;
-  virtual accounting::SpaceBitmap* GetMarkBitmap() const = 0;
+  virtual accounting::ContinuousSpaceBitmap* GetLiveBitmap() const = 0;
+  virtual accounting::ContinuousSpaceBitmap* GetMarkBitmap() const = 0;
+
+  // Maximum which the mapped space can grow to.
+  virtual size_t Capacity() const {
+    return Limit() - Begin();
+  }
 
   // Is object within this space? We check to see if the pointer is beyond the end first as
   // continuous spaces are iterated over from low to high.
   bool HasAddress(const mirror::Object* obj) const {
     const byte* byte_ptr = reinterpret_cast<const byte*>(obj);
-    return byte_ptr < End() && byte_ptr >= Begin();
+    return byte_ptr >= Begin() && byte_ptr < Limit();
   }
 
   bool Contains(const mirror::Object* obj) const {
     return HasAddress(obj);
   }
 
+  virtual bool IsContinuousSpace() const {
+    return true;
+  }
+
   virtual ~ContinuousSpace() {}
 
  protected:
   ContinuousSpace(const std::string& name, GcRetentionPolicy gc_retention_policy,
-                  byte* begin, byte* end) :
-      Space(name, gc_retention_policy), begin_(begin), end_(end) {
+                  byte* begin, byte* end, byte* limit) :
+      Space(name, gc_retention_policy), begin_(begin), end_(end), limit_(limit) {
   }
 
-
   // The beginning of the storage for fast access.
-  byte* const begin_;
+  byte* begin_;
 
   // Current end of the space.
-  byte* end_;
+  Atomic<byte*> end_;
+
+  // Limit of the space.
+  byte* limit_;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(ContinuousSpace);
@@ -233,12 +324,16 @@ class ContinuousSpace : public Space {
 // is suitable for use for large primitive arrays.
 class DiscontinuousSpace : public Space {
  public:
-  accounting::SpaceSetMap* GetLiveObjects() const {
-    return live_objects_.get();
+  accounting::LargeObjectBitmap* GetLiveBitmap() const {
+    return live_bitmap_.get();
   }
 
-  accounting::SpaceSetMap* GetMarkObjects() const {
-    return mark_objects_.get();
+  accounting::LargeObjectBitmap* GetMarkBitmap() const {
+    return mark_bitmap_.get();
+  }
+
+  virtual bool IsDiscontinuousSpace() const OVERRIDE {
+    return true;
   }
 
   virtual ~DiscontinuousSpace() {}
@@ -246,8 +341,8 @@ class DiscontinuousSpace : public Space {
  protected:
   DiscontinuousSpace(const std::string& name, GcRetentionPolicy gc_retention_policy);
 
-  UniquePtr<accounting::SpaceSetMap> live_objects_;
-  UniquePtr<accounting::SpaceSetMap> mark_objects_;
+  std::unique_ptr<accounting::LargeObjectBitmap> live_bitmap_;
+  std::unique_ptr<accounting::LargeObjectBitmap> mark_bitmap_;
 
  private:
   DISALLOW_COPY_AND_ASSIGN(DiscontinuousSpace);
@@ -255,23 +350,10 @@ class DiscontinuousSpace : public Space {
 
 class MemMapSpace : public ContinuousSpace {
  public:
-  // Maximum which the mapped space can grow to.
-  virtual size_t Capacity() const {
-    return mem_map_->Size();
-  }
-
   // Size of the space without a limit on its growth. By default this is just the Capacity, but
   // for the allocation space we support starting with a small heap and then extending it.
   virtual size_t NonGrowthLimitCapacity() const {
     return Capacity();
-  }
-
- protected:
-  MemMapSpace(const std::string& name, MemMap* mem_map, size_t initial_size,
-              GcRetentionPolicy gc_retention_policy)
-      : ContinuousSpace(name, gc_retention_policy,
-                        mem_map->Begin(), mem_map->Begin() + initial_size),
-        mem_map_(mem_map) {
   }
 
   MemMap* GetMemMap() {
@@ -282,11 +364,75 @@ class MemMapSpace : public ContinuousSpace {
     return mem_map_.get();
   }
 
- private:
-  // Underlying storage of the space
-  UniquePtr<MemMap> mem_map_;
+  MemMap* ReleaseMemMap() {
+    return mem_map_.release();
+  }
 
+ protected:
+  MemMapSpace(const std::string& name, MemMap* mem_map, byte* begin, byte* end, byte* limit,
+              GcRetentionPolicy gc_retention_policy)
+      : ContinuousSpace(name, gc_retention_policy, begin, end, limit),
+        mem_map_(mem_map) {
+  }
+
+  // Underlying storage of the space
+  std::unique_ptr<MemMap> mem_map_;
+
+ private:
   DISALLOW_COPY_AND_ASSIGN(MemMapSpace);
+};
+
+// Used by the heap compaction interface to enable copying from one type of alloc space to another.
+class ContinuousMemMapAllocSpace : public MemMapSpace, public AllocSpace {
+ public:
+  bool IsAllocSpace() const OVERRIDE {
+    return true;
+  }
+  AllocSpace* AsAllocSpace() OVERRIDE {
+    return this;
+  }
+
+  bool IsContinuousMemMapAllocSpace() const OVERRIDE {
+    return true;
+  }
+  ContinuousMemMapAllocSpace* AsContinuousMemMapAllocSpace() {
+    return this;
+  }
+
+  bool HasBoundBitmaps() const EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_);
+  void BindLiveToMarkBitmap()
+      EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_);
+  void UnBindBitmaps() EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_);
+  // Swap the live and mark bitmaps of this space. This is used by the GC for concurrent sweeping.
+  void SwapBitmaps();
+
+  // Clear the space back to an empty space.
+  virtual void Clear() = 0;
+
+  accounting::ContinuousSpaceBitmap* GetLiveBitmap() const OVERRIDE {
+    return live_bitmap_.get();
+  }
+
+  accounting::ContinuousSpaceBitmap* GetMarkBitmap() const OVERRIDE {
+    return mark_bitmap_.get();
+  }
+
+  collector::ObjectBytePair Sweep(bool swap_bitmaps);
+  virtual accounting::ContinuousSpaceBitmap::SweepCallback* GetSweepCallback() = 0;
+
+ protected:
+  std::unique_ptr<accounting::ContinuousSpaceBitmap> live_bitmap_;
+  std::unique_ptr<accounting::ContinuousSpaceBitmap> mark_bitmap_;
+  std::unique_ptr<accounting::ContinuousSpaceBitmap> temp_bitmap_;
+
+  ContinuousMemMapAllocSpace(const std::string& name, MemMap* mem_map, byte* begin,
+                             byte* end, byte* limit, GcRetentionPolicy gc_retention_policy)
+      : MemMapSpace(name, mem_map, begin, end, limit, gc_retention_policy) {
+  }
+
+ private:
+  friend class gc::Heap;
+  DISALLOW_COPY_AND_ASSIGN(ContinuousMemMapAllocSpace);
 };
 
 }  // namespace space

@@ -19,18 +19,21 @@
 #include <signal.h>
 #include <string.h>
 #include <sys/utsname.h>
+#include <inttypes.h>
 
 #include "base/logging.h"
 #include "base/mutex.h"
 #include "base/stringprintf.h"
-#include "thread.h"
+#include "thread-inl.h"
 #include "utils.h"
 
 namespace art {
 
+static constexpr bool kDumpHeapObjectOnSigsevg = false;
+
 struct Backtrace {
   void Dump(std::ostream& os) {
-    DumpNativeStack(os, GetTid(), "\t", true);
+    DumpNativeStack(os, GetTid(), "\t");
   }
 };
 
@@ -133,7 +136,7 @@ struct UContext {
 
   void Dump(std::ostream& os) {
     // TODO: support non-x86 hosts (not urgent because this code doesn't run on targets).
-#if defined(__APPLE__)
+#if defined(__APPLE__) && defined(__i386__)
     DumpRegister32(os, "eax", context->__ss.__eax);
     DumpRegister32(os, "ebx", context->__ss.__ebx);
     DumpRegister32(os, "ecx", context->__ss.__ecx);
@@ -159,7 +162,7 @@ struct UContext {
     os << '\n';
     DumpRegister32(os, "gs",  context->__ss.__gs);
     DumpRegister32(os, "ss",  context->__ss.__ss);
-#else
+#elif defined(__linux__) && defined(__i386__)
     DumpRegister32(os, "eax", context.gregs[REG_EAX]);
     DumpRegister32(os, "ebx", context.gregs[REG_EBX]);
     DumpRegister32(os, "ecx", context.gregs[REG_ECX]);
@@ -185,11 +188,52 @@ struct UContext {
     os << '\n';
     DumpRegister32(os, "gs",  context.gregs[REG_GS]);
     DumpRegister32(os, "ss",  context.gregs[REG_SS]);
+#elif defined(__linux__) && defined(__x86_64__)
+    DumpRegister64(os, "rax", context.gregs[REG_RAX]);
+    DumpRegister64(os, "rbx", context.gregs[REG_RBX]);
+    DumpRegister64(os, "rcx", context.gregs[REG_RCX]);
+    DumpRegister64(os, "rdx", context.gregs[REG_RDX]);
+    os << '\n';
+
+    DumpRegister64(os, "rdi", context.gregs[REG_RDI]);
+    DumpRegister64(os, "rsi", context.gregs[REG_RSI]);
+    DumpRegister64(os, "rbp", context.gregs[REG_RBP]);
+    DumpRegister64(os, "rsp", context.gregs[REG_RSP]);
+    os << '\n';
+
+    DumpRegister64(os, "r8 ", context.gregs[REG_R8]);
+    DumpRegister64(os, "r9 ", context.gregs[REG_R9]);
+    DumpRegister64(os, "r10", context.gregs[REG_R10]);
+    DumpRegister64(os, "r11", context.gregs[REG_R11]);
+    os << '\n';
+
+    DumpRegister64(os, "r12", context.gregs[REG_R12]);
+    DumpRegister64(os, "r13", context.gregs[REG_R13]);
+    DumpRegister64(os, "r14", context.gregs[REG_R14]);
+    DumpRegister64(os, "r15", context.gregs[REG_R15]);
+    os << '\n';
+
+    DumpRegister64(os, "rip", context.gregs[REG_RIP]);
+    os << "   ";
+    DumpRegister32(os, "eflags", context.gregs[REG_EFL]);
+    DumpX86Flags(os, context.gregs[REG_EFL]);
+    os << '\n';
+
+    DumpRegister32(os, "cs",  (context.gregs[REG_CSGSFS]) & 0x0FFFF);
+    DumpRegister32(os, "gs",  (context.gregs[REG_CSGSFS] >> 16) & 0x0FFFF);
+    DumpRegister32(os, "fs",  (context.gregs[REG_CSGSFS] >> 32) & 0x0FFFF);
+    os << '\n';
+#else
+    os << "Unknown architecture/word size/OS in ucontext dump";
 #endif
   }
 
   void DumpRegister32(std::ostream& os, const char* name, uint32_t value) {
     os << StringPrintf(" %6s: 0x%08x", name, value);
+  }
+
+  void DumpRegister64(std::ostream& os, const char* name, uint64_t value) {
+    os << StringPrintf(" %6s: 0x%016" PRIx64, name, value);
   }
 
   void DumpX86Flags(std::ostream& os, uint32_t flags) {
@@ -263,7 +307,15 @@ void HandleUnexpectedSignal(int signal_number, siginfo_t* info, void* raw_contex
                       << "Thread: " << tid << " \"" << thread_name << "\"\n"
                       << "Registers:\n" << Dumpable<UContext>(thread_context) << "\n"
                       << "Backtrace:\n" << Dumpable<Backtrace>(thread_backtrace);
-
+  Runtime* runtime = Runtime::Current();
+  if (runtime != nullptr) {
+    gc::Heap* heap = runtime->GetHeap();
+    LOG(INTERNAL_FATAL) << "Fault message: " << runtime->GetFaultMessage();
+    if (kDumpHeapObjectOnSigsevg && heap != nullptr && info != nullptr) {
+      LOG(INTERNAL_FATAL) << "Dump heap object at fault address: ";
+      heap->DumpObject(LOG(INTERNAL_FATAL), reinterpret_cast<mirror::Object*>(info->si_addr));
+    }
+  }
   if (getenv("debug_db_uid") != NULL || getenv("art_wait_for_gdb_on_crash") != NULL) {
     LOG(INTERNAL_FATAL) << "********************************************************\n"
                         << "* Process " << getpid() << " thread " << tid << " \"" << thread_name << "\""
@@ -275,7 +327,7 @@ void HandleUnexpectedSignal(int signal_number, siginfo_t* info, void* raw_contex
     while (true) {
     }
   }
-
+#ifdef __linux__
   // Remove our signal handler for this signal...
   struct sigaction action;
   memset(&action, 0, sizeof(action));
@@ -284,6 +336,9 @@ void HandleUnexpectedSignal(int signal_number, siginfo_t* info, void* raw_contex
   sigaction(signal_number, &action, NULL);
   // ...and re-raise so we die with the appropriate status.
   kill(getpid(), signal_number);
+#else
+  exit(EXIT_FAILURE);
+#endif
 }
 
 void Runtime::InitPlatformSignalHandlers() {

@@ -17,9 +17,6 @@
 #ifndef ART_RUNTIME_MIRROR_CLASS_LOADER_H_
 #define ART_RUNTIME_MIRROR_CLASS_LOADER_H_
 
-#include <vector>
-
-#include "dex_file.h"
 #include "mirror/object.h"
 
 namespace art {
@@ -30,11 +27,20 @@ namespace mirror {
 
 // C++ mirror of java.lang.ClassLoader
 class MANAGED ClassLoader : public Object {
+ public:
+  // Size of an instance of java.lang.ClassLoader.
+  static constexpr uint32_t InstanceSize() {
+    return sizeof(ClassLoader);
+  }
+  ClassLoader* GetParent() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return GetFieldObject<ClassLoader>(OFFSET_OF_OBJECT_MEMBER(ClassLoader, parent_));
+  }
+
  private:
   // Field order required by test "ValidateFieldOrderOfJavaCppUnionClasses".
-  Object* packages_;
-  ClassLoader* parent_;
-  Object* proxyCache_;
+  HeapReference<Object> packages_;
+  HeapReference<ClassLoader> parent_;
+  HeapReference<Object> proxyCache_;
 
   friend struct art::ClassLoaderOffsets;  // for verifying offset information
   DISALLOW_IMPLICIT_CONSTRUCTORS(ClassLoader);

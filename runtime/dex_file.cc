@@ -23,6 +23,7 @@
 #include <string.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <memory>
 
 #include "base/logging.h"
 #include "base/stringprintf.h"
@@ -36,9 +37,10 @@
 #include "mirror/string.h"
 #include "os.h"
 #include "safe_map.h"
+#include "ScopedFd.h"
+#include "handle_scope-inl.h"
 #include "thread.h"
-#include "UniquePtr.h"
-#include "utf.h"
+#include "utf-inl.h"
 #include "utils.h"
 #include "well_known_classes.h"
 #include "zip_archive.h"
@@ -48,86 +50,97 @@ namespace art {
 const byte DexFile::kDexMagic[] = { 'd', 'e', 'x', '\n' };
 const byte DexFile::kDexMagicVersion[] = { '0', '3', '5', '\0' };
 
-DexFile::ClassPathEntry DexFile::FindInClassPath(const char* descriptor,
-                                                 const ClassPath& class_path) {
-  for (size_t i = 0; i != class_path.size(); ++i) {
-    const DexFile* dex_file = class_path[i];
-    const DexFile::ClassDef* dex_class_def = dex_file->FindClassDef(descriptor);
-    if (dex_class_def != NULL) {
-      return ClassPathEntry(dex_file, dex_class_def);
-    }
-  }
-  // TODO: remove reinterpret_cast when issue with -std=gnu++0x host issue resolved
-  return ClassPathEntry(reinterpret_cast<const DexFile*>(NULL),
-                        reinterpret_cast<const DexFile::ClassDef*>(NULL));
-}
-
-int OpenAndReadMagic(const std::string& filename, uint32_t* magic) {
+static int OpenAndReadMagic(const char* filename, uint32_t* magic, std::string* error_msg) {
   CHECK(magic != NULL);
-  int fd = open(filename.c_str(), O_RDONLY, 0);
-  if (fd == -1) {
-    PLOG(WARNING) << "Unable to open '" << filename << "'";
+  ScopedFd fd(open(filename, O_RDONLY, 0));
+  if (fd.get() == -1) {
+    *error_msg = StringPrintf("Unable to open '%s' : %s", filename, strerror(errno));
     return -1;
   }
-  int n = TEMP_FAILURE_RETRY(read(fd, magic, sizeof(*magic)));
+  int n = TEMP_FAILURE_RETRY(read(fd.get(), magic, sizeof(*magic)));
   if (n != sizeof(*magic)) {
-    PLOG(ERROR) << "Failed to find magic in '" << filename << "'";
+    *error_msg = StringPrintf("Failed to find magic in '%s'", filename);
     return -1;
   }
-  if (lseek(fd, 0, SEEK_SET) != 0) {
-    PLOG(ERROR) << "Failed to seek to beginning of file '" << filename << "'";
+  if (lseek(fd.get(), 0, SEEK_SET) != 0) {
+    *error_msg = StringPrintf("Failed to seek to beginning of file '%s' : %s", filename,
+                              strerror(errno));
     return -1;
   }
-  return fd;
+  return fd.release();
 }
 
-bool DexFile::GetChecksum(const std::string& filename, uint32_t* checksum) {
+bool DexFile::GetChecksum(const char* filename, uint32_t* checksum, std::string* error_msg) {
   CHECK(checksum != NULL);
   uint32_t magic;
-  int fd = OpenAndReadMagic(filename, &magic);
-  if (fd == -1) {
+
+  // Strip ":...", which is the location
+  const char* zip_entry_name = kClassesDex;
+  const char* file_part = filename;
+  std::string file_part_storage;
+
+  if (DexFile::IsMultiDexLocation(filename)) {
+    file_part_storage = GetBaseLocation(filename);
+    file_part = file_part_storage.c_str();
+    zip_entry_name = filename + file_part_storage.size() + 1;
+    DCHECK_EQ(zip_entry_name[-1], kMultiDexSeparator);
+  }
+
+  ScopedFd fd(OpenAndReadMagic(file_part, &magic, error_msg));
+  if (fd.get() == -1) {
+    DCHECK(!error_msg->empty());
     return false;
   }
   if (IsZipMagic(magic)) {
-    UniquePtr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(fd));
+    std::unique_ptr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(fd.release(), filename, error_msg));
     if (zip_archive.get() == NULL) {
+      *error_msg = StringPrintf("Failed to open zip archive '%s'", file_part);
       return false;
     }
-    UniquePtr<ZipEntry> zip_entry(zip_archive->Find(kClassesDex));
+    std::unique_ptr<ZipEntry> zip_entry(zip_archive->Find(zip_entry_name, error_msg));
     if (zip_entry.get() == NULL) {
-      LOG(ERROR) << "Zip archive '" << filename << "' doesn't contain " << kClassesDex;
+      *error_msg = StringPrintf("Zip archive '%s' doesn't contain %s (error msg: %s)", file_part,
+                                zip_entry_name, error_msg->c_str());
       return false;
     }
     *checksum = zip_entry->GetCrc32();
     return true;
   }
   if (IsDexMagic(magic)) {
-    UniquePtr<const DexFile> dex_file(DexFile::OpenFile(fd, filename, false));
+    std::unique_ptr<const DexFile> dex_file(DexFile::OpenFile(fd.release(), filename, false, error_msg));
     if (dex_file.get() == NULL) {
       return false;
     }
     *checksum = dex_file->GetHeader().checksum_;
     return true;
   }
-  LOG(ERROR) << "Expected valid zip or dex file: " << filename;
+  *error_msg = StringPrintf("Expected valid zip or dex file: '%s'", filename);
   return false;
 }
 
-const DexFile* DexFile::Open(const std::string& filename,
-                             const std::string& location) {
+bool DexFile::Open(const char* filename, const char* location, std::string* error_msg,
+                   std::vector<const DexFile*>* dex_files) {
   uint32_t magic;
-  int fd = OpenAndReadMagic(filename, &magic);
-  if (fd == -1) {
-    return NULL;
+  ScopedFd fd(OpenAndReadMagic(filename, &magic, error_msg));
+  if (fd.get() == -1) {
+    DCHECK(!error_msg->empty());
+    return false;
   }
   if (IsZipMagic(magic)) {
-    return DexFile::OpenZip(fd, location);
+    return DexFile::OpenZip(fd.release(), location, error_msg, dex_files);
   }
   if (IsDexMagic(magic)) {
-    return DexFile::OpenFile(fd, location, true);
+    std::unique_ptr<const DexFile> dex_file(DexFile::OpenFile(fd.release(), location, true,
+                                                              error_msg));
+    if (dex_file.get() != nullptr) {
+      dex_files->push_back(dex_file.release());
+      return true;
+    } else {
+      return false;
+    }
   }
-  LOG(ERROR) << "Expected valid zip or dex file: " << filename;
-  return NULL;
+  *error_msg = StringPrintf("Expected valid zip or dex file: '%s'", filename);
+  return false;
 }
 
 int DexFile::GetPermissions() const {
@@ -160,46 +173,48 @@ bool DexFile::DisableWrite() const {
   }
 }
 
-const DexFile* DexFile::OpenFile(int fd,
-                                 const std::string& location,
-                                 bool verify) {
-  CHECK(!location.empty());
-  struct stat sbuf;
-  memset(&sbuf, 0, sizeof(sbuf));
-  if (fstat(fd, &sbuf) == -1) {
-    PLOG(ERROR) << "fstat \"" << location << "\" failed";
-    close(fd);
-    return NULL;
+const DexFile* DexFile::OpenFile(int fd, const char* location, bool verify,
+                                 std::string* error_msg) {
+  CHECK(location != nullptr);
+  std::unique_ptr<MemMap> map;
+  {
+    ScopedFd delayed_close(fd);
+    struct stat sbuf;
+    memset(&sbuf, 0, sizeof(sbuf));
+    if (fstat(fd, &sbuf) == -1) {
+      *error_msg = StringPrintf("DexFile: fstat '%s' failed: %s", location, strerror(errno));
+      return nullptr;
+    }
+    if (S_ISDIR(sbuf.st_mode)) {
+      *error_msg = StringPrintf("Attempt to mmap directory '%s'", location);
+      return nullptr;
+    }
+    size_t length = sbuf.st_size;
+    map.reset(MemMap::MapFile(length, PROT_READ, MAP_PRIVATE, fd, 0, location, error_msg));
+    if (map.get() == nullptr) {
+      DCHECK(!error_msg->empty());
+      return nullptr;
+    }
   }
-  if (S_ISDIR(sbuf.st_mode)) {
-    LOG(ERROR) << "attempt to mmap directory \"" << location << "\"";
-    return NULL;
-  }
-  size_t length = sbuf.st_size;
-  UniquePtr<MemMap> map(MemMap::MapFile(length, PROT_READ, MAP_PRIVATE, fd, 0));
-  if (map.get() == NULL) {
-    LOG(ERROR) << "mmap \"" << location << "\" failed";
-    close(fd);
-    return NULL;
-  }
-  close(fd);
 
   if (map->Size() < sizeof(DexFile::Header)) {
-    LOG(ERROR) << "Failed to open dex file '" << location << "' that is too short to have a header";
-    return NULL;
+    *error_msg = StringPrintf(
+        "DexFile: failed to open dex file '%s' that is too short to have a header", location);
+    return nullptr;
   }
 
   const Header* dex_header = reinterpret_cast<const Header*>(map->Begin());
 
-  const DexFile* dex_file = OpenMemory(location, dex_header->checksum_, map.release());
-  if (dex_file == NULL) {
-    LOG(ERROR) << "Failed to open dex file '" << location << "' from memory";
-    return NULL;
+  const DexFile* dex_file = OpenMemory(location, dex_header->checksum_, map.release(), error_msg);
+  if (dex_file == nullptr) {
+    *error_msg = StringPrintf("Failed to open dex file '%s' from memory: %s", location,
+                              error_msg->c_str());
+    return nullptr;
   }
 
-  if (verify && !DexFileVerifier::Verify(dex_file, dex_file->Begin(), dex_file->Size())) {
-    LOG(ERROR) << "Failed to verify dex file '" << location << "'";
-    return NULL;
+  if (verify && !DexFileVerifier::Verify(dex_file, dex_file->Begin(), dex_file->Size(), location,
+                                         error_msg)) {
+    return nullptr;
   }
 
   return dex_file;
@@ -207,66 +222,141 @@ const DexFile* DexFile::OpenFile(int fd,
 
 const char* DexFile::kClassesDex = "classes.dex";
 
-const DexFile* DexFile::OpenZip(int fd, const std::string& location) {
-  UniquePtr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(fd));
-  if (zip_archive.get() == NULL) {
-    LOG(ERROR) << "Failed to open " << location << " when looking for classes.dex";
-    return NULL;
+bool DexFile::OpenZip(int fd, const std::string& location, std::string* error_msg,
+                      std::vector<const  DexFile*>* dex_files) {
+  std::unique_ptr<ZipArchive> zip_archive(ZipArchive::OpenFromFd(fd, location.c_str(), error_msg));
+  if (zip_archive.get() == nullptr) {
+    DCHECK(!error_msg->empty());
+    return false;
   }
-  return DexFile::Open(*zip_archive.get(), location);
+  return DexFile::OpenFromZip(*zip_archive, location, error_msg, dex_files);
 }
 
 const DexFile* DexFile::OpenMemory(const std::string& location,
                                    uint32_t location_checksum,
-                                   MemMap* mem_map) {
+                                   MemMap* mem_map,
+                                   std::string* error_msg) {
   return OpenMemory(mem_map->Begin(),
                     mem_map->Size(),
                     location,
                     location_checksum,
-                    mem_map);
+                    mem_map,
+                    error_msg);
 }
 
-const DexFile* DexFile::Open(const ZipArchive& zip_archive, const std::string& location) {
+const DexFile* DexFile::Open(const ZipArchive& zip_archive, const char* entry_name,
+                             const std::string& location, std::string* error_msg,
+                             ZipOpenErrorCode* error_code) {
   CHECK(!location.empty());
-  UniquePtr<ZipEntry> zip_entry(zip_archive.Find(kClassesDex));
+  std::unique_ptr<ZipEntry> zip_entry(zip_archive.Find(entry_name, error_msg));
   if (zip_entry.get() == NULL) {
-    LOG(ERROR) << "Failed to find classes.dex within '" << location << "'";
-    return NULL;
+    *error_code = ZipOpenErrorCode::kEntryNotFound;
+    return nullptr;
   }
-  UniquePtr<MemMap> map(zip_entry->ExtractToMemMap(kClassesDex));
+  std::unique_ptr<MemMap> map(zip_entry->ExtractToMemMap(location.c_str(), entry_name, error_msg));
   if (map.get() == NULL) {
-    LOG(ERROR) << "Failed to extract '" << kClassesDex << "' from '" << location << "'";
-    return NULL;
+    *error_msg = StringPrintf("Failed to extract '%s' from '%s': %s", entry_name, location.c_str(),
+                              error_msg->c_str());
+    *error_code = ZipOpenErrorCode::kExtractToMemoryError;
+    return nullptr;
   }
-  UniquePtr<const DexFile> dex_file(OpenMemory(location, zip_entry->GetCrc32(), map.release()));
-  if (dex_file.get() == NULL) {
-    LOG(ERROR) << "Failed to open dex file '" << location << "' from memory";
-    return NULL;
-  }
-  if (!DexFileVerifier::Verify(dex_file.get(), dex_file->Begin(), dex_file->Size())) {
-    LOG(ERROR) << "Failed to verify dex file '" << location << "'";
-    return NULL;
+  std::unique_ptr<const DexFile> dex_file(OpenMemory(location, zip_entry->GetCrc32(), map.release(),
+                                               error_msg));
+  if (dex_file.get() == nullptr) {
+    *error_msg = StringPrintf("Failed to open dex file '%s' from memory: %s", location.c_str(),
+                              error_msg->c_str());
+    *error_code = ZipOpenErrorCode::kDexFileError;
+    return nullptr;
   }
   if (!dex_file->DisableWrite()) {
-    LOG(ERROR) << "Failed to make dex file read only '" << location << "'";
-    return NULL;
+    *error_msg = StringPrintf("Failed to make dex file '%s' read only", location.c_str());
+    *error_code = ZipOpenErrorCode::kMakeReadOnlyError;
+    return nullptr;
   }
   CHECK(dex_file->IsReadOnly()) << location;
+  if (!DexFileVerifier::Verify(dex_file.get(), dex_file->Begin(), dex_file->Size(),
+                               location.c_str(), error_msg)) {
+    *error_code = ZipOpenErrorCode::kVerifyError;
+    return nullptr;
+  }
+  *error_code = ZipOpenErrorCode::kNoError;
   return dex_file.release();
 }
+
+bool DexFile::OpenFromZip(const ZipArchive& zip_archive, const std::string& location,
+                          std::string* error_msg, std::vector<const DexFile*>* dex_files) {
+  ZipOpenErrorCode error_code;
+  std::unique_ptr<const DexFile> dex_file(Open(zip_archive, kClassesDex, location, error_msg,
+                                               &error_code));
+  if (dex_file.get() == nullptr) {
+    return false;
+  } else {
+    // Had at least classes.dex.
+    dex_files->push_back(dex_file.release());
+
+    // Now try some more.
+    size_t i = 2;
+
+    // We could try to avoid std::string allocations by working on a char array directly. As we
+    // do not expect a lot of iterations, this seems too involved and brittle.
+
+    while (i < 100) {
+      std::string name = StringPrintf("classes%zu.dex", i);
+      std::string fake_location = location + kMultiDexSeparator + name;
+      std::unique_ptr<const DexFile> next_dex_file(Open(zip_archive, name.c_str(), fake_location,
+                                                        error_msg, &error_code));
+      if (next_dex_file.get() == nullptr) {
+        if (error_code != ZipOpenErrorCode::kEntryNotFound) {
+          LOG(WARNING) << error_msg;
+        }
+        break;
+      } else {
+        dex_files->push_back(next_dex_file.release());
+      }
+
+      i++;
+    }
+
+    return true;
+  }
+}
+
 
 const DexFile* DexFile::OpenMemory(const byte* base,
                                    size_t size,
                                    const std::string& location,
                                    uint32_t location_checksum,
-                                   MemMap* mem_map) {
+                                   MemMap* mem_map, std::string* error_msg) {
   CHECK_ALIGNED(base, 4);  // various dex file structures must be word aligned
-  UniquePtr<DexFile> dex_file(new DexFile(base, size, location, location_checksum, mem_map));
-  if (!dex_file->Init()) {
-    return NULL;
+  std::unique_ptr<DexFile> dex_file(new DexFile(base, size, location, location_checksum, mem_map));
+  if (!dex_file->Init(error_msg)) {
+    return nullptr;
   } else {
     return dex_file.release();
   }
+}
+
+DexFile::DexFile(const byte* base, size_t size,
+                 const std::string& location,
+                 uint32_t location_checksum,
+                 MemMap* mem_map)
+    : begin_(base),
+      size_(size),
+      location_(location),
+      location_checksum_(location_checksum),
+      mem_map_(mem_map),
+      header_(reinterpret_cast<const Header*>(base)),
+      string_ids_(reinterpret_cast<const StringId*>(base + header_->string_ids_off_)),
+      type_ids_(reinterpret_cast<const TypeId*>(base + header_->type_ids_off_)),
+      field_ids_(reinterpret_cast<const FieldId*>(base + header_->field_ids_off_)),
+      method_ids_(reinterpret_cast<const MethodId*>(base + header_->method_ids_off_)),
+      proto_ids_(reinterpret_cast<const ProtoId*>(base + header_->proto_ids_off_)),
+      class_defs_(reinterpret_cast<const ClassDef*>(base + header_->class_defs_off_)),
+      find_class_def_misses_(0),
+      class_def_index_(nullptr),
+      build_class_def_index_mutex_("DexFile index creation mutex") {
+  CHECK(begin_ != NULL) << GetLocation();
+  CHECK_GT(size_, 0U) << GetLocation();
 }
 
 DexFile::~DexFile() {
@@ -274,44 +364,36 @@ DexFile::~DexFile() {
   // that's only called after DetachCurrentThread, which means there's no JNIEnv. We could
   // re-attach, but cleaning up these global references is not obviously useful. It's not as if
   // the global reference table is otherwise empty!
+  // Remove the index if one were created.
+  delete class_def_index_.LoadRelaxed();
 }
 
-bool DexFile::Init() {
-  InitMembers();
-  if (!CheckMagicAndVersion()) {
+bool DexFile::Init(std::string* error_msg) {
+  if (!CheckMagicAndVersion(error_msg)) {
     return false;
   }
   return true;
 }
 
-void DexFile::InitMembers() {
-  const byte* b = begin_;
-  header_ = reinterpret_cast<const Header*>(b);
-  const Header* h = header_;
-  string_ids_ = reinterpret_cast<const StringId*>(b + h->string_ids_off_);
-  type_ids_ = reinterpret_cast<const TypeId*>(b + h->type_ids_off_);
-  field_ids_ = reinterpret_cast<const FieldId*>(b + h->field_ids_off_);
-  method_ids_ = reinterpret_cast<const MethodId*>(b + h->method_ids_off_);
-  proto_ids_ = reinterpret_cast<const ProtoId*>(b + h->proto_ids_off_);
-  class_defs_ = reinterpret_cast<const ClassDef*>(b + h->class_defs_off_);
-}
-
-bool DexFile::CheckMagicAndVersion() const {
-  CHECK(header_->magic_ != NULL) << GetLocation();
+bool DexFile::CheckMagicAndVersion(std::string* error_msg) const {
   if (!IsMagicValid(header_->magic_)) {
-    LOG(ERROR) << "Unrecognized magic number in "  << GetLocation() << ":"
+    std::ostringstream oss;
+    oss << "Unrecognized magic number in "  << GetLocation() << ":"
             << " " << header_->magic_[0]
             << " " << header_->magic_[1]
             << " " << header_->magic_[2]
             << " " << header_->magic_[3];
+    *error_msg = oss.str();
     return false;
   }
   if (!IsVersionValid(header_->magic_)) {
-    LOG(ERROR) << "Unrecognized version number in "  << GetLocation() << ":"
+    std::ostringstream oss;
+    oss << "Unrecognized version number in "  << GetLocation() << ":"
             << " " << header_->magic_[4]
             << " " << header_->magic_[5]
             << " " << header_->magic_[6]
             << " " << header_->magic_[7];
+    *error_msg = oss.str();
     return false;
   }
   return true;
@@ -332,26 +414,51 @@ uint32_t DexFile::GetVersion() const {
 }
 
 const DexFile::ClassDef* DexFile::FindClassDef(const char* descriptor) const {
-  size_t num_class_defs = NumClassDefs();
+  // If we have an index lookup the descriptor via that as its constant time to search.
+  Index* index = class_def_index_.LoadSequentiallyConsistent();
+  if (index != nullptr) {
+    auto it = index->find(descriptor);
+    return (it == index->end()) ? nullptr : it->second;
+  }
+  // Fast path for rate no class defs case.
+  uint32_t num_class_defs = NumClassDefs();
   if (num_class_defs == 0) {
-    return NULL;
+    return nullptr;
   }
+  // Search for class def with 2 binary searches and then a linear search.
   const StringId* string_id = FindStringId(descriptor);
-  if (string_id == NULL) {
-    return NULL;
-  }
-  const TypeId* type_id = FindTypeId(GetIndexForStringId(*string_id));
-  if (type_id == NULL) {
-    return NULL;
-  }
-  uint16_t type_idx = GetIndexForTypeId(*type_id);
-  for (size_t i = 0; i < num_class_defs; ++i) {
-    const ClassDef& class_def = GetClassDef(i);
-    if (class_def.class_idx_ == type_idx) {
-      return &class_def;
+  if (string_id != nullptr) {
+    const TypeId* type_id = FindTypeId(GetIndexForStringId(*string_id));
+    if (type_id != nullptr) {
+      uint16_t type_idx = GetIndexForTypeId(*type_id);
+      for (size_t i = 0; i < num_class_defs; ++i) {
+        const ClassDef& class_def = GetClassDef(i);
+        if (class_def.class_idx_ == type_idx) {
+          return &class_def;
+        }
+      }
     }
   }
-  return NULL;
+  // A miss. If we've had kMaxFailedDexClassDefLookups misses then build an index to speed things
+  // up. This isn't done eagerly at construction as construction is not performed in multi-threaded
+  // sections of tools like dex2oat. If we're lazy we hopefully increase the chance of balancing
+  // out which thread builds the index.
+  find_class_def_misses_++;
+  const uint32_t kMaxFailedDexClassDefLookups = 100;
+  if (find_class_def_misses_ > kMaxFailedDexClassDefLookups) {
+    MutexLock mu(Thread::Current(), build_class_def_index_mutex_);
+    // Are we the first ones building the index?
+    if (class_def_index_.LoadSequentiallyConsistent() == nullptr) {
+      index = new Index(num_class_defs);
+      for (uint32_t i = 0; i < num_class_defs;  ++i) {
+        const ClassDef& class_def = GetClassDef(i);
+        const char* descriptor = GetClassDescriptor(class_def);
+        index->insert(std::make_pair(descriptor, &class_def));
+      }
+      class_def_index_.StoreSequentiallyConsistent(index);
+    }
+  }
+  return nullptr;
 }
 
 const DexFile::ClassDef* DexFile::FindClassDef(uint16_t type_idx) const {
@@ -440,9 +547,8 @@ const DexFile::StringId* DexFile::FindStringId(const char* string) const {
   int32_t hi = NumStringIds() - 1;
   while (hi >= lo) {
     int32_t mid = (hi + lo) / 2;
-    uint32_t length;
     const DexFile::StringId& str_id = GetStringId(mid);
-    const char* str = GetStringDataAndLength(str_id, &length);
+    const char* str = GetStringData(str_id);
     int compare = CompareModifiedUtf8ToModifiedUtf8AsUtf16CodePointValues(string, str);
     if (compare > 0) {
       lo = mid + 1;
@@ -460,9 +566,8 @@ const DexFile::StringId* DexFile::FindStringId(const uint16_t* string) const {
   int32_t hi = NumStringIds() - 1;
   while (hi >= lo) {
     int32_t mid = (hi + lo) / 2;
-    uint32_t length;
     const DexFile::StringId& str_id = GetStringId(mid);
-    const char* str = GetStringDataAndLength(str_id, &length);
+    const char* str = GetStringData(str_id);
     int compare = CompareModifiedUtf8ToUtf16AsCodePointValues(str, string);
     if (compare > 0) {
       lo = mid + 1;
@@ -493,7 +598,8 @@ const DexFile::TypeId* DexFile::FindTypeId(uint32_t string_idx) const {
 }
 
 const DexFile::ProtoId* DexFile::FindProtoId(uint16_t return_type_idx,
-                                         const std::vector<uint16_t>& signature_type_idxs) const {
+                                             const uint16_t* signature_type_idxs,
+                                             uint32_t signature_length) const {
   int32_t lo = 0;
   int32_t hi = NumProtoIds() - 1;
   while (hi >= lo) {
@@ -503,7 +609,7 @@ const DexFile::ProtoId* DexFile::FindProtoId(uint16_t return_type_idx,
     if (compare == 0) {
       DexFileParameterIterator it(*this, proto);
       size_t i = 0;
-      while (it.HasNext() && i < signature_type_idxs.size() && compare == 0) {
+      while (it.HasNext() && i < signature_length && compare == 0) {
         compare = signature_type_idxs[i] - it.GetTypeIdx();
         it.Next();
         i++;
@@ -511,7 +617,7 @@ const DexFile::ProtoId* DexFile::FindProtoId(uint16_t return_type_idx,
       if (compare == 0) {
         if (it.HasNext()) {
           compare = -1;
-        } else if (i < signature_type_idxs.size()) {
+        } else if (i < signature_length) {
           compare = 1;
         }
       }
@@ -528,8 +634,8 @@ const DexFile::ProtoId* DexFile::FindProtoId(uint16_t return_type_idx,
 }
 
 // Given a signature place the type ids into the given vector
-bool DexFile::CreateTypeList(uint16_t* return_type_idx, std::vector<uint16_t>* param_type_idxs,
-                             const std::string& signature) const {
+bool DexFile::CreateTypeList(const StringPiece& signature, uint16_t* return_type_idx,
+                             std::vector<uint16_t>* param_type_idxs) const {
   if (signature[0] != '(') {
     return false;
   }
@@ -581,38 +687,21 @@ bool DexFile::CreateTypeList(uint16_t* return_type_idx, std::vector<uint16_t>* p
   return false;  // failed to correctly parse return type
 }
 
-// Materializes the method descriptor for a method prototype.  Method
-// descriptors are not stored directly in the dex file.  Instead, one
-// must assemble the descriptor from references in the prototype.
-std::string DexFile::CreateMethodSignature(uint32_t proto_idx, int32_t* unicode_length) const {
-  const ProtoId& proto_id = GetProtoId(proto_idx);
-  std::string descriptor;
-  descriptor.push_back('(');
-  const TypeList* type_list = GetProtoParameters(proto_id);
-  size_t parameter_length = 0;
-  if (type_list != NULL) {
-    // A non-zero number of arguments.  Append the type names.
-    for (size_t i = 0; i < type_list->Size(); ++i) {
-      const TypeItem& type_item = type_list->GetTypeItem(i);
-      uint32_t type_idx = type_item.type_idx_;
-      uint32_t type_length;
-      const char* name = StringByTypeIdx(type_idx, &type_length);
-      parameter_length += type_length;
-      descriptor.append(name);
-    }
+const Signature DexFile::CreateSignature(const StringPiece& signature) const {
+  uint16_t return_type_idx;
+  std::vector<uint16_t> param_type_indices;
+  bool success = CreateTypeList(signature, &return_type_idx, &param_type_indices);
+  if (!success) {
+    return Signature::NoSignature();
   }
-  descriptor.push_back(')');
-  uint32_t return_type_idx = proto_id.return_type_idx_;
-  uint32_t return_type_length;
-  const char* name = StringByTypeIdx(return_type_idx, &return_type_length);
-  descriptor.append(name);
-  if (unicode_length != NULL) {
-    *unicode_length = parameter_length + return_type_length + 2;  // 2 for ( and )
+  const ProtoId* proto_id = FindProtoId(return_type_idx, param_type_indices);
+  if (proto_id == NULL) {
+    return Signature::NoSignature();
   }
-  return descriptor;
+  return Signature(this, *proto_id);
 }
 
-int32_t DexFile::GetLineNumFromPC(const mirror::ArtMethod* method, uint32_t rel_pc) const {
+int32_t DexFile::GetLineNumFromPC(mirror::ArtMethod* method, uint32_t rel_pc) const {
   // For native method, lineno should be -2 to indicate it is native. Note that
   // "line number == -2" is how libcore tells from StackTraceElement.
   if (method->GetCodeItemOffset() == 0) {
@@ -712,16 +801,17 @@ void DexFile::DecodeDebugInfo0(const CodeItem* code_item, bool is_static, uint32
   }
 
   if (it.HasNext()) {
-    LOG(ERROR) << "invalid stream - problem with parameter iterator in " << GetLocation();
+    LOG(ERROR) << "invalid stream - problem with parameter iterator in " << GetLocation()
+               << " for method " << PrettyMethod(method_idx, *this);
     return;
   }
 
   for (;;)  {
     uint8_t opcode = *stream++;
     uint16_t reg;
-    uint16_t name_idx;
-    uint16_t descriptor_idx;
-    uint16_t signature_idx = 0;
+    uint32_t name_idx;
+    uint32_t descriptor_idx;
+    uint32_t signature_idx = 0;
 
     switch (opcode) {
       case DBG_END_SEQUENCE:
@@ -827,8 +917,9 @@ void DexFile::DecodeDebugInfo0(const CodeItem* code_item, bool is_static, uint32
 void DexFile::DecodeDebugInfo(const CodeItem* code_item, bool is_static, uint32_t method_idx,
                               DexDebugNewPositionCb position_cb, DexDebugNewLocalCb local_cb,
                               void* context) const {
+  DCHECK(code_item != nullptr);
   const byte* stream = GetDebugInfoStream(code_item);
-  UniquePtr<LocalInfo[]> local_in_reg(local_cb != NULL ?
+  std::unique_ptr<LocalInfo[]> local_in_reg(local_cb != NULL ?
                                       new LocalInfo[code_item->registers_size_] :
                                       NULL);
   if (stream != NULL) {
@@ -855,6 +946,91 @@ bool DexFile::LineNumForPcCb(void* raw_context, uint32_t address, uint32_t line_
   }
 }
 
+bool DexFile::IsMultiDexLocation(const char* location) {
+  return strrchr(location, kMultiDexSeparator) != nullptr;
+}
+
+std::string DexFile::GetMultiDexClassesDexName(size_t number, const char* dex_location) {
+  if (number == 0) {
+    return dex_location;
+  } else {
+    return StringPrintf("%s" kMultiDexSeparatorString "classes%zu.dex", dex_location, number + 1);
+  }
+}
+
+std::string DexFile::GetDexCanonicalLocation(const char* dex_location) {
+  CHECK_NE(dex_location, static_cast<const char*>(nullptr));
+  std::string base_location = GetBaseLocation(dex_location);
+  const char* suffix = dex_location + base_location.size();
+  DCHECK(suffix[0] == 0 || suffix[0] == kMultiDexSeparator);
+  UniqueCPtr<const char[]> path(realpath(base_location.c_str(), nullptr));
+  if (path != nullptr && path.get() != base_location) {
+    return std::string(path.get()) + suffix;
+  } else if (suffix[0] == 0) {
+    return base_location;
+  } else {
+    return dex_location;
+  }
+}
+
+std::ostream& operator<<(std::ostream& os, const DexFile& dex_file) {
+  os << StringPrintf("[DexFile: %s dex-checksum=%08x location-checksum=%08x %p-%p]",
+                     dex_file.GetLocation().c_str(),
+                     dex_file.GetHeader().checksum_, dex_file.GetLocationChecksum(),
+                     dex_file.Begin(), dex_file.Begin() + dex_file.Size());
+  return os;
+}
+
+std::string Signature::ToString() const {
+  if (dex_file_ == nullptr) {
+    CHECK(proto_id_ == nullptr);
+    return "<no signature>";
+  }
+  const DexFile::TypeList* params = dex_file_->GetProtoParameters(*proto_id_);
+  std::string result;
+  if (params == nullptr) {
+    result += "()";
+  } else {
+    result += "(";
+    for (uint32_t i = 0; i < params->Size(); ++i) {
+      result += dex_file_->StringByTypeIdx(params->GetTypeItem(i).type_idx_);
+    }
+    result += ")";
+  }
+  result += dex_file_->StringByTypeIdx(proto_id_->return_type_idx_);
+  return result;
+}
+
+bool Signature::operator==(const StringPiece& rhs) const {
+  if (dex_file_ == nullptr) {
+    return false;
+  }
+  StringPiece tail(rhs);
+  if (!tail.starts_with("(")) {
+    return false;  // Invalid signature
+  }
+  tail.remove_prefix(1);  // "(";
+  const DexFile::TypeList* params = dex_file_->GetProtoParameters(*proto_id_);
+  if (params != nullptr) {
+    for (uint32_t i = 0; i < params->Size(); ++i) {
+      StringPiece param(dex_file_->StringByTypeIdx(params->GetTypeItem(i).type_idx_));
+      if (!tail.starts_with(param)) {
+        return false;
+      }
+      tail.remove_prefix(param.length());
+    }
+  }
+  if (!tail.starts_with(")")) {
+    return false;
+  }
+  tail.remove_prefix(1);  // ")";
+  return tail == dex_file_->StringByTypeIdx(proto_id_->return_type_idx_);
+}
+
+std::ostream& operator<<(std::ostream& os, const Signature& sig) {
+  return os << sig.ToString();
+}
+
 // Decodes the header section from the class data bytes.
 void ClassDataItemIterator::ReadClassDataHeader() {
   CHECK(ptr_pos_ != NULL);
@@ -868,8 +1044,7 @@ void ClassDataItemIterator::ReadClassDataField() {
   field_.field_idx_delta_ = DecodeUnsignedLeb128(&ptr_pos_);
   field_.access_flags_ = DecodeUnsignedLeb128(&ptr_pos_);
   if (last_idx_ != 0 && field_.field_idx_delta_ == 0) {
-    LOG(WARNING) << "Duplicate field " << PrettyField(GetMemberIndex(), dex_file_)
-                 << " in " << dex_file_.GetLocation();
+    LOG(WARNING) << "Duplicate field in " << dex_file_.GetLocation();
   }
 }
 
@@ -878,8 +1053,7 @@ void ClassDataItemIterator::ReadClassDataMethod() {
   method_.access_flags_ = DecodeUnsignedLeb128(&ptr_pos_);
   method_.code_off_ = DecodeUnsignedLeb128(&ptr_pos_);
   if (last_idx_ != 0 && method_.method_idx_delta_ == 0) {
-    LOG(WARNING) << "Duplicate method " << PrettyMethod(GetMemberIndex(), dex_file_)
-                 << " in " << dex_file_.GetLocation();
+    LOG(WARNING) << "Duplicate method in " << dex_file_.GetLocation();
   }
 }
 
@@ -938,12 +1112,14 @@ static uint64_t ReadUnsignedLong(const byte* ptr, int zwidth, bool fill_on_right
 }
 
 EncodedStaticFieldValueIterator::EncodedStaticFieldValueIterator(const DexFile& dex_file,
-                                                                 mirror::DexCache* dex_cache,
-                                                                 mirror::ClassLoader* class_loader,
+                                                                 Handle<mirror::DexCache>* dex_cache,
+                                                                 Handle<mirror::ClassLoader>* class_loader,
                                                                  ClassLinker* linker,
                                                                  const DexFile::ClassDef& class_def)
     : dex_file_(dex_file), dex_cache_(dex_cache), class_loader_(class_loader), linker_(linker),
       array_size_(), pos_(-1), type_(kByte) {
+  DCHECK(dex_cache != nullptr);
+  DCHECK(class_loader != nullptr);
   ptr_ = dex_file.GetEncodedStaticFieldValuesArray(class_def);
   if (ptr_ == NULL) {
     array_size_ = 0;
@@ -1014,30 +1190,36 @@ void EncodedStaticFieldValueIterator::Next() {
   ptr_ += width;
 }
 
+template<bool kTransactionActive>
 void EncodedStaticFieldValueIterator::ReadValueToField(mirror::ArtField* field) const {
   switch (type_) {
-    case kBoolean: field->SetBoolean(field->GetDeclaringClass(), jval_.z); break;
-    case kByte:    field->SetByte(field->GetDeclaringClass(), jval_.b); break;
-    case kShort:   field->SetShort(field->GetDeclaringClass(), jval_.s); break;
-    case kChar:    field->SetChar(field->GetDeclaringClass(), jval_.c); break;
-    case kInt:     field->SetInt(field->GetDeclaringClass(), jval_.i); break;
-    case kLong:    field->SetLong(field->GetDeclaringClass(), jval_.j); break;
-    case kFloat:   field->SetFloat(field->GetDeclaringClass(), jval_.f); break;
-    case kDouble:  field->SetDouble(field->GetDeclaringClass(), jval_.d); break;
-    case kNull:    field->SetObject(field->GetDeclaringClass(), NULL); break;
+    case kBoolean: field->SetBoolean<kTransactionActive>(field->GetDeclaringClass(), jval_.z); break;
+    case kByte:    field->SetByte<kTransactionActive>(field->GetDeclaringClass(), jval_.b); break;
+    case kShort:   field->SetShort<kTransactionActive>(field->GetDeclaringClass(), jval_.s); break;
+    case kChar:    field->SetChar<kTransactionActive>(field->GetDeclaringClass(), jval_.c); break;
+    case kInt:     field->SetInt<kTransactionActive>(field->GetDeclaringClass(), jval_.i); break;
+    case kLong:    field->SetLong<kTransactionActive>(field->GetDeclaringClass(), jval_.j); break;
+    case kFloat:   field->SetFloat<kTransactionActive>(field->GetDeclaringClass(), jval_.f); break;
+    case kDouble:  field->SetDouble<kTransactionActive>(field->GetDeclaringClass(), jval_.d); break;
+    case kNull:    field->SetObject<kTransactionActive>(field->GetDeclaringClass(), NULL); break;
     case kString: {
-      mirror::String* resolved = linker_->ResolveString(dex_file_, jval_.i, dex_cache_);
-      field->SetObject(field->GetDeclaringClass(), resolved);
+      CHECK(!kMovingFields);
+      mirror::String* resolved = linker_->ResolveString(dex_file_, jval_.i, *dex_cache_);
+      field->SetObject<kTransactionActive>(field->GetDeclaringClass(), resolved);
       break;
     }
     case kType: {
-      mirror::Class* resolved = linker_->ResolveType(dex_file_, jval_.i, dex_cache_, class_loader_);
-      field->SetObject(field->GetDeclaringClass(), resolved);
+      CHECK(!kMovingFields);
+      mirror::Class* resolved = linker_->ResolveType(dex_file_, jval_.i, *dex_cache_,
+                                                     *class_loader_);
+      field->SetObject<kTransactionActive>(field->GetDeclaringClass(), resolved);
       break;
     }
     default: UNIMPLEMENTED(FATAL) << ": type " << type_;
   }
 }
+template void EncodedStaticFieldValueIterator::ReadValueToField<true>(mirror::ArtField* field) const;
+template void EncodedStaticFieldValueIterator::ReadValueToField<false>(mirror::ArtField* field) const;
 
 CatchHandlerIterator::CatchHandlerIterator(const DexFile::CodeItem& code_item, uint32_t address) {
   handler_.address_ = -1;

@@ -21,7 +21,7 @@ namespace art {
 
 enum ThreadState {
   //                                   Thread.State   JDWP state
-  kTerminated,                      // TERMINATED     TS_ZOMBIE    Thread.run has returned, but Thread* still around
+  kTerminated = 66,                 // TERMINATED     TS_ZOMBIE    Thread.run has returned, but Thread* still around
   kRunnable,                        // RUNNABLE       TS_RUNNING   runnable
   kTimedWaiting,                    // TIMED_WAITING  TS_WAIT      in Object.wait() with a timeout
   kSleeping,                        // TIMED_WAITING  TS_SLEEPING  in Thread.sleep()
@@ -37,6 +37,8 @@ enum ThreadState {
   kWaitingForJniOnLoad,             // WAITING        TS_WAIT      waiting for execution of dlopen and JNI on load code
   kWaitingForSignalCatcherOutput,   // WAITING        TS_WAIT      waiting for signal catcher IO to complete
   kWaitingInMainSignalCatcherLoop,  // WAITING        TS_WAIT      blocking/reading/processing signals
+  kWaitingForDeoptimization,        // WAITING        TS_WAIT      waiting for deoptimization suspend all
+  kWaitingForMethodTracingStart,    // WAITING        TS_WAIT      waiting for method tracing to start
   kStarting,                        // NEW            TS_WAIT      native thread started, not yet ready to run managed code
   kNative,                          // RUNNABLE       TS_RUNNING   running in a JNI native method
   kSuspended,                       // RUNNABLE       TS_RUNNING   suspended by GC or debugger

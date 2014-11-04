@@ -20,6 +20,7 @@
 #include <map>
 #include <memory>
 
+#include "base/allocator.h"
 #include "base/logging.h"
 
 namespace art {
@@ -27,21 +28,34 @@ namespace art {
 // Equivalent to std::map, but without operator[] and its bug-prone semantics (in particular,
 // the implicit insertion of a default-constructed value on failed lookups).
 template <typename K, typename V, typename Comparator = std::less<K>,
-          typename Allocator = std::allocator<std::pair<const K, V> > >
+          typename Allocator = TrackingAllocator<std::pair<const K, V>, kAllocatorTagSafeMap>>
 class SafeMap {
  private:
   typedef SafeMap<K, V, Comparator, Allocator> Self;
 
  public:
-  typedef typename ::std::map<K, V, Comparator>::iterator iterator;
-  typedef typename ::std::map<K, V, Comparator>::const_iterator const_iterator;
-  typedef typename ::std::map<K, V, Comparator>::size_type size_type;
-  typedef typename ::std::map<K, V, Comparator>::value_type value_type;
+  typedef typename ::std::map<K, V, Comparator, Allocator>::key_compare key_compare;
+  typedef typename ::std::map<K, V, Comparator, Allocator>::value_compare value_compare;
+  typedef typename ::std::map<K, V, Comparator, Allocator>::allocator_type allocator_type;
+  typedef typename ::std::map<K, V, Comparator, Allocator>::iterator iterator;
+  typedef typename ::std::map<K, V, Comparator, Allocator>::const_iterator const_iterator;
+  typedef typename ::std::map<K, V, Comparator, Allocator>::size_type size_type;
+  typedef typename ::std::map<K, V, Comparator, Allocator>::key_type key_type;
+  typedef typename ::std::map<K, V, Comparator, Allocator>::value_type value_type;
+
+  SafeMap() = default;
+  explicit SafeMap(const key_compare& cmp, const allocator_type& allocator = allocator_type())
+    : map_(cmp, allocator) {
+  }
 
   Self& operator=(const Self& rhs) {
     map_ = rhs.map_;
     return *this;
   }
+
+  allocator_type get_allocator() const { return map_.get_allocator(); }
+  key_compare key_comp() const { return map_.key_comp(); }
+  value_compare value_comp() const { return map_.value_comp(); }
 
   iterator begin() { return map_.begin(); }
   const_iterator begin() const { return map_.begin(); }
@@ -51,12 +65,16 @@ class SafeMap {
   bool empty() const { return map_.empty(); }
   size_type size() const { return map_.size(); }
 
+  void swap(Self& other) { map_.swap(other.map_); }
   void clear() { map_.clear(); }
-  void erase(iterator it) { map_.erase(it); }
+  iterator erase(iterator it) { return map_.erase(it); }
   size_type erase(const K& k) { return map_.erase(k); }
 
   iterator find(const K& k) { return map_.find(k); }
   const_iterator find(const K& k) const { return map_.find(k); }
+
+  iterator lower_bound(const K& k) { return map_.lower_bound(k); }
+  const_iterator lower_bound(const K& k) const { return map_.lower_bound(k); }
 
   size_type count(const K& k) const { return map_.count(k); }
 
@@ -68,9 +86,18 @@ class SafeMap {
   }
 
   // Used to insert a new mapping.
-  void Put(const K& k, const V& v) {
-    std::pair<iterator, bool> result = map_.insert(std::make_pair(k, v));
+  iterator Put(const K& k, const V& v) {
+    std::pair<iterator, bool> result = map_.emplace(k, v);
     DCHECK(result.second);  // Check we didn't accidentally overwrite an existing value.
+    return result.first;
+  }
+
+  // Used to insert a new mapping at a known position for better performance.
+  iterator PutBefore(iterator pos, const K& k, const V& v) {
+    // Check that we're using the correct position and the key is not in the map.
+    DCHECK(pos == map_.end() || map_.key_comp()(k, pos->first));
+    DCHECK(pos == map_.begin() || map_.key_comp()((--iterator(pos))->first, k));
+    return map_.emplace_hint(pos, k, v);
   }
 
   // Used to insert a new mapping or overwrite an existing mapping. Note that if the value type
@@ -92,15 +119,22 @@ class SafeMap {
   ::std::map<K, V, Comparator, Allocator> map_;
 };
 
-template <typename K, typename V, typename Comparator>
-bool operator==(const SafeMap<K, V, Comparator>& lhs, const SafeMap<K, V, Comparator>& rhs) {
+template <typename K, typename V, typename Comparator, typename Allocator>
+bool operator==(const SafeMap<K, V, Comparator, Allocator>& lhs,
+                const SafeMap<K, V, Comparator, Allocator>& rhs) {
   return lhs.Equals(rhs);
 }
 
-template <typename K, typename V, typename Comparator>
-bool operator!=(const SafeMap<K, V, Comparator>& lhs, const SafeMap<K, V, Comparator>& rhs) {
+template <typename K, typename V, typename Comparator, typename Allocator>
+bool operator!=(const SafeMap<K, V, Comparator, Allocator>& lhs,
+                const SafeMap<K, V, Comparator, Allocator>& rhs) {
   return !(lhs == rhs);
 }
+
+template<class Key, class T, AllocatorTag kTag, class Compare = std::less<Key>>
+class AllocationTrackingSafeMap : public SafeMap<
+    Key, T, Compare, TrackingAllocator<std::pair<Key, T>, kTag>> {
+};
 
 }  // namespace art
 

@@ -23,7 +23,7 @@
 #include "mirror/class.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
-#include "mirror/string.h"
+#include "mirror/string-inl.h"
 #include "thread.h"
 #include "utils.h"
 
@@ -38,19 +38,21 @@ ReferenceTable::ReferenceTable(const char* name, size_t initial_size, size_t max
 ReferenceTable::~ReferenceTable() {
 }
 
-void ReferenceTable::Add(const mirror::Object* obj) {
+void ReferenceTable::Add(mirror::Object* obj) {
   DCHECK(obj != NULL);
-  if (entries_.size() == max_size_) {
+  VerifyObject(obj);
+  if (entries_.size() >= max_size_) {
     LOG(FATAL) << "ReferenceTable '" << name_ << "' "
                << "overflowed (" << max_size_ << " entries)";
   }
-  entries_.push_back(obj);
+  entries_.push_back(GcRoot<mirror::Object>(obj));
 }
 
-void ReferenceTable::Remove(const mirror::Object* obj) {
+void ReferenceTable::Remove(mirror::Object* obj) {
   // We iterate backwards on the assumption that references are LIFO.
   for (int i = entries_.size() - 1; i >= 0; --i) {
-    if (entries_[i] == obj) {
+    mirror::Object* entry = entries_[i].Read();
+    if (entry == obj) {
       entries_.erase(entries_.begin() + i);
       return;
     }
@@ -59,7 +61,7 @@ void ReferenceTable::Remove(const mirror::Object* obj) {
 
 // If "obj" is an array, return the number of elements in the array.
 // Otherwise, return zero.
-static size_t GetElementCount(const mirror::Object* obj) {
+static size_t GetElementCount(mirror::Object* obj) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   if (obj == NULL || obj == kClearedJniWeakGlobal || !obj->IsArrayInstance()) {
     return 0;
   }
@@ -67,10 +69,12 @@ static size_t GetElementCount(const mirror::Object* obj) {
 }
 
 struct ObjectComparator {
-  bool operator()(const mirror::Object* obj1, const mirror::Object* obj2)
+  bool operator()(GcRoot<mirror::Object> root1, GcRoot<mirror::Object> root2)
     // TODO: enable analysis when analysis can work with the STL.
       NO_THREAD_SAFETY_ANALYSIS {
     Locks::mutator_lock_->AssertSharedHeld(Thread::Current());
+    mirror::Object* obj1 = root1.Read<kWithoutReadBarrier>();
+    mirror::Object* obj2 = root2.Read<kWithoutReadBarrier>();
     // Ensure null references and cleared jweaks appear at the end.
     if (obj1 == NULL) {
       return true;
@@ -105,7 +109,7 @@ struct ObjectComparator {
 // Pass in the number of elements in the array (or 0 if this is not an
 // array object), and the number of additional objects that are identical
 // or equivalent to the original.
-static void DumpSummaryLine(std::ostream& os, const mirror::Object* obj, size_t element_count,
+static void DumpSummaryLine(std::ostream& os, mirror::Object* obj, size_t element_count,
                             int identical, int equiv)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   if (obj == NULL) {
@@ -139,12 +143,12 @@ size_t ReferenceTable::Size() const {
   return entries_.size();
 }
 
-void ReferenceTable::Dump(std::ostream& os) const {
+void ReferenceTable::Dump(std::ostream& os) {
   os << name_ << " reference table dump:\n";
   Dump(os, entries_);
 }
 
-void ReferenceTable::Dump(std::ostream& os, const Table& entries) {
+void ReferenceTable::Dump(std::ostream& os, Table& entries) {
   if (entries.empty()) {
     os << "  (empty)\n";
     return;
@@ -159,7 +163,7 @@ void ReferenceTable::Dump(std::ostream& os, const Table& entries) {
   }
   os << "  Last " << (count - first) << " entries (of " << count << "):\n";
   for (int idx = count - 1; idx >= first; --idx) {
-    const mirror::Object* ref = entries[idx];
+    mirror::Object* ref = entries[idx].Read();
     if (ref == NULL) {
       continue;
     }
@@ -193,14 +197,19 @@ void ReferenceTable::Dump(std::ostream& os, const Table& entries) {
   }
 
   // Make a copy of the table and sort it.
-  Table sorted_entries(entries.begin(), entries.end());
+  Table sorted_entries;
+  for (size_t i = 0; i < entries.size(); ++i) {
+    mirror::Object* entry = entries[i].Read();
+    sorted_entries.push_back(GcRoot<mirror::Object>(entry));
+  }
   std::sort(sorted_entries.begin(), sorted_entries.end(), ObjectComparator());
 
   // Remove any uninteresting stuff from the list. The sort moved them all to the end.
-  while (!sorted_entries.empty() && sorted_entries.back() == NULL) {
+  while (!sorted_entries.empty() && sorted_entries.back().IsNull()) {
     sorted_entries.pop_back();
   }
-  while (!sorted_entries.empty() && sorted_entries.back() == kClearedJniWeakGlobal) {
+  while (!sorted_entries.empty() &&
+         sorted_entries.back().Read<kWithoutReadBarrier>() == kClearedJniWeakGlobal) {
     sorted_entries.pop_back();
   }
   if (sorted_entries.empty()) {
@@ -212,8 +221,8 @@ void ReferenceTable::Dump(std::ostream& os, const Table& entries) {
   size_t equiv = 0;
   size_t identical = 0;
   for (size_t idx = 1; idx < count; idx++) {
-    const mirror::Object* prev = sorted_entries[idx-1];
-    const mirror::Object* current = sorted_entries[idx];
+    mirror::Object* prev = sorted_entries[idx-1].Read<kWithoutReadBarrier>();
+    mirror::Object* current = sorted_entries[idx].Read<kWithoutReadBarrier>();
     size_t element_count = GetElementCount(prev);
     if (current == prev) {
       // Same reference, added more than once.
@@ -228,12 +237,15 @@ void ReferenceTable::Dump(std::ostream& os, const Table& entries) {
     }
   }
   // Handle the last entry.
-  DumpSummaryLine(os, sorted_entries.back(), GetElementCount(sorted_entries.back()), identical, equiv);
+  DumpSummaryLine(os, sorted_entries.back().Read<kWithoutReadBarrier>(),
+                  GetElementCount(sorted_entries.back().Read<kWithoutReadBarrier>()),
+                  identical, equiv);
 }
 
-void ReferenceTable::VisitRoots(RootVisitor* visitor, void* arg) {
-  for (const auto& ref : entries_) {
-    visitor(ref, arg);
+void ReferenceTable::VisitRoots(RootCallback* visitor, void* arg, uint32_t tid,
+                                RootType root_type) {
+  for (GcRoot<mirror::Object>& root : entries_) {
+    root.VisitRoot(visitor, arg, tid, root_type);
   }
 }
 

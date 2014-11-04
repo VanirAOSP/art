@@ -16,33 +16,45 @@
 
 #include "class_linker.h"
 #include "interpreter/interpreter.h"
-#include "invoke_arg_array_builder.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
-#include "object_utils.h"
+#include "reflection.h"
 #include "runtime.h"
 #include "stack.h"
 
 namespace art {
 
+// TODO: Make the MethodHelper here be compaction safe.
 extern "C" void artInterpreterToCompiledCodeBridge(Thread* self, MethodHelper& mh,
                                                    const DexFile::CodeItem* code_item,
                                                    ShadowFrame* shadow_frame, JValue* result) {
   mirror::ArtMethod* method = shadow_frame->GetMethod();
   // Ensure static methods are initialized.
   if (method->IsStatic()) {
-    Runtime::Current()->GetClassLinker()->EnsureInitialized(method->GetDeclaringClass(), true, true);
+    mirror::Class* declaringClass = method->GetDeclaringClass();
+    if (UNLIKELY(!declaringClass->IsInitialized())) {
+      self->PushShadowFrame(shadow_frame);
+      StackHandleScope<1> hs(self);
+      Handle<mirror::Class> h_class(hs.NewHandle(declaringClass));
+      if (UNLIKELY(!Runtime::Current()->GetClassLinker()->EnsureInitialized(h_class, true, true))) {
+        self->PopShadowFrame();
+        DCHECK(self->IsExceptionPending());
+        return;
+      }
+      self->PopShadowFrame();
+      CHECK(h_class->IsInitializing());
+      // Reload from shadow frame in case the method moved, this is faster than adding a handle.
+      method = shadow_frame->GetMethod();
+    }
   }
   uint16_t arg_offset = (code_item == NULL) ? 0 : code_item->registers_size_ - code_item->ins_size_;
-#if defined(ART_USE_PORTABLE_COMPILER)
-  ArgArray arg_array(mh.GetShorty(), mh.GetShortyLength());
-  arg_array.BuildArgArrayFromFrame(shadow_frame, arg_offset);
-  method->Invoke(self, arg_array.GetArray(), arg_array.GetNumBytes(), result, mh.GetShorty()[0]);
-#else
-  method->Invoke(self, shadow_frame->GetVRegArgs(arg_offset),
-                 (shadow_frame->NumberOfVRegs() - arg_offset) * 4,
-                 result, mh.GetShorty()[0]);
-#endif
+  if (kUsePortableCompiler) {
+    InvokeWithShadowFrame(self, shadow_frame, arg_offset, mh, result);
+  } else {
+    method->Invoke(self, shadow_frame->GetVRegArgs(arg_offset),
+                   (shadow_frame->NumberOfVRegs() - arg_offset) * sizeof(uint32_t),
+                   result, mh.GetShorty());
+  }
 }
 
 }  // namespace art

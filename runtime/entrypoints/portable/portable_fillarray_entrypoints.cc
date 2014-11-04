@@ -15,7 +15,7 @@
  */
 
 #include "dex_instruction.h"
-#include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
 
@@ -26,7 +26,7 @@ extern "C" void art_portable_fill_array_data_from_code(mirror::ArtMethod* method
                                                        mirror::Array* array,
                                                        uint32_t payload_offset)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  const DexFile::CodeItem* code_item = MethodHelper(method).GetCodeItem();
+  const DexFile::CodeItem* code_item = method->GetCodeItem();
   const Instruction::ArrayDataPayload* payload =
       reinterpret_cast<const Instruction::ArrayDataPayload*>(code_item->insns_ + payload_offset);
   DCHECK_EQ(payload->ident, static_cast<uint16_t>(Instruction::kArrayDataSignature));
@@ -44,7 +44,7 @@ extern "C" void art_portable_fill_array_data_from_code(mirror::ArtMethod* method
     return;  // Error
   }
   uint32_t size_in_bytes = payload->element_count * payload->element_width;
-  memcpy(array->GetRawData(payload->element_width), payload->data, size_in_bytes);
+  memcpy(array->GetRawData(payload->element_width, 0), payload->data, size_in_bytes);
 }
 
 }  // namespace art

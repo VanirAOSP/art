@@ -18,7 +18,8 @@
 #define ART_RUNTIME_THREAD_LIST_H_
 
 #include "base/mutex.h"
-#include "root_visitor.h"
+#include "jni.h"
+#include "object_callbacks.h"
 
 #include <bitset>
 #include <list>
@@ -31,8 +32,8 @@ class TimingLogger;
 class ThreadList {
  public:
   static const uint32_t kMaxThreadId = 0xFFFF;
-  static const uint32_t kInvalidId = 0;
-  static const uint32_t kMainId = 1;
+  static const uint32_t kInvalidThreadId = 0;
+  static const uint32_t kMainThreadId = 1;
 
   explicit ThreadList();
   ~ThreadList();
@@ -59,11 +60,40 @@ class ThreadList {
       LOCKS_EXCLUDED(Locks::thread_list_lock_,
                      Locks::thread_suspend_count_lock_);
 
+
+  // Suspend a thread using a peer, typically used by the debugger. Returns the thread on success,
+  // else NULL. The peer is used to identify the thread to avoid races with the thread terminating.
+  // If the thread should be suspended then value of request_suspension should be true otherwise
+  // the routine will wait for a previous suspend request. If the suspension times out then *timeout
+  // is set to true.
+  Thread* SuspendThreadByPeer(jobject peer, bool request_suspension, bool debug_suspension,
+                              bool* timed_out)
+      EXCLUSIVE_LOCKS_REQUIRED(Locks::thread_list_suspend_thread_lock_)
+      LOCKS_EXCLUDED(Locks::mutator_lock_,
+                     Locks::thread_list_lock_,
+                     Locks::thread_suspend_count_lock_);
+
+  // Suspend a thread using its thread id, typically used by lock/monitor inflation. Returns the
+  // thread on success else NULL. The thread id is used to identify the thread to avoid races with
+  // the thread terminating. Note that as thread ids are recycled this may not suspend the expected
+  // thread, that may be terminating. If the suspension times out then *timeout is set to true.
+  Thread* SuspendThreadByThreadId(uint32_t thread_id, bool debug_suspension, bool* timed_out)
+      EXCLUSIVE_LOCKS_REQUIRED(Locks::thread_list_suspend_thread_lock_)
+      LOCKS_EXCLUDED(Locks::mutator_lock_,
+                     Locks::thread_list_lock_,
+                     Locks::thread_suspend_count_lock_);
+
+  // Find an already suspended thread (or self) by its id.
+  Thread* FindThreadByThreadId(uint32_t thin_lock_id);
+
   // Run a checkpoint on threads, running threads are not suspended but run the checkpoint inside
   // of the suspend check. Returns how many checkpoints we should expect to run.
-  size_t RunCheckpoint(Closure* checkpoint_function);
+  size_t RunCheckpoint(Closure* checkpoint_function)
       LOCKS_EXCLUDED(Locks::thread_list_lock_,
                      Locks::thread_suspend_count_lock_);
+
+  size_t RunCheckpointOnRunnableThreads(Closure* checkpoint_function)
+      LOCKS_EXCLUDED(Locks::thread_list_lock_, Locks::thread_suspend_count_lock_);
 
   // Suspends all threads
   void SuspendAllForDebugger()
@@ -88,10 +118,10 @@ class ThreadList {
       LOCKS_EXCLUDED(Locks::mutator_lock_, Locks::thread_list_lock_);
   void Unregister(Thread* self) LOCKS_EXCLUDED(Locks::mutator_lock_, Locks::thread_list_lock_);
 
-  void VisitRoots(RootVisitor* visitor, void* arg) const
+  void VisitRoots(RootCallback* callback, void* arg) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void VerifyRoots(VerifyRootVisitor* visitor, void* arg) const
+  void VerifyRoots(VerifyRootCallback* callback, void* arg) const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Return a copy of the thread list.
@@ -99,11 +129,12 @@ class ThreadList {
     return list_;
   }
 
-  Thread* FindThreadByThinLockId(uint32_t thin_lock_id);
+  void DumpNativeStacks(std::ostream& os)
+      LOCKS_EXCLUDED(Locks::thread_list_lock_);
 
  private:
   uint32_t AllocThreadId(Thread* self);
-  void ReleaseThreadId(Thread* self, uint32_t id) LOCKS_EXCLUDED(allocated_ids_lock_);
+  void ReleaseThreadId(Thread* self, uint32_t id) LOCKS_EXCLUDED(Locks::allocated_thread_ids_lock_);
 
   bool Contains(Thread* thread) EXCLUSIVE_LOCKS_REQUIRED(Locks::thread_list_lock_);
   bool Contains(pid_t tid) EXCLUSIVE_LOCKS_REQUIRED(Locks::thread_list_lock_);
@@ -122,8 +153,7 @@ class ThreadList {
       LOCKS_EXCLUDED(Locks::thread_list_lock_,
                      Locks::thread_suspend_count_lock_);
 
-  mutable Mutex allocated_ids_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
-  std::bitset<kMaxThreadId> allocated_ids_ GUARDED_BY(allocated_ids_lock_);
+  std::bitset<kMaxThreadId> allocated_ids_ GUARDED_BY(Locks::allocated_thread_ids_lock_);
 
   // The actual list of all threads.
   std::list<Thread*> list_ GUARDED_BY(Locks::thread_list_lock_);

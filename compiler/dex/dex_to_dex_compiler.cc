@@ -24,6 +24,7 @@
 #include "mirror/art_method-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/dex_cache.h"
+#include "thread-inl.h"
 
 namespace art {
 namespace optimizer {
@@ -49,12 +50,6 @@ class DexCompiler {
  private:
   const DexFile& GetDexFile() const {
     return *unit_.GetDexFile();
-  }
-
-  // TODO: since the whole compilation pipeline uses a "const DexFile", we need
-  // to "unconst" here. The DEX-to-DEX compiler should work on a non-const DexFile.
-  DexFile& GetModifiableDexFile() {
-    return *const_cast<DexFile*>(unit_.GetDexFile());
   }
 
   bool PerformOptimizations() const {
@@ -181,8 +176,7 @@ Instruction* DexCompiler::CompileCheckCast(Instruction* inst, uint32_t dex_pc) {
   if (!kEnableCheckCastEllision || !PerformOptimizations()) {
     return inst;
   }
-  MethodReference referrer(&GetDexFile(), unit_.GetDexMethodIndex());
-  if (!driver_.IsSafeCast(referrer, dex_pc)) {
+  if (!driver_.IsSafeCast(&unit_, dex_pc)) {
     return inst;
   }
   // Ok, this is a safe cast. Since the "check-cast" instruction size is 2 code
@@ -214,21 +208,21 @@ void DexCompiler::CompileInstanceFieldAccess(Instruction* inst,
     return;
   }
   uint32_t field_idx = inst->VRegC_22c();
-  int field_offset;
+  MemberOffset field_offset(0u);
   bool is_volatile;
-  bool fast_path = driver_.ComputeInstanceFieldInfo(field_idx, &unit_, field_offset,
-                                                    is_volatile, is_put);
-  if (fast_path && !is_volatile && IsUint(16, field_offset)) {
+  bool fast_path = driver_.ComputeInstanceFieldInfo(field_idx, &unit_, is_put,
+                                                    &field_offset, &is_volatile);
+  if (fast_path && !is_volatile && IsUint(16, field_offset.Int32Value())) {
     VLOG(compiler) << "Quickening " << Instruction::Name(inst->Opcode())
                    << " to " << Instruction::Name(new_opcode)
                    << " by replacing field index " << field_idx
-                   << " by field offset " << field_offset
+                   << " by field offset " << field_offset.Int32Value()
                    << " at dex pc " << StringPrintf("0x%x", dex_pc) << " in method "
                    << PrettyMethod(unit_.GetDexMethodIndex(), GetDexFile(), true);
     // We are modifying 4 consecutive bytes.
     inst->SetOpcode(new_opcode);
     // Replace field index by field offset.
-    inst->SetVRegC_22c(static_cast<uint16_t>(field_offset));
+    inst->SetVRegC_22c(static_cast<uint16_t>(field_offset.Int32Value()));
   }
 }
 
@@ -246,11 +240,13 @@ void DexCompiler::CompileInvokeVirtual(Instruction* inst,
   int vtable_idx;
   uintptr_t direct_code;
   uintptr_t direct_method;
-  bool fast_path = driver_.ComputeInvokeInfo(&unit_, dex_pc, invoke_type,
-                                             target_method, vtable_idx,
-                                             direct_code, direct_method,
-                                             false);
   // TODO: support devirtualization.
+  const bool kEnableDevirtualization = false;
+  bool fast_path = driver_.ComputeInvokeInfo(&unit_, dex_pc,
+                                             false, kEnableDevirtualization,
+                                             &invoke_type,
+                                             &target_method, &vtable_idx,
+                                             &direct_code, &direct_method);
   if (fast_path && original_invoke_type == invoke_type) {
     if (vtable_idx >= 0 && IsUint(16, vtable_idx)) {
       VLOG(compiler) << "Quickening " << Instruction::Name(inst->Opcode())
@@ -275,15 +271,16 @@ void DexCompiler::CompileInvokeVirtual(Instruction* inst,
 }  // namespace optimizer
 }  // namespace art
 
-extern "C" void ArtCompileDEX(art::CompilerDriver& compiler, const art::DexFile::CodeItem* code_item,
+extern "C" void ArtCompileDEX(art::CompilerDriver& driver, const art::DexFile::CodeItem* code_item,
                   uint32_t access_flags, art::InvokeType invoke_type,
                   uint16_t class_def_idx, uint32_t method_idx, jobject class_loader,
                   const art::DexFile& dex_file,
                   art::DexToDexCompilationLevel dex_to_dex_compilation_level) {
   if (dex_to_dex_compilation_level != art::kDontDexToDexCompile) {
     art::DexCompilationUnit unit(NULL, class_loader, art::Runtime::Current()->GetClassLinker(),
-                                 dex_file, code_item, class_def_idx, method_idx, access_flags);
-    art::optimizer::DexCompiler dex_compiler(compiler, unit, dex_to_dex_compilation_level);
+                                 dex_file, code_item, class_def_idx, method_idx, access_flags,
+                                 driver.GetVerifiedMethod(&dex_file, method_idx));
+    art::optimizer::DexCompiler dex_compiler(driver, unit, dex_to_dex_compilation_level);
     dex_compiler.Compile();
   }
 }

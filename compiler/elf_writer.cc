@@ -23,7 +23,6 @@
 #include "driver/compiler_driver.h"
 #include "elf_file.h"
 #include "invoke_type.h"
-#include "llvm/utils_llvm.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
 #include "oat.h"
@@ -31,15 +30,10 @@
 
 namespace art {
 
-ElfWriter::ElfWriter(const CompilerDriver& driver, File* elf_file)
-  : compiler_driver_(&driver), elf_file_(elf_file) {}
-
-ElfWriter::~ElfWriter() {}
-
-llvm::ELF::Elf32_Addr ElfWriter::GetOatDataAddress(ElfFile* elf_file) {
-  llvm::ELF::Elf32_Addr oatdata_address = elf_file->FindSymbolAddress(llvm::ELF::SHT_DYNSYM,
-                                                                      "oatdata",
-                                                                      false);
+uint32_t ElfWriter::GetOatDataAddress(ElfFile* elf_file) {
+  Elf32_Addr oatdata_address = elf_file->FindSymbolAddress(SHT_DYNSYM,
+                                                           "oatdata",
+                                                           false);
   CHECK_NE(0U, oatdata_address);
   return oatdata_address;
 }
@@ -47,8 +41,9 @@ llvm::ELF::Elf32_Addr ElfWriter::GetOatDataAddress(ElfFile* elf_file) {
 void ElfWriter::GetOatElfInformation(File* file,
                                      size_t& oat_loaded_size,
                                      size_t& oat_data_offset) {
-  UniquePtr<ElfFile> elf_file(ElfFile::Open(file, false, false));
-  CHECK(elf_file.get() != NULL);
+  std::string error_msg;
+  std::unique_ptr<ElfFile> elf_file(ElfFile::Open(file, false, false, &error_msg));
+  CHECK(elf_file.get() != nullptr) << error_msg;
 
   oat_loaded_size = elf_file->GetLoadedSize();
   CHECK_NE(0U, oat_loaded_size);

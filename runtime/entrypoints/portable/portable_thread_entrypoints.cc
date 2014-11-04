@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "mirror/art_method.h"
 #include "mirror/object-inl.h"
 #include "verifier/dex_gc_map.h"
@@ -36,11 +36,7 @@ class ShadowFrameCopyVisitor : public StackVisitor {
       ShadowFrame* new_frame = ShadowFrame::Create(num_regs, NULL, method, dex_pc);
 
       const uint8_t* gc_map = method->GetNativeGcMap();
-      uint32_t gc_map_length = static_cast<uint32_t>((gc_map[0] << 24) |
-                                                     (gc_map[1] << 16) |
-                                                     (gc_map[2] << 8) |
-                                                     (gc_map[3] << 0));
-      verifier::DexPcToReferenceMap dex_gc_map(gc_map + 4, gc_map_length);
+      verifier::DexPcToReferenceMap dex_gc_map(gc_map);
       const uint8_t* reg_bitmap = dex_gc_map.FindBitMap(dex_pc);
       for (size_t reg = 0; reg < num_regs; ++reg) {
         if (TestBitmap(reg, reg_bitmap)) {
@@ -82,7 +78,7 @@ extern "C" void art_portable_test_suspend_from_code(Thread* self)
     visitor.WalkStack(true);
     self->SetDeoptimizationShadowFrame(visitor.GetShadowFrameCopy());
     self->SetDeoptimizationReturnValue(JValue());
-    self->SetException(ThrowLocation(), reinterpret_cast<mirror::Throwable*>(-1));
+    self->SetException(ThrowLocation(), Thread::GetDeoptimizationException());
   }
 }
 

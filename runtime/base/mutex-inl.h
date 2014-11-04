@@ -17,12 +17,15 @@
 #ifndef ART_RUNTIME_BASE_MUTEX_INL_H_
 #define ART_RUNTIME_BASE_MUTEX_INL_H_
 
+#include <inttypes.h>
+
 #include "mutex.h"
 
 #define ATRACE_TAG ATRACE_TAG_DALVIK
 
-#include "cutils/atomic-inline.h"
 #include "cutils/trace.h"
+
+#include "base/stringprintf.h"
 #include "runtime.h"
 #include "thread.h"
 
@@ -96,9 +99,11 @@ class ScopedContentionRecorder {
         blocked_tid_(kLogLockContentions ? blocked_tid : 0),
         owner_tid_(kLogLockContentions ? owner_tid : 0),
         start_nano_time_(kLogLockContentions ? NanoTime() : 0) {
-    std::string msg = StringPrintf("Lock contention on %s (owner tid: %llu)",
-                                   mutex->GetName(), owner_tid);
-    ATRACE_BEGIN(msg.c_str());
+    if (ATRACE_ENABLED()) {
+      std::string msg = StringPrintf("Lock contention on %s (owner tid: %" PRIu64 ")",
+                                     mutex->GetName(), owner_tid);
+      ATRACE_BEGIN(msg.c_str());
+    }
   }
 
   ~ScopedContentionRecorder() {
@@ -130,9 +135,21 @@ static inline void CheckUnattachedThread(LockLevel level) NO_THREAD_SAFETY_ANALY
   // TODO: tighten this check.
   if (kDebugLocking) {
     Runtime* runtime = Runtime::Current();
-    CHECK(runtime == NULL || !runtime->IsStarted() || runtime->IsShuttingDown() ||
-          level == kDefaultMutexLevel  || level == kRuntimeShutdownLock ||
-          level == kThreadListLock || level == kLoggingLock || level == kAbortLock);
+    CHECK(runtime == nullptr || !runtime->IsStarted() || runtime->IsShuttingDownLocked() ||
+          // Used during thread creation to avoid races with runtime shutdown. Thread::Current not
+          // yet established.
+          level == kRuntimeShutdownLock ||
+          // Thread Ids are allocated/released before threads are established.
+          level == kAllocatedThreadIdsLock ||
+          // Thread LDT's are initialized without Thread::Current established.
+          level == kModifyLdtLock ||
+          // Threads are unregistered while holding the thread list lock, during this process they
+          // no longer exist and so we expect an unlock with no self.
+          level == kThreadListLock ||
+          // Ignore logging which may or may not have set up thread data structures.
+          level == kLoggingLock ||
+          // Avoid recursive death.
+          level == kAbortLock) << level;
   }
 }
 
@@ -184,44 +201,50 @@ inline void ReaderWriterMutex::SharedLock(Thread* self) {
 #if ART_USE_FUTEXES
   bool done = false;
   do {
-    int32_t cur_state = state_;
+    int32_t cur_state = state_.LoadRelaxed();
     if (LIKELY(cur_state >= 0)) {
       // Add as an extra reader.
-      done = android_atomic_acquire_cas(cur_state, cur_state + 1, &state_) == 0;
+      done = state_.CompareExchangeWeakAcquire(cur_state, cur_state + 1);
     } else {
       // Owner holds it exclusively, hang up.
       ScopedContentionRecorder scr(this, GetExclusiveOwnerTid(), SafeGetTid(self));
-      android_atomic_inc(&num_pending_readers_);
-      if (futex(&state_, FUTEX_WAIT, cur_state, NULL, NULL, 0) != 0) {
+      ++num_pending_readers_;
+      if (futex(state_.Address(), FUTEX_WAIT, cur_state, NULL, NULL, 0) != 0) {
         if (errno != EAGAIN) {
           PLOG(FATAL) << "futex wait failed for " << name_;
         }
       }
-      android_atomic_dec(&num_pending_readers_);
+      --num_pending_readers_;
     }
   } while (!done);
 #else
   CHECK_MUTEX_CALL(pthread_rwlock_rdlock, (&rwlock_));
 #endif
+  DCHECK(exclusive_owner_ == 0U || exclusive_owner_ == -1U);
   RegisterAsLocked(self);
   AssertSharedHeld(self);
 }
 
 inline void ReaderWriterMutex::SharedUnlock(Thread* self) {
   DCHECK(self == NULL || self == Thread::Current());
+  DCHECK(exclusive_owner_ == 0U || exclusive_owner_ == -1U);
   AssertSharedHeld(self);
   RegisterAsUnlocked(self);
 #if ART_USE_FUTEXES
   bool done = false;
   do {
-    int32_t cur_state = state_;
+    int32_t cur_state = state_.LoadRelaxed();
     if (LIKELY(cur_state > 0)) {
-      // Reduce state by 1.
-      done = android_atomic_release_cas(cur_state, cur_state - 1, &state_) == 0;
-      if (done && (cur_state - 1) == 0) {  // cas may fail due to noise?
-        if (num_pending_writers_ > 0 || num_pending_readers_ > 0) {
+      // Reduce state by 1 and impose lock release load/store ordering.
+      // Note, the relaxed loads below musn't reorder before the CompareExchange.
+      // TODO: the ordering here is non-trivial as state is split across 3 fields, fix by placing
+      // a status bit into the state on contention.
+      done = state_.CompareExchangeWeakSequentiallyConsistent(cur_state, cur_state - 1);
+      if (done && (cur_state - 1) == 0) {  // Weak CAS may fail spuriously.
+        if (num_pending_writers_.LoadRelaxed() > 0 ||
+            num_pending_readers_.LoadRelaxed() > 0) {
           // Wake any exclusive waiters as there are now no readers.
-          futex(&state_, FUTEX_WAKE, -1, NULL, NULL, 0);
+          futex(state_.Address(), FUTEX_WAKE, -1, NULL, NULL, 0);
         }
       }
     } else {
@@ -246,26 +269,7 @@ inline bool Mutex::IsExclusiveHeld(const Thread* self) const {
 }
 
 inline uint64_t Mutex::GetExclusiveOwnerTid() const {
-#if ART_USE_FUTEXES
   return exclusive_owner_;
-#elif defined(__BIONIC__)
-  return static_cast<uint64_t>((mutex_.value >> 16) & 0xffff);
-#elif defined(__GLIBC__)
-  return reinterpret_cast<const glibc_pthread_mutex_t*>(&mutex_)->owner;
-#elif defined(__APPLE__)
-  const darwin_pthread_mutex_t* dpmutex = reinterpret_cast<const darwin_pthread_mutex_t*>(&mutex_);
-  pthread_t owner = dpmutex->darwin_pthread_mutex_owner;
-  // 0 for unowned, -1 for PTHREAD_MTX_TID_SWITCHING
-  // TODO: should we make darwin_pthread_mutex_owner volatile and recheck until not -1?
-  if ((owner == (pthread_t)0) || (owner == (pthread_t)-1)) {
-    return 0;
-  }
-  uint64_t tid;
-  CHECK_PTHREAD_CALL(pthread_threadid_np, (owner, &tid), __FUNCTION__);  // Requires Mac OS 10.6
-  return tid;
-#else
-#error unsupported C library
-#endif
 }
 
 inline bool ReaderWriterMutex::IsExclusiveHeld(const Thread* self) const {
@@ -282,7 +286,7 @@ inline bool ReaderWriterMutex::IsExclusiveHeld(const Thread* self) const {
 
 inline uint64_t ReaderWriterMutex::GetExclusiveOwnerTid() const {
 #if ART_USE_FUTEXES
-  int32_t state = state_;
+  int32_t state = state_.LoadRelaxed();
   if (state == 0) {
     return 0;  // No owner.
   } else if (state > 0) {
@@ -291,23 +295,7 @@ inline uint64_t ReaderWriterMutex::GetExclusiveOwnerTid() const {
     return exclusive_owner_;
   }
 #else
-#if defined(__BIONIC__)
-  return rwlock_.writerThreadId;
-#elif defined(__GLIBC__)
-  return reinterpret_cast<const glibc_pthread_rwlock_t*>(&rwlock_)->writer;
-#elif defined(__APPLE__)
-  const darwin_pthread_rwlock_t*
-      dprwlock = reinterpret_cast<const darwin_pthread_rwlock_t*>(&rwlock_);
-  pthread_t owner = dprwlock->darwin_pthread_rwlock_owner;
-  if (owner == (pthread_t)0) {
-    return 0;
-  }
-  uint64_t tid;
-  CHECK_PTHREAD_CALL(pthread_threadid_np, (owner, &tid), __FUNCTION__);  // Requires Mac OS 10.6
-  return tid;
-#else
-#error unsupported C library
-#endif
+  return exclusive_owner_;
 #endif
 }
 

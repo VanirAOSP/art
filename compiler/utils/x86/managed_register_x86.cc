@@ -21,19 +21,6 @@
 namespace art {
 namespace x86 {
 
-// These cpu registers are never available for allocation.
-static const Register kReservedCpuRegistersArray[] = { ESP };
-
-
-// We reduce the number of available registers for allocation in debug-code
-// mode in order to increase register pressure.
-
-// We need all registers for caching.
-static const int kNumberOfAvailableCpuRegisters = kNumberOfCpuRegisters;
-static const int kNumberOfAvailableXmmRegisters = kNumberOfXmmRegisters;
-static const int kNumberOfAvailableRegisterPairs = kNumberOfRegisterPairs;
-
-
 // Define register pairs.
 // This list must be kept in sync with the RegisterPair enum.
 #define REGISTER_PAIR_LIST(P) \
@@ -46,7 +33,8 @@ static const int kNumberOfAvailableRegisterPairs = kNumberOfRegisterPairs;
   P(EDX, EDI)                 \
   P(ECX, EBX)                 \
   P(ECX, EDI)                 \
-  P(EBX, EDI)
+  P(EBX, EDI)                 \
+  P(ECX, EDX)
 
 
 struct RegisterPairDescriptor {
@@ -107,11 +95,11 @@ void X86ManagedRegister::Print(std::ostream& os) const {
   if (!IsValidManagedRegister()) {
     os << "No Register";
   } else if (IsXmmRegister()) {
-    os << "XMM: " << static_cast<int>(AsXmmRegister());
+    os << "XMM: " << AsXmmRegister();
   } else if (IsX87Register()) {
-    os << "X87: " << static_cast<int>(AsX87Register());
+    os << "X87: " << AsX87Register();
   } else if (IsCpuRegister()) {
-    os << "CPU: " << static_cast<int>(AsCpuRegister());
+    os << "CPU: " << AsCpuRegister();
   } else if (IsRegisterPair()) {
     os << "Pair: " << AsRegisterPairLow() << ", " << AsRegisterPairHigh();
   } else {

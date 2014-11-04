@@ -18,13 +18,14 @@
 #define ART_COMPILER_JNI_QUICK_CALLING_CONVENTION_H_
 
 #include <vector>
-#include "stack_indirect_reference_table.h"
+#include "handle_scope.h"
+#include "primitive.h"
 #include "thread.h"
 #include "utils/managed_register.h"
 
 namespace art {
 
-// Top-level abstraction for different calling conventions
+// Top-level abstraction for different calling conventions.
 class CallingConvention {
  public:
   bool IsReturnAReference() const { return shorty_[0] == 'L'; }
@@ -46,8 +47,10 @@ class CallingConvention {
   // Register reserved for scratch usage during procedure calls.
   virtual ManagedRegister InterproceduralScratchRegister() = 0;
 
-  // Offset of Method within the frame
-  FrameOffset MethodStackOffset();
+  // Offset of Method within the frame.
+  FrameOffset MethodStackOffset() {
+    return displacement_;
+  }
 
   // Iterator interface
 
@@ -60,23 +63,40 @@ class CallingConvention {
     itr_args_ = 0;
     itr_refs_ = 0;
     itr_longs_and_doubles_ = 0;
+    itr_float_and_doubles_ = 0;
   }
 
   virtual ~CallingConvention() {}
 
  protected:
-  CallingConvention(bool is_static, bool is_synchronized, const char* shorty)
-      : displacement_(0), is_static_(is_static), is_synchronized_(is_synchronized),
+  CallingConvention(bool is_static, bool is_synchronized, const char* shorty,
+                    size_t frame_pointer_size)
+      : itr_slots_(0), itr_refs_(0), itr_args_(0), itr_longs_and_doubles_(0),
+        itr_float_and_doubles_(0), displacement_(0),
+        frame_pointer_size_(frame_pointer_size),
+        handle_scope_pointer_size_(sizeof(StackReference<mirror::Object>)),
+        is_static_(is_static), is_synchronized_(is_synchronized),
         shorty_(shorty) {
     num_args_ = (is_static ? 0 : 1) + strlen(shorty) - 1;
     num_ref_args_ = is_static ? 0 : 1;  // The implicit this pointer.
+    num_float_or_double_args_ = 0;
     num_long_or_double_args_ = 0;
     for (size_t i = 1; i < strlen(shorty); i++) {
       char ch = shorty_[i];
-      if (ch == 'L') {
+      switch (ch) {
+      case 'L':
         num_ref_args_++;
-      } else if ((ch == 'D') || (ch == 'J')) {
+        break;
+      case 'J':
         num_long_or_double_args_++;
+        break;
+      case 'D':
+        num_long_or_double_args_++;
+        num_float_or_double_args_++;
+        break;
+      case 'F':
+        num_float_or_double_args_++;
+        break;
       }
     }
   }
@@ -97,6 +117,34 @@ class CallingConvention {
     char ch = shorty_[param];
     return (ch == 'J' || ch == 'D');
   }
+  bool IsParamAFloatOrDouble(unsigned int param) const {
+    DCHECK_LT(param, NumArgs());
+    if (IsStatic()) {
+      param++;  // 0th argument must skip return value at start of the shorty
+    } else if (param == 0) {
+      return false;  // this argument
+    }
+    char ch = shorty_[param];
+    return (ch == 'F' || ch == 'D');
+  }
+  bool IsParamADouble(unsigned int param) const {
+    DCHECK_LT(param, NumArgs());
+    if (IsStatic()) {
+      param++;  // 0th argument must skip return value at start of the shorty
+    } else if (param == 0) {
+      return false;  // this argument
+    }
+    return shorty_[param] == 'D';
+  }
+  bool IsParamALong(unsigned int param) const {
+    DCHECK_LT(param, NumArgs());
+    if (IsStatic()) {
+      param++;  // 0th argument must skip return value at start of the shorty
+    } else if (param == 0) {
+      return true;  // this argument
+    }
+    return shorty_[param] == 'J';
+  }
   bool IsParamAReference(unsigned int param) const {
     DCHECK_LT(param, NumArgs());
     if (IsStatic()) {
@@ -112,6 +160,9 @@ class CallingConvention {
   size_t NumLongOrDoubleArgs() const {
     return num_long_or_double_args_;
   }
+  size_t NumFloatOrDoubleArgs() const {
+    return num_float_or_double_args_;
+  }
   size_t NumReferenceArgs() const {
     return num_ref_args_;
   }
@@ -120,7 +171,7 @@ class CallingConvention {
     if (IsStatic()) {
       param++;  // 0th argument must skip return value at start of the shorty
     } else if (param == 0) {
-      return kPointerSize;  // this argument
+      return frame_pointer_size_;  // this argument
     }
     size_t result = Primitive::ComponentSize(Primitive::GetType(shorty_[param]));
     if (result >= 1 && result < 4) {
@@ -135,14 +186,20 @@ class CallingConvention {
   // Note that each slot is 32-bit. When the current argument is bigger
   // than 32 bits, return the first slot number for this argument.
   unsigned int itr_slots_;
-  // The number of references iterated past
+  // The number of references iterated past.
   unsigned int itr_refs_;
-  // The argument number along argument list for current argument
+  // The argument number along argument list for current argument.
   unsigned int itr_args_;
-  // Number of longs and doubles seen along argument list
+  // Number of longs and doubles seen along argument list.
   unsigned int itr_longs_and_doubles_;
-  // Space for frames below this on the stack
+  // Number of float and doubles seen along argument list.
+  unsigned int itr_float_and_doubles_;
+  // Space for frames below this on the stack.
   FrameOffset displacement_;
+  // The size of a reference.
+  const size_t frame_pointer_size_;
+  // The size of a reference entry within the handle scope.
+  const size_t handle_scope_pointer_size_;
 
  private:
   const bool is_static_;
@@ -150,6 +207,7 @@ class CallingConvention {
   std::string shorty_;
   size_t num_args_;
   size_t num_ref_args_;
+  size_t num_float_or_double_args_;
   size_t num_long_or_double_args_;
 };
 
@@ -174,6 +232,9 @@ class ManagedRuntimeCallingConvention : public CallingConvention {
   bool HasNext();
   void Next();
   bool IsCurrentParamAReference();
+  bool IsCurrentParamAFloatOrDouble();
+  bool IsCurrentParamADouble();
+  bool IsCurrentParamALong();
   bool IsCurrentArgExplicit();  // ie a non-implict argument such as this
   bool IsCurrentArgPossiblyNull();
   size_t CurrentParamSize();
@@ -185,11 +246,12 @@ class ManagedRuntimeCallingConvention : public CallingConvention {
   virtual ~ManagedRuntimeCallingConvention() {}
 
   // Registers to spill to caller's out registers on entry.
-  virtual const std::vector<ManagedRegister>& EntrySpills() = 0;
+  virtual const ManagedRegisterEntrySpills& EntrySpills() = 0;
 
  protected:
-  ManagedRuntimeCallingConvention(bool is_static, bool is_synchronized, const char* shorty)
-      : CallingConvention(is_static, is_synchronized, shorty) {}
+  ManagedRuntimeCallingConvention(bool is_static, bool is_synchronized, const char* shorty,
+                                  size_t frame_pointer_size)
+      : CallingConvention(is_static, is_synchronized, shorty, frame_pointer_size) {}
 };
 
 // Abstraction for JNI calling conventions
@@ -226,6 +288,8 @@ class JniCallingConvention : public CallingConvention {
   FrameOffset ReturnValueSaveLocation() const;
   // Register that holds result if it is integer.
   virtual ManagedRegister IntReturnRegister() = 0;
+  // Whether the compiler needs to ensure zero-/sign-extension of a small result type
+  virtual bool RequiresSmallResultTypeExtension() const = 0;
 
   // Callee save registers to spill prior to native code (which may clobber)
   virtual const std::vector<ManagedRegister>& CalleeSaveRegisters() const = 0;
@@ -241,6 +305,10 @@ class JniCallingConvention : public CallingConvention {
   bool HasNext();
   virtual void Next();
   bool IsCurrentParamAReference();
+  bool IsCurrentParamAFloatOrDouble();
+  bool IsCurrentParamADouble();
+  bool IsCurrentParamALong();
+  bool IsCurrentParamJniEnv();
   size_t CurrentParamSize();
   virtual bool IsCurrentParamInRegister() = 0;
   virtual bool IsCurrentParamOnStack() = 0;
@@ -248,20 +316,26 @@ class JniCallingConvention : public CallingConvention {
   virtual FrameOffset CurrentParamStackOffset() = 0;
 
   // Iterator interface extension for JNI
-  FrameOffset CurrentParamSirtEntryOffset();
+  FrameOffset CurrentParamHandleScopeEntryOffset();
 
-  // Position of SIRT and interior fields
-  FrameOffset SirtOffset() const {
-    return FrameOffset(displacement_.Int32Value() +
-                       kPointerSize);  // above Method*
+  // Position of handle scope and interior fields
+  FrameOffset HandleScopeOffset() const {
+    return FrameOffset(this->displacement_.Int32Value() + sizeof(StackReference<mirror::ArtMethod>));
+    // above Method reference
   }
-  FrameOffset SirtNumRefsOffset() const {
-    return FrameOffset(SirtOffset().Int32Value() +
-                       StackIndirectReferenceTable::NumberOfReferencesOffset());
+
+  FrameOffset HandleScopeLinkOffset() const {
+    return FrameOffset(HandleScopeOffset().Int32Value() + HandleScope::LinkOffset(frame_pointer_size_));
   }
-  FrameOffset SirtLinkOffset() const {
-    return FrameOffset(SirtOffset().Int32Value() +
-                       StackIndirectReferenceTable::LinkOffset());
+
+  FrameOffset HandleScopeNumRefsOffset() const {
+    return FrameOffset(HandleScopeOffset().Int32Value() +
+                       HandleScope::NumberOfReferencesOffset(frame_pointer_size_));
+  }
+
+  FrameOffset HandleerencesOffset() const {
+    return FrameOffset(HandleScopeOffset().Int32Value() +
+                       HandleScope::ReferencesOffset(frame_pointer_size_));
   }
 
   virtual ~JniCallingConvention() {}
@@ -273,10 +347,11 @@ class JniCallingConvention : public CallingConvention {
     kObjectOrClass = 1
   };
 
-  explicit JniCallingConvention(bool is_static, bool is_synchronized, const char* shorty)
-      : CallingConvention(is_static, is_synchronized, shorty) {}
+  explicit JniCallingConvention(bool is_static, bool is_synchronized, const char* shorty,
+                                size_t frame_pointer_size)
+      : CallingConvention(is_static, is_synchronized, shorty, frame_pointer_size) {}
 
-  // Number of stack slots for outgoing arguments, above which the SIRT is
+  // Number of stack slots for outgoing arguments, above which the handle scope is
   // located
   virtual size_t NumberOfOutgoingStackArgs() = 0;
 

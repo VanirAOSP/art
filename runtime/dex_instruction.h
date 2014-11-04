@@ -118,41 +118,60 @@ class Instruction {
   };
 
   enum Flags {
-    kBranch   = 0x01,  // conditional or unconditional branch
-    kContinue = 0x02,  // flow can continue to next statement
-    kSwitch   = 0x04,  // switch statement
-    kThrow    = 0x08,  // could cause an exception to be thrown
-    kReturn   = 0x10,  // returns, no additional statements
-    kInvoke   = 0x20,  // a flavor of invoke
-    kUnconditional = 0x40,  // unconditional branch
+    kBranch              = 0x000001,  // conditional or unconditional branch
+    kContinue            = 0x000002,  // flow can continue to next statement
+    kSwitch              = 0x000004,  // switch statement
+    kThrow               = 0x000008,  // could cause an exception to be thrown
+    kReturn              = 0x000010,  // returns, no additional statements
+    kInvoke              = 0x000020,  // a flavor of invoke
+    kUnconditional       = 0x000040,  // unconditional branch
+    kAdd                 = 0x000080,  // addition
+    kSubtract            = 0x000100,  // subtract
+    kMultiply            = 0x000200,  // multiply
+    kDivide              = 0x000400,  // division
+    kRemainder           = 0x000800,  // remainder
+    kAnd                 = 0x001000,  // and
+    kOr                  = 0x002000,  // or
+    kXor                 = 0x004000,  // xor
+    kShl                 = 0x008000,  // shl
+    kShr                 = 0x010000,  // shr
+    kUshr                = 0x020000,  // ushr
+    kCast                = 0x040000,  // cast
+    kStore               = 0x080000,  // store opcode
+    kLoad                = 0x100000,  // load opcode
+    kClobber             = 0x200000,  // clobbers memory in a big way (not just a write)
+    kRegCFieldOrConstant = 0x400000,  // is the third virtual register a field or literal constant (vC)
+    kRegBFieldOrConstant = 0x800000,  // is the second virtual register a field or literal constant (vB)
   };
 
   enum VerifyFlag {
-    kVerifyNone            = 0x00000,
-    kVerifyRegA            = 0x00001,
-    kVerifyRegAWide        = 0x00002,
-    kVerifyRegB            = 0x00004,
-    kVerifyRegBField       = 0x00008,
-    kVerifyRegBMethod      = 0x00010,
-    kVerifyRegBNewInstance = 0x00020,
-    kVerifyRegBString      = 0x00040,
-    kVerifyRegBType        = 0x00080,
-    kVerifyRegBWide        = 0x00100,
-    kVerifyRegC            = 0x00200,
-    kVerifyRegCField       = 0x00400,
-    kVerifyRegCNewArray    = 0x00800,
-    kVerifyRegCType        = 0x01000,
-    kVerifyRegCWide        = 0x02000,
-    kVerifyArrayData       = 0x04000,
-    kVerifyBranchTarget    = 0x08000,
-    kVerifySwitchTargets   = 0x10000,
-    kVerifyVarArg          = 0x20000,
-    kVerifyVarArgRange     = 0x40000,
-    kVerifyError           = 0x80000,
+    kVerifyNone               = 0x000000,
+    kVerifyRegA               = 0x000001,
+    kVerifyRegAWide           = 0x000002,
+    kVerifyRegB               = 0x000004,
+    kVerifyRegBField          = 0x000008,
+    kVerifyRegBMethod         = 0x000010,
+    kVerifyRegBNewInstance    = 0x000020,
+    kVerifyRegBString         = 0x000040,
+    kVerifyRegBType           = 0x000080,
+    kVerifyRegBWide           = 0x000100,
+    kVerifyRegC               = 0x000200,
+    kVerifyRegCField          = 0x000400,
+    kVerifyRegCNewArray       = 0x000800,
+    kVerifyRegCType           = 0x001000,
+    kVerifyRegCWide           = 0x002000,
+    kVerifyArrayData          = 0x004000,
+    kVerifyBranchTarget       = 0x008000,
+    kVerifySwitchTargets      = 0x010000,
+    kVerifyVarArg             = 0x020000,
+    kVerifyVarArgNonZero      = 0x040000,
+    kVerifyVarArgRange        = 0x080000,
+    kVerifyVarArgRangeNonZero = 0x100000,
+    kVerifyRuntimeOnly        = 0x200000,
+    kVerifyError              = 0x400000,
   };
 
-  // Decodes this instruction, populating its arguments.
-  void Decode(uint32_t &vA, uint32_t &vB, uint64_t &vB_wide, uint32_t &vC, uint32_t arg[]) const;
+  static constexpr uint32_t kMaxVarArgRegs = 5;
 
   // Returns the size (in 2 byte code units) of this instruction.
   size_t SizeInCodeUnits() const {
@@ -217,44 +236,125 @@ class Instruction {
   // VRegA
   bool HasVRegA() const;
   int32_t VRegA() const;
-  int8_t VRegA_10t() const;
-  uint8_t VRegA_10x() const;
-  uint4_t VRegA_11n() const;
-  uint8_t VRegA_11x() const;
-  uint4_t VRegA_12x() const;
+
+  int8_t VRegA_10t() const {
+    return VRegA_10t(Fetch16(0));
+  }
+  uint8_t VRegA_10x() const {
+    return VRegA_10x(Fetch16(0));
+  }
+  uint4_t VRegA_11n() const {
+    return VRegA_11n(Fetch16(0));
+  }
+  uint8_t VRegA_11x() const {
+    return VRegA_11x(Fetch16(0));
+  }
+  uint4_t VRegA_12x() const {
+    return VRegA_12x(Fetch16(0));
+  }
   int16_t VRegA_20t() const;
-  uint8_t VRegA_21c() const;
-  uint8_t VRegA_21h() const;
-  uint8_t VRegA_21s() const;
-  uint8_t VRegA_21t() const;
-  uint8_t VRegA_22b() const;
-  uint4_t VRegA_22c() const;
-  uint4_t VRegA_22s() const;
-  uint4_t VRegA_22t() const;
-  uint8_t VRegA_22x() const;
-  uint8_t VRegA_23x() const;
+  uint8_t VRegA_21c() const {
+    return VRegA_21c(Fetch16(0));
+  }
+  uint8_t VRegA_21h() const {
+    return VRegA_21h(Fetch16(0));
+  }
+  uint8_t VRegA_21s() const {
+    return VRegA_21s(Fetch16(0));
+  }
+  uint8_t VRegA_21t() const {
+    return VRegA_21t(Fetch16(0));
+  }
+  uint8_t VRegA_22b() const {
+    return VRegA_22b(Fetch16(0));
+  }
+  uint4_t VRegA_22c() const {
+    return VRegA_22c(Fetch16(0));
+  }
+  uint4_t VRegA_22s() const {
+    return VRegA_22s(Fetch16(0));
+  }
+  uint4_t VRegA_22t() const {
+    return VRegA_22t(Fetch16(0));
+  }
+  uint8_t VRegA_22x() const {
+    return VRegA_22x(Fetch16(0));
+  }
+  uint8_t VRegA_23x() const {
+    return VRegA_23x(Fetch16(0));
+  }
   int32_t VRegA_30t() const;
-  uint8_t VRegA_31c() const;
-  uint8_t VRegA_31i() const;
-  uint8_t VRegA_31t() const;
+  uint8_t VRegA_31c() const {
+    return VRegA_31c(Fetch16(0));
+  }
+  uint8_t VRegA_31i() const {
+    return VRegA_31i(Fetch16(0));
+  }
+  uint8_t VRegA_31t() const {
+    return VRegA_31t(Fetch16(0));
+  }
   uint16_t VRegA_32x() const;
-  uint4_t VRegA_35c() const;
-  uint8_t VRegA_3rc() const;
-  uint8_t VRegA_51l() const;
+  uint4_t VRegA_35c() const {
+    return VRegA_35c(Fetch16(0));
+  }
+  uint8_t VRegA_3rc() const {
+    return VRegA_3rc(Fetch16(0));
+  }
+  uint8_t VRegA_51l() const {
+    return VRegA_51l(Fetch16(0));
+  }
+
+  // The following methods return the vA operand for various instruction formats. The "inst_data"
+  // parameter holds the first 16 bits of instruction which the returned value is decoded from.
+  int8_t VRegA_10t(uint16_t inst_data) const;
+  uint8_t VRegA_10x(uint16_t inst_data) const;
+  uint4_t VRegA_11n(uint16_t inst_data) const;
+  uint8_t VRegA_11x(uint16_t inst_data) const;
+  uint4_t VRegA_12x(uint16_t inst_data) const;
+  uint8_t VRegA_21c(uint16_t inst_data) const;
+  uint8_t VRegA_21h(uint16_t inst_data) const;
+  uint8_t VRegA_21s(uint16_t inst_data) const;
+  uint8_t VRegA_21t(uint16_t inst_data) const;
+  uint8_t VRegA_22b(uint16_t inst_data) const;
+  uint4_t VRegA_22c(uint16_t inst_data) const;
+  uint4_t VRegA_22s(uint16_t inst_data) const;
+  uint4_t VRegA_22t(uint16_t inst_data) const;
+  uint8_t VRegA_22x(uint16_t inst_data) const;
+  uint8_t VRegA_23x(uint16_t inst_data) const;
+  uint8_t VRegA_31c(uint16_t inst_data) const;
+  uint8_t VRegA_31i(uint16_t inst_data) const;
+  uint8_t VRegA_31t(uint16_t inst_data) const;
+  uint4_t VRegA_35c(uint16_t inst_data) const;
+  uint8_t VRegA_3rc(uint16_t inst_data) const;
+  uint8_t VRegA_51l(uint16_t inst_data) const;
 
   // VRegB
   bool HasVRegB() const;
   int32_t VRegB() const;
-  int4_t VRegB_11n() const;
-  uint4_t VRegB_12x() const;
+
+  bool HasWideVRegB() const;
+  uint64_t WideVRegB() const;
+
+  int4_t VRegB_11n() const {
+    return VRegB_11n(Fetch16(0));
+  }
+  uint4_t VRegB_12x() const {
+    return VRegB_12x(Fetch16(0));
+  }
   uint16_t VRegB_21c() const;
   uint16_t VRegB_21h() const;
   int16_t VRegB_21s() const;
   int16_t VRegB_21t() const;
   uint8_t VRegB_22b() const;
-  uint4_t VRegB_22c() const;
-  uint4_t VRegB_22s() const;
-  uint4_t VRegB_22t() const;
+  uint4_t VRegB_22c() const {
+    return VRegB_22c(Fetch16(0));
+  }
+  uint4_t VRegB_22s() const {
+    return VRegB_22s(Fetch16(0));
+  }
+  uint4_t VRegB_22t() const {
+    return VRegB_22t(Fetch16(0));
+  }
   uint16_t VRegB_22x() const;
   uint8_t VRegB_23x() const;
   uint32_t VRegB_31c() const;
@@ -265,9 +365,19 @@ class Instruction {
   uint16_t VRegB_3rc() const;
   uint64_t VRegB_51l() const;  // vB_wide
 
+  // The following methods return the vB operand for all instruction formats where it is encoded in
+  // the first 16 bits of instruction. The "inst_data" parameter holds these 16 bits. The returned
+  // value is decoded from it.
+  int4_t VRegB_11n(uint16_t inst_data) const;
+  uint4_t VRegB_12x(uint16_t inst_data) const;
+  uint4_t VRegB_22c(uint16_t inst_data) const;
+  uint4_t VRegB_22s(uint16_t inst_data) const;
+  uint4_t VRegB_22t(uint16_t inst_data) const;
+
   // VRegC
   bool HasVRegC() const;
   int32_t VRegC() const;
+
   int8_t VRegC_22b() const;
   uint16_t VRegC_22c() const;
   int16_t VRegC_22s() const;
@@ -277,11 +387,22 @@ class Instruction {
   uint16_t VRegC_3rc() const;
 
   // Fills the given array with the 'arg' array of the instruction.
-  void GetArgs(uint32_t args[5]) const;
+  bool HasVarArgs() const;
+  void GetVarArgs(uint32_t args[kMaxVarArgRegs], uint16_t inst_data) const;
+  void GetVarArgs(uint32_t args[kMaxVarArgRegs]) const {
+    return GetVarArgs(args, Fetch16(0));
+  }
 
-  // Returns the opcode field of the instruction.
+  // Returns the opcode field of the instruction. The given "inst_data" parameter must be the first
+  // 16 bits of instruction.
+  Code Opcode(uint16_t inst_data) const {
+    DCHECK_EQ(inst_data, Fetch16(0));
+    return static_cast<Code>(inst_data & 0xFF);
+  }
+
+  // Returns the opcode field of the instruction from the first 16 bits of instruction.
   Code Opcode() const {
-    return static_cast<Code>(Fetch16(0) & 0xFF);
+    return Opcode(Fetch16(0));
   }
 
   void SetOpcode(Code opcode) {
@@ -322,6 +443,11 @@ class Instruction {
   // Returns the flags for the given opcode.
   static int FlagsOf(Code opcode) {
     return kInstructionFlags[opcode];
+  }
+
+  // Return the verify flags for the given opcode.
+  static int VerifyFlagsOf(Code opcode) {
+    return kInstructionVerifyFlags[opcode];
   }
 
   // Returns true if this instruction is a branch.
@@ -370,18 +496,24 @@ class Instruction {
   }
 
   int GetVerifyTypeArgumentB() const {
-    return (kInstructionVerifyFlags[Opcode()] & (kVerifyRegB | kVerifyRegBField | kVerifyRegBMethod |
-             kVerifyRegBNewInstance | kVerifyRegBString | kVerifyRegBType | kVerifyRegBWide));
+    return (kInstructionVerifyFlags[Opcode()] & (kVerifyRegB | kVerifyRegBField |
+        kVerifyRegBMethod | kVerifyRegBNewInstance | kVerifyRegBString | kVerifyRegBType |
+        kVerifyRegBWide));
   }
 
   int GetVerifyTypeArgumentC() const {
     return (kInstructionVerifyFlags[Opcode()] & (kVerifyRegC | kVerifyRegCField |
-             kVerifyRegCNewArray | kVerifyRegCType | kVerifyRegCWide));
+        kVerifyRegCNewArray | kVerifyRegCType | kVerifyRegCWide));
   }
 
   int GetVerifyExtraFlags() const {
     return (kInstructionVerifyFlags[Opcode()] & (kVerifyArrayData | kVerifyBranchTarget |
-             kVerifySwitchTargets | kVerifyVarArg | kVerifyVarArgRange | kVerifyError));
+        kVerifySwitchTargets | kVerifyVarArg | kVerifyVarArgNonZero | kVerifyVarArgRange |
+        kVerifyVarArgRangeNonZero | kVerifyError));
+  }
+
+  bool GetVerifyIsRuntimeOnly() const {
+    return (kInstructionVerifyFlags[Opcode()] & kVerifyRuntimeOnly) != 0;
   }
 
   // Get the dex PC of this instruction as a offset in code units from the beginning of insns.
@@ -395,28 +527,43 @@ class Instruction {
   // Dump code_units worth of this instruction, padding to code_units for shorter instructions
   std::string DumpHex(size_t code_units) const;
 
- private:
-  size_t SizeInCodeUnitsComplexOpcode() const;
-
   uint16_t Fetch16(size_t offset) const {
     const uint16_t* insns = reinterpret_cast<const uint16_t*>(this);
     return insns[offset];
   }
+
+ private:
+  size_t SizeInCodeUnitsComplexOpcode() const;
 
   uint32_t Fetch32(size_t offset) const {
     return (Fetch16(offset) | ((uint32_t) Fetch16(offset + 1) << 16));
   }
 
   uint4_t InstA() const {
-    return static_cast<uint4_t>((Fetch16(0) >> 8) & 0x0f);
+    return InstA(Fetch16(0));
   }
 
   uint4_t InstB() const {
-    return static_cast<uint4_t>(Fetch16(0) >> 12);
+    return InstB(Fetch16(0));
   }
 
   uint8_t InstAA() const {
-    return static_cast<uint8_t>(Fetch16(0) >> 8);
+    return InstAA(Fetch16(0));
+  }
+
+  uint4_t InstA(uint16_t inst_data) const {
+    DCHECK_EQ(inst_data, Fetch16(0));
+    return static_cast<uint4_t>((inst_data >> 8) & 0x0f);
+  }
+
+  uint4_t InstB(uint16_t inst_data) const {
+    DCHECK_EQ(inst_data, Fetch16(0));
+    return static_cast<uint4_t>(inst_data >> 12);
+  }
+
+  uint8_t InstAA(uint16_t inst_data) const {
+    DCHECK_EQ(inst_data, Fetch16(0));
+    return static_cast<uint8_t>(inst_data >> 8);
   }
 
   static const char* const kInstructionNames[];
@@ -430,23 +577,6 @@ std::ostream& operator<<(std::ostream& os, const Instruction::Code& code);
 std::ostream& operator<<(std::ostream& os, const Instruction::Format& format);
 std::ostream& operator<<(std::ostream& os, const Instruction::Flags& flags);
 std::ostream& operator<<(std::ostream& os, const Instruction::VerifyFlag& vflags);
-
-/*
- * Holds the contents of a decoded instruction.
- */
-struct DecodedInstruction {
-  uint32_t vA;
-  uint32_t vB;
-  uint64_t vB_wide;        /* for k51l */
-  uint32_t vC;
-  uint32_t arg[5];         /* vC/D/E/F/G in invoke or filled-new-array */
-  Instruction::Code opcode;
-
-  explicit DecodedInstruction(const Instruction* inst) {
-    inst->Decode(vA, vB, vB_wide, vC, arg);
-    opcode = inst->Opcode();
-  }
-};
 
 }  // namespace art
 

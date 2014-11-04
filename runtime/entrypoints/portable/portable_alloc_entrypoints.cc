@@ -14,24 +14,27 @@
  * limitations under the License.
  */
 
-#include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
 
 namespace art {
 
+static constexpr gc::AllocatorType kPortableAllocatorType =
+    gc::kUseRosAlloc ? gc::kAllocatorTypeRosAlloc : gc::kAllocatorTypeDlMalloc;
+
 extern "C" mirror::Object* art_portable_alloc_object_from_code(uint32_t type_idx,
                                                                mirror::ArtMethod* referrer,
                                                                Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return AllocObjectFromCode(type_idx, referrer, thread, false);
+  return AllocObjectFromCode<false, true>(type_idx, referrer, thread, kPortableAllocatorType);
 }
 
 extern "C" mirror::Object* art_portable_alloc_object_from_code_with_access_check(uint32_t type_idx,
                                                                                  mirror::ArtMethod* referrer,
                                                                                  Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return AllocObjectFromCode(type_idx, referrer, thread, true);
+  return AllocObjectFromCode<true, true>(type_idx, referrer, thread, kPortableAllocatorType);
 }
 
 extern "C" mirror::Object* art_portable_alloc_array_from_code(uint32_t type_idx,
@@ -39,7 +42,8 @@ extern "C" mirror::Object* art_portable_alloc_array_from_code(uint32_t type_idx,
                                                               uint32_t length,
                                                               Thread* self)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return AllocArrayFromCode(type_idx, referrer, length, self, false);
+  return AllocArrayFromCode<false, true>(type_idx, referrer, length, self,
+                                         kPortableAllocatorType);
 }
 
 extern "C" mirror::Object* art_portable_alloc_array_from_code_with_access_check(uint32_t type_idx,
@@ -47,7 +51,8 @@ extern "C" mirror::Object* art_portable_alloc_array_from_code_with_access_check(
                                                                                 uint32_t length,
                                                                                 Thread* self)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return AllocArrayFromCode(type_idx, referrer, length, self, true);
+  return AllocArrayFromCode<true, true>(type_idx, referrer, length, self,
+                                        kPortableAllocatorType);
 }
 
 extern "C" mirror::Object* art_portable_check_and_alloc_array_from_code(uint32_t type_idx,
@@ -55,7 +60,8 @@ extern "C" mirror::Object* art_portable_check_and_alloc_array_from_code(uint32_t
                                                                         uint32_t length,
                                                                         Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return CheckAndAllocArrayFromCode(type_idx, referrer, length, thread, false);
+  return CheckAndAllocArrayFromCodeInstrumented(type_idx, referrer, length, thread, false,
+                                                kPortableAllocatorType);
 }
 
 extern "C" mirror::Object* art_portable_check_and_alloc_array_from_code_with_access_check(uint32_t type_idx,
@@ -63,7 +69,8 @@ extern "C" mirror::Object* art_portable_check_and_alloc_array_from_code_with_acc
                                                                                           uint32_t length,
                                                                                           Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return CheckAndAllocArrayFromCode(type_idx, referrer, length, thread, true);
+  return CheckAndAllocArrayFromCodeInstrumented(type_idx, referrer, length, thread, true,
+                                                kPortableAllocatorType);
 }
 
 }  // namespace art

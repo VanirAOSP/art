@@ -17,12 +17,11 @@
 #ifndef ART_RUNTIME_METHOD_REFERENCE_H_
 #define ART_RUNTIME_METHOD_REFERENCE_H_
 
+#include <stdint.h>
+
 namespace art {
 
 class DexFile;
-
-// A class is uniquely located by its DexFile and the class_defs_ table index into that DexFile
-typedef std::pair<const DexFile*, uint32_t> ClassReference;
 
 // A method is uniquely located by its DexFile and the method_ids_ table index into that DexFile
 struct MethodReference {

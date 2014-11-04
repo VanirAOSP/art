@@ -18,11 +18,11 @@
 
 #include <string>
 
-#include "atomic_integer.h"
-#include "common_test.h"
+#include "atomic.h"
+#include "common_runtime_test.h"
 #include "mirror/object_array-inl.h"
 #include "thread_pool.h"
-#include "UniquePtr.h"
+#include "thread-inl.h"
 
 namespace art {
 class CheckWaitTask : public Task {
@@ -56,7 +56,7 @@ class CheckWaitTask : public Task {
   AtomicInteger* const count3_;
 };
 
-class BarrierTest : public CommonTest {
+class BarrierTest : public CommonRuntimeTest {
  public:
   static int32_t num_threads;
 };
@@ -66,7 +66,7 @@ int32_t BarrierTest::num_threads = 4;
 // Check that barrier wait and barrier increment work.
 TEST_F(BarrierTest, CheckWait) {
   Thread* self = Thread::Current();
-  ThreadPool thread_pool(num_threads);
+  ThreadPool thread_pool("Barrier test thread pool", num_threads);
   Barrier barrier(0);
   AtomicInteger count1(0);
   AtomicInteger count2(0);
@@ -78,20 +78,20 @@ TEST_F(BarrierTest, CheckWait) {
   barrier.Increment(self, num_threads);
   // At this point each thread should have passed through the barrier. The first count should be
   // equal to num_threads.
-  EXPECT_EQ(num_threads, count1);
+  EXPECT_EQ(num_threads, count1.LoadRelaxed());
   // Count 3 should still be zero since no thread should have gone past the second barrier.
-  EXPECT_EQ(0, count3);
+  EXPECT_EQ(0, count3.LoadRelaxed());
   // Now lets tell the threads to pass again.
   barrier.Increment(self, num_threads);
   // Count 2 should be equal to num_threads since each thread must have passed the second barrier
   // at this point.
-  EXPECT_EQ(num_threads, count2);
+  EXPECT_EQ(num_threads, count2.LoadRelaxed());
   // Wait for all the threads to finish.
   thread_pool.Wait(self, true, false);
   // All three counts should be equal to num_threads now.
-  EXPECT_EQ(count1, count2);
-  EXPECT_EQ(count2, count3);
-  EXPECT_EQ(num_threads, count3);
+  EXPECT_EQ(count1.LoadRelaxed(), count2.LoadRelaxed());
+  EXPECT_EQ(count2.LoadRelaxed(), count3.LoadRelaxed());
+  EXPECT_EQ(num_threads, count3.LoadRelaxed());
 }
 
 class CheckPassTask : public Task {
@@ -121,7 +121,7 @@ class CheckPassTask : public Task {
 // Check that barrier pass through works.
 TEST_F(BarrierTest, CheckPass) {
   Thread* self = Thread::Current();
-  ThreadPool thread_pool(num_threads);
+  ThreadPool thread_pool("Barrier test thread pool", num_threads);
   Barrier barrier(0);
   AtomicInteger count(0);
   const int32_t num_tasks = num_threads * 4;
@@ -134,7 +134,7 @@ TEST_F(BarrierTest, CheckPass) {
   // Wait for all the tasks to complete using the barrier.
   barrier.Increment(self, expected_total_tasks);
   // The total number of completed tasks should be equal to expected_total_tasks.
-  EXPECT_EQ(count, expected_total_tasks);
+  EXPECT_EQ(count.LoadRelaxed(), expected_total_tasks);
 }
 
 }  // namespace art

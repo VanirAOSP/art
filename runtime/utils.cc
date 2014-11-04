@@ -16,15 +16,19 @@
 
 #include "utils.h"
 
+#include <inttypes.h>
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <memory>
 
-#include "UniquePtr.h"
+#include "base/stl_util.h"
 #include "base/unix_file/fd_file.h"
 #include "dex_file-inl.h"
+#include "field_helper.h"
 #include "mirror/art_field-inl.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/class-inl.h"
@@ -32,9 +36,9 @@
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
 #include "mirror/string.h"
-#include "object_utils.h"
 #include "os.h"
-#include "utf.h"
+#include "scoped_thread_state_change.h"
+#include "utf-inl.h"
 
 #if !defined(HAVE_POSIX_CLOCKS)
 #include <sys/time.h>
@@ -49,8 +53,7 @@
 #include <sys/syscall.h>
 #endif
 
-#include <corkscrew/backtrace.h>  // For DumpNativeStack.
-#include <corkscrew/demangle.h>  // For DumpNativeStack.
+#include <backtrace/Backtrace.h>  // For DumpNativeStack.
 
 #if defined(__linux__)
 #include <linux/unistd.h>
@@ -83,29 +86,36 @@ std::string GetThreadName(pid_t tid) {
   return result;
 }
 
-void GetThreadStack(pthread_t thread, void*& stack_base, size_t& stack_size) {
+void GetThreadStack(pthread_t thread, void** stack_base, size_t* stack_size, size_t* guard_size) {
 #if defined(__APPLE__)
-  stack_size = pthread_get_stacksize_np(thread);
+  *stack_size = pthread_get_stacksize_np(thread);
   void* stack_addr = pthread_get_stackaddr_np(thread);
 
   // Check whether stack_addr is the base or end of the stack.
   // (On Mac OS 10.7, it's the end.)
   int stack_variable;
   if (stack_addr > &stack_variable) {
-    stack_base = reinterpret_cast<byte*>(stack_addr) - stack_size;
+    *stack_base = reinterpret_cast<byte*>(stack_addr) - *stack_size;
   } else {
-    stack_base = stack_addr;
+    *stack_base = stack_addr;
   }
+
+  // This is wrong, but there doesn't seem to be a way to get the actual value on the Mac.
+  pthread_attr_t attributes;
+  CHECK_PTHREAD_CALL(pthread_attr_init, (&attributes), __FUNCTION__);
+  CHECK_PTHREAD_CALL(pthread_attr_getguardsize, (&attributes, guard_size), __FUNCTION__);
+  CHECK_PTHREAD_CALL(pthread_attr_destroy, (&attributes), __FUNCTION__);
 #else
   pthread_attr_t attributes;
   CHECK_PTHREAD_CALL(pthread_getattr_np, (thread, &attributes), __FUNCTION__);
-  CHECK_PTHREAD_CALL(pthread_attr_getstack, (&attributes, &stack_base, &stack_size), __FUNCTION__);
+  CHECK_PTHREAD_CALL(pthread_attr_getstack, (&attributes, stack_base, stack_size), __FUNCTION__);
+  CHECK_PTHREAD_CALL(pthread_attr_getguardsize, (&attributes, guard_size), __FUNCTION__);
   CHECK_PTHREAD_CALL(pthread_attr_destroy, (&attributes), __FUNCTION__);
 #endif
 }
 
 bool ReadFileToString(const std::string& file_name, std::string* result) {
-  UniquePtr<File> file(new File);
+  std::unique_ptr<File> file(new File);
   if (!file->Open(file_name, O_RDONLY)) {
     return false;
   }
@@ -136,11 +146,11 @@ uint64_t MilliTime() {
 #if defined(HAVE_POSIX_CLOCKS)
   timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
-  return static_cast<uint64_t>(now.tv_sec) * 1000LL + now.tv_nsec / 1000000LL;
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000) + now.tv_nsec / UINT64_C(1000000);
 #else
   timeval now;
   gettimeofday(&now, NULL);
-  return static_cast<uint64_t>(now.tv_sec) * 1000LL + now.tv_usec / 1000LL;
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000) + now.tv_usec / UINT64_C(1000);
 #endif
 }
 
@@ -148,11 +158,11 @@ uint64_t MicroTime() {
 #if defined(HAVE_POSIX_CLOCKS)
   timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
-  return static_cast<uint64_t>(now.tv_sec) * 1000000LL + now.tv_nsec / 1000LL;
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000) + now.tv_nsec / UINT64_C(1000);
 #else
   timeval now;
   gettimeofday(&now, NULL);
-  return static_cast<uint64_t>(now.tv_sec) * 1000000LL + now.tv_usec;
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000) + now.tv_usec;
 #endif
 }
 
@@ -160,11 +170,11 @@ uint64_t NanoTime() {
 #if defined(HAVE_POSIX_CLOCKS)
   timespec now;
   clock_gettime(CLOCK_MONOTONIC, &now);
-  return static_cast<uint64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000000) + now.tv_nsec;
 #else
   timeval now;
   gettimeofday(&now, NULL);
-  return static_cast<uint64_t>(now.tv_sec) * 1000000000LL + now.tv_usec * 1000LL;
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000000) + now.tv_usec * UINT64_C(1000);
 #endif
 }
 
@@ -172,7 +182,7 @@ uint64_t ThreadCpuNanoTime() {
 #if defined(HAVE_POSIX_CLOCKS)
   timespec now;
   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now);
-  return static_cast<uint64_t>(now.tv_sec) * 1000000000LL + now.tv_nsec;
+  return static_cast<uint64_t>(now.tv_sec) * UINT64_C(1000000000) + now.tv_nsec;
 #else
   UNIMPLEMENTED(WARNING);
   return -1;
@@ -219,23 +229,24 @@ void InitTimeSpec(bool absolute, int clock, int64_t ms, int32_t ns, timespec* ts
   }
 }
 
-std::string PrettyDescriptor(const mirror::String* java_descriptor) {
+std::string PrettyDescriptor(mirror::String* java_descriptor) {
   if (java_descriptor == NULL) {
     return "null";
   }
-  return PrettyDescriptor(java_descriptor->ToModifiedUtf8());
+  return PrettyDescriptor(java_descriptor->ToModifiedUtf8().c_str());
 }
 
-std::string PrettyDescriptor(const mirror::Class* klass) {
+std::string PrettyDescriptor(mirror::Class* klass) {
   if (klass == NULL) {
     return "null";
   }
-  return PrettyDescriptor(ClassHelper(klass).GetDescriptor());
+  std::string temp;
+  return PrettyDescriptor(klass->GetDescriptor(&temp));
 }
 
-std::string PrettyDescriptor(const std::string& descriptor) {
+std::string PrettyDescriptor(const char* descriptor) {
   // Count the number of '['s to get the dimensionality.
-  const char* c = descriptor.c_str();
+  const char* c = descriptor;
   size_t dim = 0;
   while (*c == '[') {
     dim++;
@@ -276,30 +287,25 @@ std::string PrettyDescriptor(const std::string& descriptor) {
     result.push_back(ch);
   }
   // ...and replace the semicolon with 'dim' "[]" pairs:
-  while (dim--) {
+  for (size_t i = 0; i < dim; ++i) {
     result += "[]";
   }
   return result;
 }
 
-std::string PrettyDescriptor(Primitive::Type type) {
-  std::string descriptor_string(Primitive::Descriptor(type));
-  return PrettyDescriptor(descriptor_string);
-}
-
-std::string PrettyField(const mirror::ArtField* f, bool with_type) {
+std::string PrettyField(mirror::ArtField* f, bool with_type) {
   if (f == NULL) {
     return "null";
   }
-  FieldHelper fh(f);
   std::string result;
   if (with_type) {
-    result += PrettyDescriptor(fh.GetTypeDescriptor());
+    result += PrettyDescriptor(f->GetTypeDescriptor());
     result += ' ';
   }
-  result += PrettyDescriptor(fh.GetDeclaringClassDescriptor());
+  StackHandleScope<1> hs(Thread::Current());
+  result += PrettyDescriptor(FieldHelper(hs.NewHandle(f)).GetDeclaringClassDescriptor());
   result += '.';
-  result += fh.GetName();
+  result += f->GetName();
   return result;
 }
 
@@ -342,8 +348,10 @@ std::string PrettyArguments(const char* signature) {
     } else {
       ++argument_length;
     }
-    std::string argument_descriptor(signature, argument_length);
-    result += PrettyDescriptor(argument_descriptor);
+    {
+      std::string argument_descriptor(signature, argument_length);
+      result += PrettyDescriptor(argument_descriptor.c_str());
+    }
     if (signature[argument_length] != ')') {
       result += ", ";
     }
@@ -362,20 +370,24 @@ std::string PrettyReturnType(const char* signature) {
   return PrettyDescriptor(return_type);
 }
 
-std::string PrettyMethod(const mirror::ArtMethod* m, bool with_signature) {
-  if (m == NULL) {
+std::string PrettyMethod(mirror::ArtMethod* m, bool with_signature) {
+  if (m == nullptr) {
     return "null";
   }
-  MethodHelper mh(m);
-  std::string result(PrettyDescriptor(mh.GetDeclaringClassDescriptor()));
+  std::string result(PrettyDescriptor(m->GetDeclaringClassDescriptor()));
   result += '.';
-  result += mh.GetName();
+  result += m->GetName();
+  if (UNLIKELY(m->IsFastNative())) {
+    result += "!";
+  }
   if (with_signature) {
-    std::string signature(mh.GetSignature());
-    if (signature == "<no signature>") {
-      return result + signature;
+    const Signature signature = m->GetSignature();
+    std::string sig_as_string(signature.ToString());
+    if (signature == Signature::NoSignature()) {
+      return result + sig_as_string;
     }
-    result = PrettyReturnType(signature.c_str()) + " " + result + PrettyArguments(signature.c_str());
+    result = PrettyReturnType(sig_as_string.c_str()) + " " + result +
+        PrettyArguments(sig_as_string.c_str());
   }
   return result;
 }
@@ -389,32 +401,33 @@ std::string PrettyMethod(uint32_t method_idx, const DexFile& dex_file, bool with
   result += '.';
   result += dex_file.GetMethodName(method_id);
   if (with_signature) {
-    std::string signature(dex_file.GetMethodSignature(method_id));
-    if (signature == "<no signature>") {
-      return result + signature;
+    const Signature signature = dex_file.GetMethodSignature(method_id);
+    std::string sig_as_string(signature.ToString());
+    if (signature == Signature::NoSignature()) {
+      return result + sig_as_string;
     }
-    result = PrettyReturnType(signature.c_str()) + " " + result + PrettyArguments(signature.c_str());
+    result = PrettyReturnType(sig_as_string.c_str()) + " " + result +
+        PrettyArguments(sig_as_string.c_str());
   }
   return result;
 }
 
-std::string PrettyTypeOf(const mirror::Object* obj) {
+std::string PrettyTypeOf(mirror::Object* obj) {
   if (obj == NULL) {
     return "null";
   }
   if (obj->GetClass() == NULL) {
     return "(raw)";
   }
-  ClassHelper kh(obj->GetClass());
-  std::string result(PrettyDescriptor(kh.GetDescriptor()));
+  std::string temp;
+  std::string result(PrettyDescriptor(obj->GetClass()->GetDescriptor(&temp)));
   if (obj->IsClass()) {
-    kh.ChangeClass(obj->AsClass());
-    result += "<" + PrettyDescriptor(kh.GetDescriptor()) + ">";
+    result += "<" + PrettyDescriptor(obj->AsClass()->GetDescriptor(&temp)) + ">";
   }
   return result;
 }
 
-std::string PrettyClass(const mirror::Class* c) {
+std::string PrettyClass(mirror::Class* c) {
   if (c == NULL) {
     return "null";
   }
@@ -425,7 +438,7 @@ std::string PrettyClass(const mirror::Class* c) {
   return result;
 }
 
-std::string PrettyClassAndClassLoader(const mirror::Class* c) {
+std::string PrettyClassAndClassLoader(mirror::Class* c) {
   if (c == NULL) {
     return "null";
   }
@@ -439,33 +452,38 @@ std::string PrettyClassAndClassLoader(const mirror::Class* c) {
   return result;
 }
 
-std::string PrettySize(size_t byte_count) {
+std::string PrettySize(int64_t byte_count) {
   // The byte thresholds at which we display amounts.  A byte count is displayed
   // in unit U when kUnitThresholds[U] <= bytes < kUnitThresholds[U+1].
-  static const size_t kUnitThresholds[] = {
+  static const int64_t kUnitThresholds[] = {
     0,              // B up to...
     3*1024,         // KB up to...
     2*1024*1024,    // MB up to...
     1024*1024*1024  // GB from here.
   };
-  static const size_t kBytesPerUnit[] = { 1, KB, MB, GB };
+  static const int64_t kBytesPerUnit[] = { 1, KB, MB, GB };
   static const char* const kUnitStrings[] = { "B", "KB", "MB", "GB" };
-
+  const char* negative_str = "";
+  if (byte_count < 0) {
+    negative_str = "-";
+    byte_count = -byte_count;
+  }
   int i = arraysize(kUnitThresholds);
   while (--i > 0) {
     if (byte_count >= kUnitThresholds[i]) {
       break;
     }
   }
-
-  return StringPrintf("%zd%s", byte_count / kBytesPerUnit[i], kUnitStrings[i]);
+  return StringPrintf("%s%" PRId64 "%s",
+                      negative_str, byte_count / kBytesPerUnit[i], kUnitStrings[i]);
 }
 
-std::string PrettyDuration(uint64_t nano_duration) {
+std::string PrettyDuration(uint64_t nano_duration, size_t max_fraction_digits) {
   if (nano_duration == 0) {
     return "0";
   } else {
-    return FormatDuration(nano_duration, GetAppropriateTimeUnit(nano_duration));
+    return FormatDuration(nano_duration, GetAppropriateTimeUnit(nano_duration),
+                          max_fraction_digits);
   }
 }
 
@@ -502,52 +520,62 @@ uint64_t GetNsToTimeUnitDivisor(TimeUnit time_unit) {
   return 0;
 }
 
-std::string FormatDuration(uint64_t nano_duration, TimeUnit time_unit) {
-  const char* unit = NULL;
+std::string FormatDuration(uint64_t nano_duration, TimeUnit time_unit,
+                           size_t max_fraction_digits) {
+  const char* unit = nullptr;
   uint64_t divisor = GetNsToTimeUnitDivisor(time_unit);
-  uint32_t zero_fill = 1;
   switch (time_unit) {
     case kTimeUnitSecond:
       unit = "s";
-      zero_fill = 9;
       break;
     case kTimeUnitMillisecond:
       unit = "ms";
-      zero_fill = 6;
       break;
     case kTimeUnitMicrosecond:
       unit = "us";
-      zero_fill = 3;
       break;
     case kTimeUnitNanosecond:
       unit = "ns";
-      zero_fill = 0;
       break;
   }
-
-  uint64_t whole_part = nano_duration / divisor;
+  const uint64_t whole_part = nano_duration / divisor;
   uint64_t fractional_part = nano_duration % divisor;
   if (fractional_part == 0) {
-    return StringPrintf("%llu%s", whole_part, unit);
+    return StringPrintf("%" PRIu64 "%s", whole_part, unit);
   } else {
-    while ((fractional_part % 1000) == 0) {
-      zero_fill -= 3;
-      fractional_part /= 1000;
+    static constexpr size_t kMaxDigits = 30;
+    size_t avail_digits = kMaxDigits;
+    char fraction_buffer[kMaxDigits];
+    char* ptr = fraction_buffer;
+    uint64_t multiplier = 10;
+    // This infinite loops if fractional part is 0.
+    while (avail_digits > 1 && fractional_part * multiplier < divisor) {
+      multiplier *= 10;
+      *ptr++ = '0';
+      avail_digits--;
     }
-    if (zero_fill == 3) {
-      return StringPrintf("%llu.%03llu%s", whole_part, fractional_part, unit);
-    } else if (zero_fill == 6) {
-      return StringPrintf("%llu.%06llu%s", whole_part, fractional_part, unit);
-    } else {
-      return StringPrintf("%llu.%09llu%s", whole_part, fractional_part, unit);
-    }
+    snprintf(ptr, avail_digits, "%" PRIu64, fractional_part);
+    fraction_buffer[std::min(kMaxDigits - 1, max_fraction_digits)] = '\0';
+    return StringPrintf("%" PRIu64 ".%s%s", whole_part, fraction_buffer, unit);
   }
 }
 
-std::string PrintableString(const std::string& utf) {
+std::string PrintableChar(uint16_t ch) {
+  std::string result;
+  result += '\'';
+  if (NeedsEscaping(ch)) {
+    StringAppendF(&result, "\\u%04x", ch);
+  } else {
+    result += ch;
+  }
+  result += '\'';
+  return result;
+}
+
+std::string PrintableString(const char* utf) {
   std::string result;
   result += '"';
-  const char* p = utf.c_str();
+  const char* p = utf;
   size_t char_count = CountModifiedUtf8Chars(p);
   for (size_t i = 0; i < char_count; ++i) {
     uint16_t ch = GetUtf16FromUtf8(&p);
@@ -604,11 +632,20 @@ std::string DotToDescriptor(const char* class_name) {
 
 std::string DescriptorToDot(const char* descriptor) {
   size_t length = strlen(descriptor);
-  if (descriptor[0] == 'L' && descriptor[length - 1] == ';') {
-    std::string result(descriptor + 1, length - 2);
-    std::replace(result.begin(), result.end(), '/', '.');
-    return result;
+  if (length > 1) {
+    if (descriptor[0] == 'L' && descriptor[length - 1] == ';') {
+      // Descriptors have the leading 'L' and trailing ';' stripped.
+      std::string result(descriptor + 1, length - 2);
+      std::replace(result.begin(), result.end(), '/', '.');
+      return result;
+    } else {
+      // For arrays the 'L' and ';' remain intact.
+      std::string result(descriptor);
+      std::replace(result.begin(), result.end(), '/', '.');
+      return result;
+    }
   }
+  // Do nothing for non-class/array descriptors.
   return descriptor;
 }
 
@@ -621,16 +658,15 @@ std::string DescriptorToName(const char* descriptor) {
   return descriptor;
 }
 
-std::string JniShortName(const mirror::ArtMethod* m) {
-  MethodHelper mh(m);
-  std::string class_name(mh.GetDeclaringClassDescriptor());
+std::string JniShortName(mirror::ArtMethod* m) {
+  std::string class_name(m->GetDeclaringClassDescriptor());
   // Remove the leading 'L' and trailing ';'...
   CHECK_EQ(class_name[0], 'L') << class_name;
   CHECK_EQ(class_name[class_name.size() - 1], ';') << class_name;
   class_name.erase(0, 1);
   class_name.erase(class_name.size() - 1, 1);
 
-  std::string method_name(mh.GetName());
+  std::string method_name(m->GetName());
 
   std::string short_name;
   short_name += "Java_";
@@ -640,12 +676,12 @@ std::string JniShortName(const mirror::ArtMethod* m) {
   return short_name;
 }
 
-std::string JniLongName(const mirror::ArtMethod* m) {
+std::string JniLongName(mirror::ArtMethod* m) {
   std::string long_name;
   long_name += JniShortName(m);
   long_name += "__";
 
-  std::string signature(MethodHelper(m).GetSignature());
+  std::string signature(m->GetSignature().ToString());
   signature.erase(0, 1);
   signature.erase(signature.begin() + signature.find(')'), signature.end());
 
@@ -718,9 +754,9 @@ bool IsValidPartOfMemberNameUtf8Slow(const char** pUtf8Ptr) {
  * this function returns false, then the given pointer may only have
  * been partially advanced.
  */
-bool IsValidPartOfMemberNameUtf8(const char** pUtf8Ptr) {
+static bool IsValidPartOfMemberNameUtf8(const char** pUtf8Ptr) {
   uint8_t c = (uint8_t) **pUtf8Ptr;
-  if (c <= 0x7f) {
+  if (LIKELY(c <= 0x7f)) {
     // It's low-ascii, so check the table.
     uint32_t wordIdx = c >> 5;
     uint32_t bitIdx = c & 0x1f;
@@ -761,7 +797,7 @@ bool IsValidMemberName(const char* s) {
 }
 
 enum ClassNameType { kName, kDescriptor };
-bool IsValidClassName(const char* s, ClassNameType type, char separator) {
+static bool IsValidClassName(const char* s, ClassNameType type, char separator) {
   int arrayCount = 0;
   while (*s == '[') {
     arrayCount++;
@@ -890,6 +926,35 @@ void Split(const std::string& s, char separator, std::vector<std::string>& resul
   }
 }
 
+std::string Trim(std::string s) {
+  std::string result;
+  unsigned int start_index = 0;
+  unsigned int end_index = s.size() - 1;
+
+  // Skip initial whitespace.
+  while (start_index < s.size()) {
+    if (!isspace(s[start_index])) {
+      break;
+    }
+    start_index++;
+  }
+
+  // Skip terminating whitespace.
+  while (end_index >= start_index) {
+    if (!isspace(s[end_index])) {
+      break;
+    }
+    end_index--;
+  }
+
+  // All spaces, no beef.
+  if (end_index < start_index) {
+    return "";
+  }
+  // Start_index is the first non-space, end_index is the last one.
+  return s.substr(start_index, end_index - start_index + 1);
+}
+
 template <typename StringT>
 std::string Join(std::vector<StringT>& strings, char separator) {
   if (strings.empty()) {
@@ -959,8 +1024,8 @@ void SetThreadName(const char* thread_name) {
 #endif
 }
 
-void GetTaskStats(pid_t tid, char& state, int& utime, int& stime, int& task_cpu) {
-  utime = stime = task_cpu = 0;
+void GetTaskStats(pid_t tid, char* state, int* utime, int* stime, int* task_cpu) {
+  *utime = *stime = *task_cpu = 0;
   std::string stats;
   if (!ReadFileToString(StringPrintf("/proc/self/task/%d/stat", tid), &stats)) {
     return;
@@ -970,10 +1035,10 @@ void GetTaskStats(pid_t tid, char& state, int& utime, int& stime, int& task_cpu)
   // Extract the three fields we care about.
   std::vector<std::string> fields;
   Split(stats, ' ', fields);
-  state = fields[0][0];
-  utime = strtoull(fields[11].c_str(), NULL, 10);
-  stime = strtoull(fields[12].c_str(), NULL, 10);
-  task_cpu = strtoull(fields[36].c_str(), NULL, 10);
+  *state = fields[0][0];
+  *utime = strtoull(fields[11].c_str(), NULL, 10);
+  *stime = strtoull(fields[12].c_str(), NULL, 10);
+  *task_cpu = strtoull(fields[36].c_str(), NULL, 10);
 }
 
 std::string GetSchedulerGroupName(pid_t tid) {
@@ -1001,103 +1066,55 @@ std::string GetSchedulerGroupName(pid_t tid) {
   return "";
 }
 
-static const char* CleanMapName(const backtrace_symbol_t* symbol) {
-  const char* map_name = symbol->map_name;
-  if (map_name == NULL) {
-    map_name = "???";
+void DumpNativeStack(std::ostream& os, pid_t tid, const char* prefix,
+    mirror::ArtMethod* current_method) {
+  // We may be called from contexts where current_method is not null, so we must assert this.
+  if (current_method != nullptr) {
+    Locks::mutator_lock_->AssertSharedHeld(Thread::Current());
   }
-  // Turn "/usr/local/google/home/enh/clean-dalvik-dev/out/host/linux-x86/lib/libartd.so"
-  // into "libartd.so".
-  const char* last_slash = strrchr(map_name, '/');
-  if (last_slash != NULL) {
-    map_name = last_slash + 1;
-  }
-  return map_name;
-}
-
-static void FindSymbolInElf(const backtrace_frame_t* frame, const backtrace_symbol_t* symbol,
-                            std::string& symbol_name, uint32_t& pc_offset) {
-  symbol_table_t* symbol_table = NULL;
-  if (symbol->map_name != NULL) {
-    symbol_table = load_symbol_table(symbol->map_name);
-  }
-  const symbol_t* elf_symbol = NULL;
-  bool was_relative = true;
-  if (symbol_table != NULL) {
-    elf_symbol = find_symbol(symbol_table, symbol->relative_pc);
-    if (elf_symbol == NULL) {
-      elf_symbol = find_symbol(symbol_table, frame->absolute_pc);
-      was_relative = false;
-    }
-  }
-  if (elf_symbol != NULL) {
-    const char* demangled_symbol_name = demangle_symbol_name(elf_symbol->name);
-    if (demangled_symbol_name != NULL) {
-      symbol_name = demangled_symbol_name;
-    } else {
-      symbol_name = elf_symbol->name;
-    }
-
-    // TODO: is it a libcorkscrew bug that we have to do this?
-    pc_offset = (was_relative ? symbol->relative_pc : frame->absolute_pc) - elf_symbol->start;
-  } else {
-    symbol_name = "???";
-  }
-  free_symbol_table(symbol_table);
-}
-
-void DumpNativeStack(std::ostream& os, pid_t tid, const char* prefix, bool include_count) {
-  // Ensure libcorkscrew doesn't use a stale cache of /proc/self/maps.
-  flush_my_map_info_list();
-
-  const size_t MAX_DEPTH = 32;
-  UniquePtr<backtrace_frame_t[]> frames(new backtrace_frame_t[MAX_DEPTH]);
-  size_t ignore_count = 2;  // Don't include unwind_backtrace_thread or DumpNativeStack.
-  ssize_t frame_count = unwind_backtrace_thread(tid, frames.get(), ignore_count, MAX_DEPTH);
-  if (frame_count == -1) {
-    os << prefix << "(unwind_backtrace_thread failed for thread " << tid << ")\n";
+#ifdef __linux__
+  std::unique_ptr<Backtrace> backtrace(Backtrace::Create(BACKTRACE_CURRENT_PROCESS, tid));
+  if (!backtrace->Unwind(0)) {
+    os << prefix << "(backtrace::Unwind failed for thread " << tid << ")\n";
     return;
-  } else if (frame_count == 0) {
+  } else if (backtrace->NumFrames() == 0) {
     os << prefix << "(no native stack frames for thread " << tid << ")\n";
     return;
   }
 
-  UniquePtr<backtrace_symbol_t[]> backtrace_symbols(new backtrace_symbol_t[frame_count]);
-  get_backtrace_symbols(frames.get(), frame_count, backtrace_symbols.get());
-
-  for (size_t i = 0; i < static_cast<size_t>(frame_count); ++i) {
-    const backtrace_frame_t* frame = &frames[i];
-    const backtrace_symbol_t* symbol = &backtrace_symbols[i];
-
+  for (Backtrace::const_iterator it = backtrace->begin();
+       it != backtrace->end(); ++it) {
     // We produce output like this:
-    // ]    #00 unwind_backtrace_thread+536 [0x55d75bb8] (libcorkscrew.so)
-
-    std::string symbol_name;
-    uint32_t pc_offset = 0;
-    if (symbol->demangled_name != NULL) {
-      symbol_name = symbol->demangled_name;
-      pc_offset = symbol->relative_pc - symbol->relative_symbol_addr;
-    } else if (symbol->symbol_name != NULL) {
-      symbol_name = symbol->symbol_name;
-      pc_offset = symbol->relative_pc - symbol->relative_symbol_addr;
+    // ]    #00 pc 000075bb8  /system/lib/libc.so (unwind_backtrace_thread+536)
+    // In order for parsing tools to continue to function, the stack dump
+    // format must at least adhere to this format:
+    //  #XX pc <RELATIVE_ADDR>  <FULL_PATH_TO_SHARED_LIBRARY> ...
+    // The parsers require a single space before and after pc, and two spaces
+    // after the <RELATIVE_ADDR>. There can be any prefix data before the
+    // #XX. <RELATIVE_ADDR> has to be a hex number but with no 0x prefix.
+    os << prefix << StringPrintf("#%02zu pc ", it->num);
+    if (!it->map) {
+      os << StringPrintf("%08" PRIxPTR "  ???", it->pc);
     } else {
-      // dladdr(3) didn't find a symbol; maybe it's static? Look in the ELF file...
-      FindSymbolInElf(frame, symbol, symbol_name, pc_offset);
+      os << StringPrintf("%08" PRIxPTR "  ", it->pc - it->map->start)
+         << it->map->name << " (";
+      if (!it->func_name.empty()) {
+        os << it->func_name;
+        if (it->func_offset != 0) {
+          os << "+" << it->func_offset;
+        }
+      } else if (current_method != nullptr && current_method->IsWithinQuickCode(it->pc)) {
+        const void* start_of_code = current_method->GetEntryPointFromQuickCompiledCode();
+        os << JniLongName(current_method) << "+"
+           << (it->pc - reinterpret_cast<uintptr_t>(start_of_code));
+      } else {
+        os << "???";
+      }
+      os << ")";
     }
-
-    os << prefix;
-    if (include_count) {
-      os << StringPrintf("#%02zd ", i);
-    }
-    os << symbol_name;
-    if (pc_offset != 0) {
-      os << "+" << pc_offset;
-    }
-    os << StringPrintf(" [%p] (%s)\n",
-                       reinterpret_cast<void*>(frame->absolute_pc), CleanMapName(symbol));
+    os << "\n";
   }
-
-  free_backtrace_symbols(backtrace_symbols.get(), frame_count);
+#endif
 }
 
 #if defined(__APPLE__)
@@ -1126,7 +1143,8 @@ void DumpKernelStack(std::ostream& os, pid_t tid, const char* prefix, bool inclu
   // which looking at the source appears to be the kernel's way of saying "that's all, folks!".
   kernel_stack_frames.pop_back();
   for (size_t i = 0; i < kernel_stack_frames.size(); ++i) {
-    // Turn "[<ffffffff8109156d>] futex_wait_queue_me+0xcd/0x110" into "futex_wait_queue_me+0xcd/0x110".
+    // Turn "[<ffffffff8109156d>] futex_wait_queue_me+0xcd/0x110"
+    // into "futex_wait_queue_me+0xcd/0x110".
     const char* text = kernel_stack_frames[i].c_str();
     const char* close_bracket = strchr(text, ']');
     if (close_bracket != NULL) {
@@ -1160,49 +1178,73 @@ const char* GetAndroidRoot() {
 }
 
 const char* GetAndroidData() {
+  std::string error_msg;
+  const char* dir = GetAndroidDataSafe(&error_msg);
+  if (dir != nullptr) {
+    return dir;
+  } else {
+    LOG(FATAL) << error_msg;
+    return "";
+  }
+}
+
+const char* GetAndroidDataSafe(std::string* error_msg) {
   const char* android_data = getenv("ANDROID_DATA");
   if (android_data == NULL) {
     if (OS::DirectoryExists("/data")) {
       android_data = "/data";
     } else {
-      LOG(FATAL) << "ANDROID_DATA not set and /data does not exist";
-      return "";
+      *error_msg = "ANDROID_DATA not set and /data does not exist";
+      return nullptr;
     }
   }
   if (!OS::DirectoryExists(android_data)) {
-    LOG(FATAL) << "Failed to find ANDROID_DATA directory " << android_data;
-    return "";
+    *error_msg = StringPrintf("Failed to find ANDROID_DATA directory %s", android_data);
+    return nullptr;
   }
   return android_data;
 }
 
-#ifdef ALLOW_DEXROOT_ON_CACHE
-const char* GetAndroidCache() {
-  const char* android_cache = getenv("ANDROID_CACHE");
-  if (android_cache == NULL) {
-    if (OS::DirectoryExists("/cache")) {
-      android_cache = "/cache";
-    } else {
-      LOG(FATAL) << "ANDROID_CACHE not set and /cache does not exist";
-      return "";
-    }
+void GetDalvikCache(const char* subdir, const bool create_if_absent, std::string* dalvik_cache,
+                    bool* have_android_data, bool* dalvik_cache_exists, bool* is_global_cache) {
+  CHECK(subdir != nullptr);
+  std::string error_msg;
+  const char* android_data = GetAndroidDataSafe(&error_msg);
+  if (android_data == nullptr) {
+    *have_android_data = false;
+    *dalvik_cache_exists = false;
+    *is_global_cache = false;
+    return;
+  } else {
+    *have_android_data = true;
   }
-  if (!OS::DirectoryExists(android_cache)) {
-    LOG(FATAL) << "Failed to find ANDROID_CACHE directory " << android_cache;
-    return "";
+  const std::string dalvik_cache_root(StringPrintf("%s/dalvik-cache/", android_data));
+  *dalvik_cache = dalvik_cache_root + subdir;
+  *dalvik_cache_exists = OS::DirectoryExists(dalvik_cache->c_str());
+  *is_global_cache = strcmp(android_data, "/data") == 0;
+  if (create_if_absent && !*dalvik_cache_exists && !*is_global_cache) {
+    // Don't create the system's /data/dalvik-cache/... because it needs special permissions.
+    *dalvik_cache_exists = ((mkdir(dalvik_cache_root.c_str(), 0700) == 0 || errno == EEXIST) &&
+                            (mkdir(dalvik_cache->c_str(), 0700) == 0 || errno == EEXIST));
   }
-  return android_cache;
 }
-#endif
 
-std::string GetDalvikCacheOrDie(const char* android_data) {
-  std::string dalvik_cache(StringPrintf("%s/dalvik-cache", android_data));
-
-  if (!OS::DirectoryExists(dalvik_cache.c_str())) {
-    if (StartsWith(dalvik_cache, "/tmp/")) {
-      int result = mkdir(dalvik_cache.c_str(), 0700);
+std::string GetDalvikCacheOrDie(const char* subdir, const bool create_if_absent) {
+  CHECK(subdir != nullptr);
+  const char* android_data = GetAndroidData();
+  const std::string dalvik_cache_root(StringPrintf("%s/dalvik-cache/", android_data));
+  const std::string dalvik_cache = dalvik_cache_root + subdir;
+  if (create_if_absent && !OS::DirectoryExists(dalvik_cache.c_str())) {
+    // Don't create the system's /data/dalvik-cache/... because it needs special permissions.
+    if (strcmp(android_data, "/data") != 0) {
+      int result = mkdir(dalvik_cache_root.c_str(), 0700);
+      if (result != 0 && errno != EEXIST) {
+        PLOG(FATAL) << "Failed to create dalvik-cache directory " << dalvik_cache_root;
+        return "";
+      }
+      result = mkdir(dalvik_cache.c_str(), 0700);
       if (result != 0) {
-        LOG(FATAL) << "Failed to create dalvik-cache directory " << dalvik_cache;
+        PLOG(FATAL) << "Failed to create dalvik-cache directory " << dalvik_cache;
         return "";
       }
     } else {
@@ -1213,8 +1255,8 @@ std::string GetDalvikCacheOrDie(const char* android_data) {
   return dalvik_cache;
 }
 
-std::string GetDalvikCacheFilenameOrDie(const std::string& location) {
-  std::string dalvik_cache(GetDalvikCacheOrDie(GetAndroidData()));
+bool GetDalvikCacheFilename(const char* location, const char* cache_location,
+                            std::string* filename, std::string* error_msg) {
 #ifdef ALLOW_DEXROOT_ON_CACHE
   char dexoptDataOnly[PROPERTY_VALUE_MAX];
   property_get("dalvik.vm.dexopt-data-only", dexoptDataOnly, "1");
@@ -1223,15 +1265,58 @@ std::string GetDalvikCacheFilenameOrDie(const std::string& location) {
   }
 #endif
   if (location[0] != '/') {
-    LOG(FATAL) << "Expected path in location to be absolute: "<< location;
+    *error_msg = StringPrintf("Expected path in location to be absolute: %s", location);
+    return false;
   }
-  std::string cache_file(location, 1);  // skip leading slash
-  if (!EndsWith(location, ".dex") && !EndsWith(location, ".art")) {
+  std::string cache_file(&location[1]);  // skip leading slash
+  if (!EndsWith(location, ".dex") && !EndsWith(location, ".art") && !EndsWith(location, ".oat")) {
     cache_file += "/";
     cache_file += DexFile::kClassesDex;
   }
   std::replace(cache_file.begin(), cache_file.end(), '/', '@');
-  return dalvik_cache + "/" + cache_file;
+  *filename = StringPrintf("%s/%s", cache_location, cache_file.c_str());
+  return true;
+}
+
+std::string GetDalvikCacheFilenameOrDie(const char* location, const char* cache_location) {
+  std::string ret;
+  std::string error_msg;
+  if (!GetDalvikCacheFilename(location, cache_location, &ret, &error_msg)) {
+    LOG(FATAL) << error_msg;
+  }
+  return ret;
+}
+
+static void InsertIsaDirectory(const InstructionSet isa, std::string* filename) {
+  // in = /foo/bar/baz
+  // out = /foo/bar/<isa>/baz
+  size_t pos = filename->rfind('/');
+  CHECK_NE(pos, std::string::npos) << *filename << " " << isa;
+  filename->insert(pos, "/", 1);
+  filename->insert(pos + 1, GetInstructionSetString(isa));
+}
+
+std::string GetSystemImageFilename(const char* location, const InstructionSet isa) {
+  // location = /system/framework/boot.art
+  // filename = /system/framework/<isa>/boot.art
+  std::string filename(location);
+  InsertIsaDirectory(isa, &filename);
+  return filename;
+}
+
+std::string DexFilenameToOdexFilename(const std::string& location, const InstructionSet isa) {
+  // location = /foo/bar/baz.jar
+  // odex_location = /foo/bar/<isa>/baz.odex
+
+  CHECK_GE(location.size(), 4U) << location;  // must be at least .123
+  std::string odex_location(location);
+  InsertIsaDirectory(isa, &odex_location);
+  size_t dot_index = odex_location.size() - 3 - 1;  // 3=dex or zip or apk
+  CHECK_EQ('.', odex_location[dot_index]) << location;
+  odex_location.resize(dot_index + 1);
+  CHECK_EQ('.', odex_location[odex_location.size()-1]) << location << " " << odex_location;
+  odex_location += "odex";
+  return odex_location;
 }
 
 bool IsZipMagic(uint32_t magic) {
@@ -1247,6 +1332,63 @@ bool IsOatMagic(uint32_t magic) {
   return (memcmp(reinterpret_cast<const byte*>(magic),
                  OatHeader::kOatMagic,
                  sizeof(OatHeader::kOatMagic)) == 0);
+}
+
+bool Exec(std::vector<std::string>& arg_vector, std::string* error_msg) {
+  const std::string command_line(Join(arg_vector, ' '));
+
+  CHECK_GE(arg_vector.size(), 1U) << command_line;
+
+  // Convert the args to char pointers.
+  const char* program = arg_vector[0].c_str();
+  std::vector<char*> args;
+  for (size_t i = 0; i < arg_vector.size(); ++i) {
+    const std::string& arg = arg_vector[i];
+    char* arg_str = const_cast<char*>(arg.c_str());
+    CHECK(arg_str != nullptr) << i;
+    args.push_back(arg_str);
+  }
+  args.push_back(NULL);
+
+  // fork and exec
+  pid_t pid = fork();
+  if (pid == 0) {
+    // no allocation allowed between fork and exec
+
+    // change process groups, so we don't get reaped by ProcessManager
+    setpgid(0, 0);
+
+    execv(program, &args[0]);
+
+    PLOG(ERROR) << "Failed to execv(" << command_line << ")";
+    exit(1);
+  } else {
+    if (pid == -1) {
+      *error_msg = StringPrintf("Failed to execv(%s) because fork failed: %s",
+                                command_line.c_str(), strerror(errno));
+      return false;
+    }
+
+    // wait for subprocess to finish
+    int status;
+    pid_t got_pid = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
+    if (got_pid != pid) {
+      *error_msg = StringPrintf("Failed after fork for execv(%s) because waitpid failed: "
+                                "wanted %d, got %d: %s",
+                                command_line.c_str(), pid, got_pid, strerror(errno));
+      return false;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      *error_msg = StringPrintf("Failed execv(%s) because non-0 exit status",
+                                command_line.c_str());
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string PrettyDescriptor(Primitive::Type type) {
+  return PrettyDescriptor(Primitive::Descriptor(type));
 }
 
 }  // namespace art

@@ -16,18 +16,19 @@
 
 #include "context_x86.h"
 
-#include "mirror/art_method.h"
+#include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
+#include "quick/quick_method_frame_info.h"
 #include "stack.h"
 
 namespace art {
 namespace x86 {
 
-static const uint32_t gZero = 0;
+static constexpr uintptr_t gZero = 0;
 
 void X86Context::Reset() {
-  for (int i = 0; i < kNumberOfCpuRegisters; i++) {
-    gprs_[i] = NULL;
+  for (size_t  i = 0; i < kNumberOfCpuRegisters; i++) {
+    gprs_[i] = nullptr;
   }
   gprs_[ESP] = &esp_;
   // Initialize registers with easy to spot debug values.
@@ -37,16 +38,15 @@ void X86Context::Reset() {
 
 void X86Context::FillCalleeSaves(const StackVisitor& fr) {
   mirror::ArtMethod* method = fr.GetMethod();
-  uint32_t core_spills = method->GetCoreSpillMask();
-  size_t spill_count = __builtin_popcount(core_spills);
-  DCHECK_EQ(method->GetFpSpillMask(), 0u);
-  size_t frame_size = method->GetFrameSizeInBytes();
+  const QuickMethodFrameInfo frame_info = method->GetQuickFrameInfo();
+  size_t spill_count = POPCOUNT(frame_info.CoreSpillMask());
+  DCHECK_EQ(frame_info.FpSpillMask(), 0u);
   if (spill_count > 0) {
     // Lowest number spill is farthest away, walk registers and fill into context.
     int j = 2;  // Offset j to skip return address spill.
     for (int i = 0; i < kNumberOfCpuRegisters; i++) {
-      if (((core_spills >> i) & 1) != 0) {
-        gprs_[i] = fr.CalleeSaveAddress(spill_count - j, frame_size);
+      if (((frame_info.CoreSpillMask() >> i) & 1) != 0) {
+        gprs_[i] = fr.CalleeSaveAddress(spill_count - j, frame_info.FrameSizeInBytes());
         j++;
       }
     }
@@ -55,17 +55,21 @@ void X86Context::FillCalleeSaves(const StackVisitor& fr) {
 
 void X86Context::SmashCallerSaves() {
   // This needs to be 0 because we want a null/zero return value.
-  gprs_[EAX] = const_cast<uint32_t*>(&gZero);
-  gprs_[EDX] = const_cast<uint32_t*>(&gZero);
-  gprs_[ECX] = NULL;
-  gprs_[EBX] = NULL;
+  gprs_[EAX] = const_cast<uintptr_t*>(&gZero);
+  gprs_[EDX] = const_cast<uintptr_t*>(&gZero);
+  gprs_[ECX] = nullptr;
+  gprs_[EBX] = nullptr;
 }
 
-void X86Context::SetGPR(uint32_t reg, uintptr_t value) {
+bool X86Context::SetGPR(uint32_t reg, uintptr_t value) {
   CHECK_LT(reg, static_cast<uint32_t>(kNumberOfCpuRegisters));
   CHECK_NE(gprs_[reg], &gZero);
-  CHECK(gprs_[reg] != NULL);
-  *gprs_[reg] = value;
+  if (gprs_[reg] != nullptr) {
+    *gprs_[reg] = value;
+    return true;
+  } else {
+    return false;
+  }
 }
 
 void X86Context::DoLongJump() {
@@ -74,7 +78,7 @@ void X86Context::DoLongJump() {
   // the top for the stack pointer that doesn't get popped in a pop-all.
   volatile uintptr_t gprs[kNumberOfCpuRegisters + 1];
   for (size_t i = 0; i < kNumberOfCpuRegisters; ++i) {
-    gprs[kNumberOfCpuRegisters - i - 1] = gprs_[i] != NULL ? *gprs_[i] : X86Context::kBadGprBase + i;
+    gprs[kNumberOfCpuRegisters - i - 1] = gprs_[i] != nullptr ? *gprs_[i] : X86Context::kBadGprBase + i;
   }
   // We want to load the stack pointer one slot below so that the ret will pop eip.
   uintptr_t esp = gprs[kNumberOfCpuRegisters - ESP - 1] - kWordSize;
@@ -89,7 +93,7 @@ void X86Context::DoLongJump() {
       : "g"(&gprs[0])  // input.
       :);  // clobber.
 #else
-    UNIMPLEMENTED(FATAL);
+  UNIMPLEMENTED(FATAL);
 #endif
 }
 

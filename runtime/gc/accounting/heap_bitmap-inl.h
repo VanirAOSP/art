@@ -19,6 +19,8 @@
 
 #include "heap_bitmap.h"
 
+#include "space_bitmap-inl.h"
+
 namespace art {
 namespace gc {
 namespace accounting {
@@ -28,10 +30,79 @@ inline void HeapBitmap::Visit(const Visitor& visitor) {
   for (const auto& bitmap : continuous_space_bitmaps_) {
     bitmap->VisitMarkedRange(bitmap->HeapBegin(), bitmap->HeapLimit(), visitor);
   }
-  DCHECK(!discontinuous_space_sets_.empty());
-  for (const auto& space_set : discontinuous_space_sets_) {
-    space_set->Visit(visitor);
+  for (const auto& bitmap : large_object_bitmaps_) {
+    bitmap->VisitMarkedRange(bitmap->HeapBegin(), bitmap->HeapLimit(), visitor);
   }
+}
+
+inline bool HeapBitmap::Test(const mirror::Object* obj) {
+  ContinuousSpaceBitmap* bitmap = GetContinuousSpaceBitmap(obj);
+  if (LIKELY(bitmap != nullptr)) {
+    return bitmap->Test(obj);
+  }
+  for (const auto& bitmap : large_object_bitmaps_) {
+    if (LIKELY(bitmap->HasAddress(obj))) {
+      return bitmap->Test(obj);
+    }
+  }
+  LOG(FATAL) << "Invalid object " << obj;
+  return false;
+}
+
+inline void HeapBitmap::Clear(const mirror::Object* obj) {
+  ContinuousSpaceBitmap* bitmap = GetContinuousSpaceBitmap(obj);
+  if (LIKELY(bitmap != nullptr)) {
+    bitmap->Clear(obj);
+    return;
+  }
+  for (const auto& bitmap : large_object_bitmaps_) {
+    if (LIKELY(bitmap->HasAddress(obj))) {
+      bitmap->Clear(obj);
+    }
+  }
+  LOG(FATAL) << "Invalid object " << obj;
+}
+
+template<typename LargeObjectSetVisitor>
+inline bool HeapBitmap::Set(const mirror::Object* obj, const LargeObjectSetVisitor& visitor) {
+  ContinuousSpaceBitmap* bitmap = GetContinuousSpaceBitmap(obj);
+  if (LIKELY(bitmap != nullptr)) {
+    return bitmap->Set(obj);
+  }
+  visitor(obj);
+  for (const auto& bitmap : large_object_bitmaps_) {
+    if (LIKELY(bitmap->HasAddress(obj))) {
+      return bitmap->Set(obj);
+    }
+  }
+  LOG(FATAL) << "Invalid object " << obj;
+  return false;
+}
+
+template<typename LargeObjectSetVisitor>
+inline bool HeapBitmap::AtomicTestAndSet(const mirror::Object* obj,
+                                         const LargeObjectSetVisitor& visitor) {
+  ContinuousSpaceBitmap* bitmap = GetContinuousSpaceBitmap(obj);
+  if (LIKELY(bitmap != nullptr)) {
+    return bitmap->AtomicTestAndSet(obj);
+  }
+  visitor(obj);
+  for (const auto& bitmap : large_object_bitmaps_) {
+    if (LIKELY(bitmap->HasAddress(obj))) {
+      return bitmap->AtomicTestAndSet(obj);
+    }
+  }
+  LOG(FATAL) << "Invalid object " << obj;
+  return false;
+}
+
+inline ContinuousSpaceBitmap* HeapBitmap::GetContinuousSpaceBitmap(const mirror::Object* obj) const {
+  for (const auto& bitmap : continuous_space_bitmaps_) {
+    if (bitmap->HasAddress(obj)) {
+      return bitmap;
+    }
+  }
+  return nullptr;
 }
 
 }  // namespace accounting

@@ -18,16 +18,15 @@
 #define ART_RUNTIME_GC_COLLECTOR_STICKY_MARK_SWEEP_H_
 
 #include "base/macros.h"
-#include "locks.h"
 #include "partial_mark_sweep.h"
 
 namespace art {
 namespace gc {
 namespace collector {
 
-class StickyMarkSweep : public PartialMarkSweep {
+class StickyMarkSweep FINAL : public PartialMarkSweep {
  public:
-  GcType GetGcType() const {
+  GcType GetGcType() const OVERRIDE {
     return kGcTypeSticky;
   }
 
@@ -37,17 +36,15 @@ class StickyMarkSweep : public PartialMarkSweep {
  protected:
   // Bind the live bits to the mark bits of bitmaps for all spaces, all spaces other than the
   // alloc space will be marked as immune.
-  void BindBitmaps() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void BindBitmaps() OVERRIDE SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void MarkReachableObjects()
+  void MarkReachableObjects() OVERRIDE
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_);
 
-  virtual void MarkThreadRoots(Thread* self)
+  void Sweep(bool swap_bitmaps) OVERRIDE
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
       EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_);
-
-  void Sweep(bool swap_bitmaps) EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_);
 
  private:
   DISALLOW_COPY_AND_ASSIGN(StickyMarkSweep);

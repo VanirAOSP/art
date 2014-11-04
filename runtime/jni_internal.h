@@ -22,9 +22,8 @@
 #include "base/macros.h"
 #include "base/mutex.h"
 #include "indirect_reference_table.h"
+#include "object_callbacks.h"
 #include "reference_table.h"
-#include "root_visitor.h"
-#include "runtime.h"
 
 #include <iosfwd>
 #include <string>
@@ -42,10 +41,12 @@ namespace mirror {
   class ArtMethod;
   class ClassLoader;
 }  // namespace mirror
-class ArgArray;
 union JValue;
 class Libraries;
+class ParsedOptions;
+class Runtime;
 class ScopedObjectAccess;
+template<class T> class Handle;
 class Thread;
 
 void JniAbortF(const char* jni_function_name, const char* fmt, ...)
@@ -53,17 +54,11 @@ void JniAbortF(const char* jni_function_name, const char* fmt, ...)
 void RegisterNativeMethods(JNIEnv* env, const char* jni_class_name, const JNINativeMethod* methods,
                            jint method_count);
 
-JValue InvokeWithJValues(const ScopedObjectAccess&, jobject obj, jmethodID mid, jvalue* args)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-void InvokeWithArgArray(const ScopedObjectAccess& soa, mirror::ArtMethod* method,
-                        ArgArray *arg_array, JValue* result, char result_type)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
 int ThrowNewException(JNIEnv* env, jclass exception_class, const char* msg, jobject cause);
 
 class JavaVMExt : public JavaVM {
  public:
-  JavaVMExt(Runtime* runtime, Runtime::ParsedOptions* options);
+  JavaVMExt(Runtime* runtime, ParsedOptions* options);
   ~JavaVMExt();
 
   /**
@@ -72,8 +67,8 @@ class JavaVMExt : public JavaVM {
    * Returns 'true' on success. On failure, sets 'detail' to a
    * human-readable description of the error.
    */
-  bool LoadNativeLibrary(const std::string& path, mirror::ClassLoader* class_loader,
-                         std::string& detail)
+  bool LoadNativeLibrary(const std::string& path, Handle<mirror::ClassLoader> class_loader,
+                         std::string* detail)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   /**
@@ -90,7 +85,8 @@ class JavaVMExt : public JavaVM {
 
   void SetCheckJniEnabled(bool enabled);
 
-  void VisitRoots(RootVisitor*, void*);
+  void VisitRoots(RootCallback* callback, void* arg)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   void DisallowNewWeakGlobals() EXCLUSIVE_LOCKS_REQUIRED(Locks::mutator_lock_);
   void AllowNewWeakGlobals() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -98,8 +94,10 @@ class JavaVMExt : public JavaVM {
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   void DeleteWeakGlobalRef(Thread* self, jweak obj)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void SweepWeakGlobals(IsMarkedTester is_marked, void* arg);
-  mirror::Object* DecodeWeakGlobal(Thread* self, IndirectRef ref);
+  void SweepJniWeakGlobals(IsMarkedCallback* callback, void* arg)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  mirror::Object* DecodeWeakGlobal(Thread* self, IndirectRef ref)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   Runtime* runtime;
 
@@ -114,16 +112,10 @@ class JavaVMExt : public JavaVM {
   // Extra diagnostics.
   std::string trace;
 
-  // Used to provide compatibility for apps that assumed direct references.
-  bool work_around_app_jni_bugs;
-
-  // Used to hold references to pinned primitive arrays.
-  Mutex pins_lock DEFAULT_MUTEX_ACQUIRED_AFTER;
-  ReferenceTable pin_table GUARDED_BY(pins_lock);
-
   // JNI global references.
   ReaderWriterMutex globals_lock DEFAULT_MUTEX_ACQUIRED_AFTER;
-  IndirectReferenceTable globals GUARDED_BY(globals_lock);
+  // Not guarded by globals_lock since we sometimes use SynchronizedGet in Thread::DecodeJObject.
+  IndirectReferenceTable globals;
 
   Mutex libraries_lock DEFAULT_MUTEX_ACQUIRED_AFTER;
   Libraries* libraries GUARDED_BY(libraries_lock);
@@ -135,6 +127,9 @@ class JavaVMExt : public JavaVM {
   // TODO: Make the other members of this class also private.
   // JNI weak global references.
   Mutex weak_globals_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
+  // Since weak_globals_ contain weak roots, be careful not to
+  // directly access the object references in it. Use Get() with the
+  // read barrier enabled.
   IndirectReferenceTable weak_globals_ GUARDED_BY(weak_globals_lock_);
   bool allow_new_weak_globals_ GUARDED_BY(weak_globals_lock_);
   ConditionVariable weak_globals_add_condition_ GUARDED_BY(weak_globals_lock_);
@@ -152,6 +147,10 @@ struct JNIEnvExt : public JNIEnv {
   void PushFrame(int capacity);
   void PopFrame();
 
+  template<typename T>
+  T AddLocalReference(mirror::Object* obj)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
   static Offset SegmentStateOffset();
 
   static Offset LocalRefCookieOffset() {
@@ -162,6 +161,9 @@ struct JNIEnvExt : public JNIEnv {
     return Offset(OFFSETOF_MEMBER(JNIEnvExt, self));
   }
 
+  jobject NewLocalRef(mirror::Object* obj) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void DeleteLocalRef(jobject obj) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
   Thread* const self;
   JavaVMExt* vm;
 
@@ -169,7 +171,7 @@ struct JNIEnvExt : public JNIEnv {
   uint32_t local_ref_cookie;
 
   // JNI local references.
-  IndirectReferenceTable locals;
+  IndirectReferenceTable locals GUARDED_BY(Locks::mutator_lock_);
 
   // Stack of cookies corresponding to PushLocalFrame/PopLocalFrame calls.
   // TODO: to avoid leaks (and bugs), we need to clear this vector on entry (or return)
@@ -215,5 +217,4 @@ class ScopedJniEnvLocalRefState {
 }  // namespace art
 
 std::ostream& operator<<(std::ostream& os, const jobjectRefType& rhs);
-
 #endif  // ART_RUNTIME_JNI_INTERNAL_H_

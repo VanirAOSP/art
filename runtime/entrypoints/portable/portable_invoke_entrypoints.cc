@@ -14,51 +14,69 @@
  * limitations under the License.
  */
 
-#include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/dex_cache-inl.h"
 #include "mirror/object-inl.h"
 
 namespace art {
 
-static mirror::ArtMethod* FindMethodHelper(uint32_t method_idx,
-                                                mirror::Object* this_object,
-                                                mirror::ArtMethod* caller_method,
-                                                bool access_check,
-                                                InvokeType type,
-                                                Thread* thread)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  mirror::ArtMethod* method = FindMethodFast(method_idx,
-                                                  this_object,
-                                                  caller_method,
-                                                  access_check,
-                                                  type);
+template<InvokeType type, bool access_check>
+mirror::ArtMethod* FindMethodHelper(uint32_t method_idx, mirror::Object* this_object,
+                                    mirror::ArtMethod* caller_method, Thread* self) {
+  mirror::ArtMethod* method = FindMethodFast(method_idx, this_object, caller_method,
+                                             access_check, type);
   if (UNLIKELY(method == NULL)) {
-    method = FindMethodFromCode(method_idx, this_object, caller_method,
-                                thread, access_check, type);
+    // Note: This can cause thread suspension.
+    self->AssertThreadSuspensionIsAllowable();
+    method = FindMethodFromCode<type, access_check>(method_idx, &this_object, &caller_method,
+                                                    self);
     if (UNLIKELY(method == NULL)) {
-      CHECK(thread->IsExceptionPending());
+      CHECK(self->IsExceptionPending());
       return 0;  // failure
     }
   }
-  DCHECK(!thread->IsExceptionPending());
-  const void* code = method->GetEntryPointFromCompiledCode();
+  DCHECK(!self->IsExceptionPending());
+#if defined(ART_USE_PORTABLE_COMPILER)
+  const void* code = method->GetEntryPointFromPortableCompiledCode();
+#else
+  const void* code = nullptr;
+#endif
 
   // When we return, the caller will branch to this address, so it had better not be 0!
   if (UNLIKELY(code == NULL)) {
-      MethodHelper mh(method);
       LOG(FATAL) << "Code was NULL in method: " << PrettyMethod(method)
-                 << " location: " << mh.GetDexFile().GetLocation();
+                 << " location: " << method->GetDexFile()->GetLocation();
   }
   return method;
 }
+
+// Explicit template declarations of FindMethodHelper for all invoke types.
+#define EXPLICIT_FIND_METHOD_HELPER_TEMPLATE_DECL(_type, _access_check)                        \
+  template SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)                                         \
+  mirror::ArtMethod* FindMethodHelper<_type, _access_check>(uint32_t method_idx,               \
+                                                            mirror::Object* this_object,       \
+                                                            mirror::ArtMethod* caller_method,  \
+                                                            Thread* thread)
+#define EXPLICIT_FIND_METHOD_HELPER_TYPED_TEMPLATE_DECL(_type) \
+    EXPLICIT_FIND_METHOD_HELPER_TEMPLATE_DECL(_type, false);   \
+    EXPLICIT_FIND_METHOD_HELPER_TEMPLATE_DECL(_type, true)
+
+EXPLICIT_FIND_METHOD_HELPER_TYPED_TEMPLATE_DECL(kStatic);
+EXPLICIT_FIND_METHOD_HELPER_TYPED_TEMPLATE_DECL(kDirect);
+EXPLICIT_FIND_METHOD_HELPER_TYPED_TEMPLATE_DECL(kVirtual);
+EXPLICIT_FIND_METHOD_HELPER_TYPED_TEMPLATE_DECL(kSuper);
+EXPLICIT_FIND_METHOD_HELPER_TYPED_TEMPLATE_DECL(kInterface);
+
+#undef EXPLICIT_FIND_METHOD_HELPER_TYPED_TEMPLATE_DECL
+#undef EXPLICIT_FIND_METHOD_HELPER_TEMPLATE_DECL
 
 extern "C" mirror::Object* art_portable_find_static_method_from_code_with_access_check(uint32_t method_idx,
                                                                                        mirror::Object* this_object,
                                                                                        mirror::ArtMethod* referrer,
                                                                                        Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return FindMethodHelper(method_idx, this_object, referrer, true, kStatic, thread);
+  return FindMethodHelper<kStatic, true>(method_idx, this_object, referrer, thread);
 }
 
 extern "C" mirror::Object* art_portable_find_direct_method_from_code_with_access_check(uint32_t method_idx,
@@ -66,7 +84,7 @@ extern "C" mirror::Object* art_portable_find_direct_method_from_code_with_access
                                                                                        mirror::ArtMethod* referrer,
                                                                                        Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return FindMethodHelper(method_idx, this_object, referrer, true, kDirect, thread);
+  return FindMethodHelper<kDirect, true>(method_idx, this_object, referrer, thread);
 }
 
 extern "C" mirror::Object* art_portable_find_virtual_method_from_code_with_access_check(uint32_t method_idx,
@@ -74,7 +92,7 @@ extern "C" mirror::Object* art_portable_find_virtual_method_from_code_with_acces
                                                                                         mirror::ArtMethod* referrer,
                                                                                         Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return FindMethodHelper(method_idx, this_object, referrer, true, kVirtual, thread);
+  return FindMethodHelper<kVirtual, true>(method_idx, this_object, referrer, thread);
 }
 
 extern "C" mirror::Object* art_portable_find_super_method_from_code_with_access_check(uint32_t method_idx,
@@ -82,7 +100,7 @@ extern "C" mirror::Object* art_portable_find_super_method_from_code_with_access_
                                                                                       mirror::ArtMethod* referrer,
                                                                                       Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return FindMethodHelper(method_idx, this_object, referrer, true, kSuper, thread);
+  return FindMethodHelper<kSuper, true>(method_idx, this_object, referrer, thread);
 }
 
 extern "C" mirror::Object* art_portable_find_interface_method_from_code_with_access_check(uint32_t method_idx,
@@ -90,7 +108,7 @@ extern "C" mirror::Object* art_portable_find_interface_method_from_code_with_acc
                                                                                           mirror::ArtMethod* referrer,
                                                                                           Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return FindMethodHelper(method_idx, this_object, referrer, true, kInterface, thread);
+  return FindMethodHelper<kInterface, true>(method_idx, this_object, referrer, thread);
 }
 
 extern "C" mirror::Object* art_portable_find_interface_method_from_code(uint32_t method_idx,
@@ -98,7 +116,7 @@ extern "C" mirror::Object* art_portable_find_interface_method_from_code(uint32_t
                                                                         mirror::ArtMethod* referrer,
                                                                         Thread* thread)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  return FindMethodHelper(method_idx, this_object, referrer, false, kInterface, thread);
+  return FindMethodHelper<kInterface, false>(method_idx, this_object, referrer, thread);
 }
 
 }  // namespace art

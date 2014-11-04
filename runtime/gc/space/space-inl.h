@@ -19,26 +19,39 @@
 
 #include "space.h"
 
+#include "base/casts.h"
 #include "dlmalloc_space.h"
 #include "image_space.h"
+#include "large_object_space.h"
 
 namespace art {
 namespace gc {
 namespace space {
 
 inline ImageSpace* Space::AsImageSpace() {
-  DCHECK_EQ(GetType(), kSpaceTypeImageSpace);
+  DCHECK(IsImageSpace());
   return down_cast<ImageSpace*>(down_cast<MemMapSpace*>(this));
 }
 
-inline DlMallocSpace* Space::AsDlMallocSpace() {
-  DCHECK(GetType() == kSpaceTypeAllocSpace || GetType() == kSpaceTypeZygoteSpace);
-  return down_cast<DlMallocSpace*>(down_cast<MemMapSpace*>(this));
+inline MallocSpace* Space::AsMallocSpace() {
+  DCHECK(IsMallocSpace());
+  DCHECK(IsDlMallocSpace() || IsRosAllocSpace());
+  return down_cast<MallocSpace*>(down_cast<MemMapSpace*>(this));
 }
 
 inline LargeObjectSpace* Space::AsLargeObjectSpace() {
-  DCHECK_EQ(GetType(), kSpaceTypeLargeObjectSpace);
-  return reinterpret_cast<LargeObjectSpace*>(this);
+  DCHECK(IsLargeObjectSpace());
+  return down_cast<LargeObjectSpace*>(this);
+}
+
+inline ContinuousSpace* Space::AsContinuousSpace() {
+  DCHECK(IsContinuousSpace());
+  return down_cast<ContinuousSpace*>(this);
+}
+
+inline DiscontinuousSpace* Space::AsDiscontinuousSpace() {
+  DCHECK(IsDiscontinuousSpace());
+  return down_cast<DiscontinuousSpace*>(this);
 }
 
 }  // namespace space

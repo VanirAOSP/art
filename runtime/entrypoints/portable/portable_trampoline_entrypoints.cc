@@ -18,11 +18,10 @@
 #define ART_RUNTIME_ENTRYPOINTS_PORTABLE_PORTABLE_ARGUMENT_VISITOR_H_
 
 #include "dex_instruction-inl.h"
-#include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "interpreter/interpreter.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
-#include "object_utils.h"
 #include "scoped_thread_state_change.h"
 
 namespace art {
@@ -47,8 +46,14 @@ class PortableArgumentVisitor {
 #define PORTABLE_CALLEE_SAVE_FRAME__REF_AND_ARGS__R1_OFFSET 0
 #define PORTABLE_CALLEE_SAVE_FRAME__REF_AND_ARGS__FRAME_SIZE 0
 #define PORTABLE_STACK_ARG_SKIP 4
+#elif defined(__x86_64__)
+// TODO: implement and check these.
+#define PORTABLE_CALLEE_SAVE_FRAME__REF_AND_ARGS__R1_OFFSET 16
+#define PORTABLE_CALLEE_SAVE_FRAME__REF_AND_ARGS__FRAME_SIZE 96
+#define PORTABLE_STACK_ARG_SKIP 0
 #else
-#error "Unsupported architecture"
+// TODO: portable should be disabled for aarch64 for now.
+// #error "Unsupported architecture"
 #define PORTABLE_CALLEE_SAVE_FRAME__REF_AND_ARGS__R1_OFFSET 0
 #define PORTABLE_CALLEE_SAVE_FRAME__REF_AND_ARGS__FRAME_SIZE 0
 #define PORTABLE_STACK_ARG_SKIP 0
@@ -190,8 +195,9 @@ extern "C" uint64_t artPortableToInterpreterBridge(mirror::ArtMethod* method, Th
     return 0;
   } else {
     const char* old_cause = self->StartAssertNoThreadSuspension("Building interpreter shadow frame");
-    MethodHelper mh(method);
-    const DexFile::CodeItem* code_item = mh.GetCodeItem();
+    StackHandleScope<2> hs(self);
+    MethodHelper mh(hs.NewHandle(method));
+    const DexFile::CodeItem* code_item = method->GetCodeItem();
     uint16_t num_regs = code_item->registers_size_;
     void* memory = alloca(ShadowFrame::ComputeSize(num_regs));
     ShadowFrame* shadow_frame(ShadowFrame::Create(num_regs, NULL,  // No last shadow coming from quick.
@@ -206,10 +212,10 @@ extern "C" uint64_t artPortableToInterpreterBridge(mirror::ArtMethod* method, Th
     self->PushShadowFrame(shadow_frame);
     self->EndAssertNoThreadSuspension(old_cause);
 
-    if (method->IsStatic() && !method->GetDeclaringClass()->IsInitializing()) {
+    if (method->IsStatic() && !method->GetDeclaringClass()->IsInitialized()) {
       // Ensure static method's class is initialized.
-      if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(method->GetDeclaringClass(),
-                                                                   true, true)) {
+      Handle<mirror::Class> h_class(hs.NewHandle(method->GetDeclaringClass()));
+      if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(h_class, true, true)) {
         DCHECK(Thread::Current()->IsExceptionPending());
         self->PopManagedStackFragment(fragment);
         return 0;
@@ -287,7 +293,8 @@ extern "C" uint64_t artPortableProxyInvokeHandler(mirror::ArtMethod* proxy_metho
   jobject rcvr_jobj = soa.AddLocalReference<jobject>(receiver);
 
   // Placing arguments into args vector and remove the receiver.
-  MethodHelper proxy_mh(proxy_method);
+  StackHandleScope<1> hs(self);
+  MethodHelper proxy_mh(hs.NewHandle(proxy_method));
   std::vector<jvalue> args;
   BuildPortableArgumentVisitor local_ref_visitor(proxy_mh, sp, soa, args);
   local_ref_visitor.VisitArguments();
@@ -310,17 +317,17 @@ extern "C" uint64_t artPortableProxyInvokeHandler(mirror::ArtMethod* proxy_metho
 // Lazily resolve a method for portable. Called by stub code.
 extern "C" const void* artPortableResolutionTrampoline(mirror::ArtMethod* called,
                                                        mirror::Object* receiver,
-                                                       Thread* thread,
+                                                       Thread* self,
                                                        mirror::ArtMethod** called_addr)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   uint32_t dex_pc;
-  mirror::ArtMethod* caller = thread->GetCurrentMethod(&dex_pc);
+  mirror::ArtMethod* caller = self->GetCurrentMethod(&dex_pc);
 
   ClassLinker* linker = Runtime::Current()->GetClassLinker();
   InvokeType invoke_type;
   bool is_range;
   if (called->IsRuntimeMethod()) {
-    const DexFile::CodeItem* code = MethodHelper(caller).GetCodeItem();
+    const DexFile::CodeItem* code = caller->GetCodeItem();
     CHECK_LT(dex_pc, code->insns_size_in_code_units_);
     const Instruction* instr = Instruction::At(&code->insns_[dex_pc]);
     Instruction::Code instr_code = instr->Opcode();
@@ -372,7 +379,7 @@ extern "C" const void* artPortableResolutionTrampoline(mirror::ArtMethod* called
         is_range = true;
     }
     uint32_t dex_method_idx = (is_range) ? instr->VRegB_3rc() : instr->VRegB_35c();
-    called = linker->ResolveMethod(dex_method_idx, caller, invoke_type);
+    called = linker->ResolveMethod(Thread::Current(), dex_method_idx, &caller, invoke_type);
     // Incompatible class change should have been handled in resolve method.
     CHECK(!called->CheckIncompatibleClassChange(invoke_type));
     // Refine called method based on receiver.
@@ -387,43 +394,57 @@ extern "C" const void* artPortableResolutionTrampoline(mirror::ArtMethod* called
     // Incompatible class change should have been handled in resolve method.
     CHECK(!called->CheckIncompatibleClassChange(invoke_type));
   }
-  const void* code = NULL;
-  if (LIKELY(!thread->IsExceptionPending())) {
+  const void* code = nullptr;
+  if (LIKELY(!self->IsExceptionPending())) {
     // Ensure that the called method's class is initialized.
-    mirror::Class* called_class = called->GetDeclaringClass();
+    StackHandleScope<1> hs(self);
+    Handle<mirror::Class> called_class(hs.NewHandle(called->GetDeclaringClass()));
     linker->EnsureInitialized(called_class, true, true);
     if (LIKELY(called_class->IsInitialized())) {
-      code = called->GetEntryPointFromCompiledCode();
+#if defined(ART_USE_PORTABLE_COMPILER)
+      code = called->GetEntryPointFromPortableCompiledCode();
+#else
+      code = nullptr;
+#endif
       // TODO: remove this after we solve the link issue.
-      {  // for lazy link.
-        if (code == NULL) {
-          code = linker->GetOatCodeFor(called);
-        }
+      if (code == nullptr) {
+#if defined(ART_USE_PORTABLE_COMPILER)
+        bool have_portable_code;
+        code = linker->GetPortableOatCodeFor(called, &have_portable_code);
+#endif
       }
     } else if (called_class->IsInitializing()) {
       if (invoke_type == kStatic) {
         // Class is still initializing, go to oat and grab code (trampoline must be left in place
         // until class is initialized to stop races between threads).
-        code = linker->GetOatCodeFor(called);
+#if defined(ART_USE_PORTABLE_COMPILER)
+        bool have_portable_code;
+        code = linker->GetPortableOatCodeFor(called, &have_portable_code);
+#endif
       } else {
         // No trampoline for non-static methods.
-        code = called->GetEntryPointFromCompiledCode();
+#if defined(ART_USE_PORTABLE_COMPILER)
+        code = called->GetEntryPointFromPortableCompiledCode();
+#else
+        code = nullptr;
+#endif
         // TODO: remove this after we solve the link issue.
-        {  // for lazy link.
-          if (code == NULL) {
-            code = linker->GetOatCodeFor(called);
-          }
+        if (code == nullptr) {
+#if defined(ART_USE_PORTABLE_COMPILER)
+          bool have_portable_code;
+          code = linker->GetPortableOatCodeFor(called, &have_portable_code);
+#endif
         }
       }
     } else {
       DCHECK(called_class->IsErroneous());
     }
   }
-  if (LIKELY(code != NULL)) {
+  if (LIKELY(code != nullptr)) {
     // Expect class to at least be initializing.
     DCHECK(called->GetDeclaringClass()->IsInitializing());
     // Don't want infinite recursion.
-    DCHECK(code != GetResolutionTrampoline(linker));
+    DCHECK(code != linker->GetPortableResolutionTrampoline());
     // Set up entry into main method
     *called_addr = called;
   }

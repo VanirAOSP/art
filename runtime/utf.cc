@@ -19,6 +19,7 @@
 #include "base/logging.h"
 #include "mirror/array.h"
 #include "mirror/object-inl.h"
+#include "utf-inl.h"
 
 namespace art {
 
@@ -67,7 +68,7 @@ void ConvertUtf16ToModifiedUtf8(char* utf8_out, const uint16_t* utf16_in, size_t
   }
 }
 
-int32_t ComputeUtf16Hash(const mirror::CharArray* chars, int32_t offset,
+int32_t ComputeUtf16Hash(mirror::CharArray* chars, int32_t offset,
                          size_t char_count) {
   int32_t hash = 0;
   for (size_t i = 0; i < char_count; i++) {
@@ -84,39 +85,12 @@ int32_t ComputeUtf16Hash(const uint16_t* chars, size_t char_count) {
   return hash;
 }
 
-
-uint16_t GetUtf16FromUtf8(const char** utf8_data_in) {
-  uint8_t one = *(*utf8_data_in)++;
-  if ((one & 0x80) == 0) {
-    // one-byte encoding
-    return one;
+int32_t ComputeUtf8Hash(const char* chars) {
+  int32_t hash = 0;
+  while (*chars != '\0') {
+    hash = hash * 31 + GetUtf16FromUtf8(&chars);
   }
-  // two- or three-byte encoding
-  uint8_t two = *(*utf8_data_in)++;
-  if ((one & 0x20) == 0) {
-    // two-byte encoding
-    return ((one & 0x1f) << 6) | (two & 0x3f);
-  }
-  // three-byte encoding
-  uint8_t three = *(*utf8_data_in)++;
-  return ((one & 0x0f) << 12) | ((two & 0x3f) << 6) | (three & 0x3f);
-}
-
-int CompareModifiedUtf8ToModifiedUtf8AsUtf16CodePointValues(const char* utf8_1, const char* utf8_2) {
-  for (;;) {
-    if (*utf8_1 == '\0') {
-      return (*utf8_2 == '\0') ? 0 : -1;
-    } else if (*utf8_2 == '\0') {
-      return 1;
-    }
-
-    int c1 = GetUtf16FromUtf8(&utf8_1);
-    int c2 = GetUtf16FromUtf8(&utf8_2);
-
-    if (c1 != c2) {
-      return c1 > c2 ? 1 : -1;
-    }
-  }
+  return hash;
 }
 
 int CompareModifiedUtf8ToUtf16AsCodePointValues(const char* utf8_1, const uint16_t* utf8_2) {

@@ -23,18 +23,6 @@
 
 namespace art {
 namespace mips {
-#if 0
-class DirectCallRelocation : public AssemblerFixup {
- public:
-  void Process(const MemoryRegion& region, int position) {
-    // Direct calls are relative to the following instruction on mips.
-    int32_t pointer = region.Load<int32_t>(position);
-    int32_t start = reinterpret_cast<int32_t>(region.start());
-    int32_t delta = start + position + sizeof(int32_t);
-    region.Store<int32_t>(position, pointer - delta);
-  }
-};
-#endif
 
 std::ostream& operator<<(std::ostream& os, const DRegister& rhs) {
   if (rhs >= D0 && rhs < kNumberOfDRegisters) {
@@ -135,7 +123,7 @@ void MipsAssembler::EmitJump(Label* label, bool link) {
 
 int32_t MipsAssembler::EncodeBranchOffset(int offset, int32_t inst, bool is_jump) {
   CHECK_ALIGNED(offset, 4);
-  CHECK(IsInt(CountOneBits(kBranchOffsetMask), offset)) << offset;
+  CHECK(IsInt(POPCOUNT(kBranchOffsetMask), offset)) << offset;
 
   // Properly preserve only the bits supported in the instruction.
   offset >>= 2;
@@ -548,19 +536,21 @@ void MipsAssembler::StoreDToOffset(DRegister reg, Register base, int32_t offset)
   Sdc1(reg, base, offset);
 }
 
+constexpr size_t kFramePointerSize = 4;
+
 void MipsAssembler::BuildFrame(size_t frame_size, ManagedRegister method_reg,
                                const std::vector<ManagedRegister>& callee_save_regs,
-                               const std::vector<ManagedRegister>& entry_spills) {
+                               const ManagedRegisterEntrySpills& entry_spills) {
   CHECK_ALIGNED(frame_size, kStackAlignment);
 
   // Increase frame to required size.
   IncreaseFrameSize(frame_size);
 
   // Push callee saves and return address
-  int stack_offset = frame_size - kPointerSize;
+  int stack_offset = frame_size - kFramePointerSize;
   StoreToOffset(kStoreWord, RA, SP, stack_offset);
   for (int i = callee_save_regs.size() - 1; i >= 0; --i) {
-    stack_offset -= kPointerSize;
+    stack_offset -= kFramePointerSize;
     Register reg = callee_save_regs.at(i).AsMips().AsCoreRegister();
     StoreToOffset(kStoreWord, reg, SP, stack_offset);
   }
@@ -571,7 +561,7 @@ void MipsAssembler::BuildFrame(size_t frame_size, ManagedRegister method_reg,
   // Write out entry spills.
   for (size_t i = 0; i < entry_spills.size(); ++i) {
     Register reg = entry_spills.at(i).AsMips().AsCoreRegister();
-    StoreToOffset(kStoreWord, reg, SP, frame_size + kPointerSize + (i * kPointerSize));
+    StoreToOffset(kStoreWord, reg, SP, frame_size + kFramePointerSize + (i * kFramePointerSize));
   }
 }
 
@@ -580,11 +570,11 @@ void MipsAssembler::RemoveFrame(size_t frame_size,
   CHECK_ALIGNED(frame_size, kStackAlignment);
 
   // Pop callee saves and return address
-  int stack_offset = frame_size - (callee_save_regs.size() * kPointerSize) - kPointerSize;
+  int stack_offset = frame_size - (callee_save_regs.size() * kFramePointerSize) - kFramePointerSize;
   for (size_t i = 0; i < callee_save_regs.size(); ++i) {
     Register reg = callee_save_regs.at(i).AsMips().AsCoreRegister();
     LoadFromOffset(kLoadWord, reg, SP, stack_offset);
-    stack_offset += kPointerSize;
+    stack_offset += kFramePointerSize;
   }
   LoadFromOffset(kLoadWord, RA, SP, stack_offset);
 
@@ -645,7 +635,7 @@ void MipsAssembler::StoreImmediateToFrame(FrameOffset dest, uint32_t imm,
   StoreToOffset(kStoreWord, scratch.AsCoreRegister(), SP, dest.Int32Value());
 }
 
-void MipsAssembler::StoreImmediateToThread(ThreadOffset dest, uint32_t imm,
+void MipsAssembler::StoreImmediateToThread32(ThreadOffset<4> dest, uint32_t imm,
                                            ManagedRegister mscratch) {
   MipsManagedRegister scratch = mscratch.AsMips();
   CHECK(scratch.IsCoreRegister()) << scratch;
@@ -653,7 +643,7 @@ void MipsAssembler::StoreImmediateToThread(ThreadOffset dest, uint32_t imm,
   StoreToOffset(kStoreWord, scratch.AsCoreRegister(), S1, dest.Int32Value());
 }
 
-void MipsAssembler::StoreStackOffsetToThread(ThreadOffset thr_offs,
+void MipsAssembler::StoreStackOffsetToThread32(ThreadOffset<4> thr_offs,
                                              FrameOffset fr_offs,
                                              ManagedRegister mscratch) {
   MipsManagedRegister scratch = mscratch.AsMips();
@@ -663,7 +653,7 @@ void MipsAssembler::StoreStackOffsetToThread(ThreadOffset thr_offs,
                 S1, thr_offs.Int32Value());
 }
 
-void MipsAssembler::StoreStackPointerToThread(ThreadOffset thr_offs) {
+void MipsAssembler::StoreStackPointerToThread32(ThreadOffset<4> thr_offs) {
   StoreToOffset(kStoreWord, SP, S1, thr_offs.Int32Value());
 }
 
@@ -680,7 +670,7 @@ void MipsAssembler::Load(ManagedRegister mdest, FrameOffset src, size_t size) {
   return EmitLoad(mdest, SP, src.Int32Value(), size);
 }
 
-void MipsAssembler::Load(ManagedRegister mdest, ThreadOffset src, size_t size) {
+void MipsAssembler::LoadFromThread32(ManagedRegister mdest, ThreadOffset<4> src, size_t size) {
   return EmitLoad(mdest, S1, src.Int32Value(), size);
 }
 
@@ -696,6 +686,9 @@ void MipsAssembler::LoadRef(ManagedRegister mdest, ManagedRegister base,
   CHECK(dest.IsCoreRegister() && dest.IsCoreRegister());
   LoadFromOffset(kLoadWord, dest.AsCoreRegister(),
                  base.AsMips().AsCoreRegister(), offs.Int32Value());
+  if (kPoisonHeapReferences) {
+    Subu(dest.AsCoreRegister(), ZERO, dest.AsCoreRegister());
+  }
 }
 
 void MipsAssembler::LoadRawPtr(ManagedRegister mdest, ManagedRegister base,
@@ -706,8 +699,8 @@ void MipsAssembler::LoadRawPtr(ManagedRegister mdest, ManagedRegister base,
                  base.AsMips().AsCoreRegister(), offs.Int32Value());
 }
 
-void MipsAssembler::LoadRawPtrFromThread(ManagedRegister mdest,
-                                         ThreadOffset offs) {
+void MipsAssembler::LoadRawPtrFromThread32(ManagedRegister mdest,
+                                         ThreadOffset<4> offs) {
   MipsManagedRegister dest = mdest.AsMips();
   CHECK(dest.IsCoreRegister());
   LoadFromOffset(kLoadWord, dest.AsCoreRegister(), S1, offs.Int32Value());
@@ -757,8 +750,8 @@ void MipsAssembler::CopyRef(FrameOffset dest, FrameOffset src,
   StoreToOffset(kStoreWord, scratch.AsCoreRegister(), SP, dest.Int32Value());
 }
 
-void MipsAssembler::CopyRawPtrFromThread(FrameOffset fr_offs,
-                                         ThreadOffset thr_offs,
+void MipsAssembler::CopyRawPtrFromThread32(FrameOffset fr_offs,
+                                         ThreadOffset<4> thr_offs,
                                          ManagedRegister mscratch) {
   MipsManagedRegister scratch = mscratch.AsMips();
   CHECK(scratch.IsCoreRegister()) << scratch;
@@ -768,7 +761,7 @@ void MipsAssembler::CopyRawPtrFromThread(FrameOffset fr_offs,
                 SP, fr_offs.Int32Value());
 }
 
-void MipsAssembler::CopyRawPtrToThread(ThreadOffset thr_offs,
+void MipsAssembler::CopyRawPtrToThread32(ThreadOffset<4> thr_offs,
                                        FrameOffset fr_offs,
                                        ManagedRegister mscratch) {
   MipsManagedRegister scratch = mscratch.AsMips();
@@ -834,8 +827,8 @@ void MipsAssembler::MemoryBarrier(ManagedRegister) {
   UNIMPLEMENTED(FATAL) << "no mips implementation";
 }
 
-void MipsAssembler::CreateSirtEntry(ManagedRegister mout_reg,
-                                    FrameOffset sirt_offset,
+void MipsAssembler::CreateHandleScopeEntry(ManagedRegister mout_reg,
+                                    FrameOffset handle_scope_offset,
                                     ManagedRegister min_reg, bool null_allowed) {
   MipsManagedRegister out_reg = mout_reg.AsMips();
   MipsManagedRegister in_reg = min_reg.AsMips();
@@ -843,27 +836,27 @@ void MipsAssembler::CreateSirtEntry(ManagedRegister mout_reg,
   CHECK(out_reg.IsCoreRegister()) << out_reg;
   if (null_allowed) {
     Label null_arg;
-    // Null values get a SIRT entry value of 0.  Otherwise, the SIRT entry is
-    // the address in the SIRT holding the reference.
+    // Null values get a handle scope entry value of 0.  Otherwise, the handle scope entry is
+    // the address in the handle scope holding the reference.
     // e.g. out_reg = (handle == 0) ? 0 : (SP+handle_offset)
     if (in_reg.IsNoRegister()) {
       LoadFromOffset(kLoadWord, out_reg.AsCoreRegister(),
-                     SP, sirt_offset.Int32Value());
+                     SP, handle_scope_offset.Int32Value());
       in_reg = out_reg;
     }
     if (!out_reg.Equals(in_reg)) {
       LoadImmediate(out_reg.AsCoreRegister(), 0);
     }
     EmitBranch(in_reg.AsCoreRegister(), ZERO, &null_arg, true);
-    AddConstant(out_reg.AsCoreRegister(), SP, sirt_offset.Int32Value());
+    AddConstant(out_reg.AsCoreRegister(), SP, handle_scope_offset.Int32Value());
     Bind(&null_arg, false);
   } else {
-    AddConstant(out_reg.AsCoreRegister(), SP, sirt_offset.Int32Value());
+    AddConstant(out_reg.AsCoreRegister(), SP, handle_scope_offset.Int32Value());
   }
 }
 
-void MipsAssembler::CreateSirtEntry(FrameOffset out_off,
-                                    FrameOffset sirt_offset,
+void MipsAssembler::CreateHandleScopeEntry(FrameOffset out_off,
+                                    FrameOffset handle_scope_offset,
                                     ManagedRegister mscratch,
                                     bool null_allowed) {
   MipsManagedRegister scratch = mscratch.AsMips();
@@ -871,21 +864,21 @@ void MipsAssembler::CreateSirtEntry(FrameOffset out_off,
   if (null_allowed) {
     Label null_arg;
     LoadFromOffset(kLoadWord, scratch.AsCoreRegister(), SP,
-                   sirt_offset.Int32Value());
-    // Null values get a SIRT entry value of 0.  Otherwise, the sirt entry is
-    // the address in the SIRT holding the reference.
-    // e.g. scratch = (scratch == 0) ? 0 : (SP+sirt_offset)
+                   handle_scope_offset.Int32Value());
+    // Null values get a handle scope entry value of 0.  Otherwise, the handle scope entry is
+    // the address in the handle scope holding the reference.
+    // e.g. scratch = (scratch == 0) ? 0 : (SP+handle_scope_offset)
     EmitBranch(scratch.AsCoreRegister(), ZERO, &null_arg, true);
-    AddConstant(scratch.AsCoreRegister(), SP, sirt_offset.Int32Value());
+    AddConstant(scratch.AsCoreRegister(), SP, handle_scope_offset.Int32Value());
     Bind(&null_arg, false);
   } else {
-    AddConstant(scratch.AsCoreRegister(), SP, sirt_offset.Int32Value());
+    AddConstant(scratch.AsCoreRegister(), SP, handle_scope_offset.Int32Value());
   }
   StoreToOffset(kStoreWord, scratch.AsCoreRegister(), SP, out_off.Int32Value());
 }
 
-// Given a SIRT entry, load the associated reference.
-void MipsAssembler::LoadReferenceFromSirt(ManagedRegister mout_reg,
+// Given a handle scope entry, load the associated reference.
+void MipsAssembler::LoadReferenceFromHandleScope(ManagedRegister mout_reg,
                                           ManagedRegister min_reg) {
   MipsManagedRegister out_reg = mout_reg.AsMips();
   MipsManagedRegister in_reg = min_reg.AsMips();
@@ -932,7 +925,7 @@ void MipsAssembler::Call(FrameOffset base, Offset offset, ManagedRegister mscrat
   // TODO: place reference map on call
 }
 
-void MipsAssembler::Call(ThreadOffset /*offset*/, ManagedRegister /*mscratch*/) {
+void MipsAssembler::CallFromThread32(ThreadOffset<4> /*offset*/, ManagedRegister /*mscratch*/) {
   UNIMPLEMENTED(FATAL) << "no mips implementation";
 }
 
@@ -950,7 +943,7 @@ void MipsAssembler::ExceptionPoll(ManagedRegister mscratch, size_t stack_adjust)
   MipsExceptionSlowPath* slow = new MipsExceptionSlowPath(scratch, stack_adjust);
   buffer_.EnqueueSlowPath(slow);
   LoadFromOffset(kLoadWord, scratch.AsCoreRegister(),
-                 S1, Thread::ExceptionOffset().Int32Value());
+                 S1, Thread::ExceptionOffset<4>().Int32Value());
   EmitBranch(scratch.AsCoreRegister(), ZERO, slow->Entry(), false);
 }
 
@@ -965,7 +958,7 @@ void MipsExceptionSlowPath::Emit(Assembler* sasm) {
   // Don't care about preserving A0 as this call won't return
   __ Move(A0, scratch_.AsCoreRegister());
   // Set up call to Thread::Current()->pDeliverException
-  __ LoadFromOffset(kLoadWord, T9, S1, QUICK_ENTRYPOINT_OFFSET(pDeliverException).Int32Value());
+  __ LoadFromOffset(kLoadWord, T9, S1, QUICK_ENTRYPOINT_OFFSET(4, pDeliverException).Int32Value());
   __ Jr(T9);
   // Call never returns
   __ Break();

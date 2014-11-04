@@ -18,14 +18,12 @@
 #define ART_COMPILER_ELF_WRITER_H_
 
 #include <stdint.h>
-
 #include <cstddef>
 #include <string>
 #include <vector>
 
-#include <llvm/Support/ELF.h>
-
 #include "base/macros.h"
+#include "base/mutex.h"
 #include "os.h"
 
 namespace art {
@@ -44,21 +42,23 @@ class ElfWriter {
                                    size_t& oat_data_offset);
 
   // Returns runtime oat_data runtime address for an opened ElfFile.
-  static llvm::ELF::Elf32_Addr GetOatDataAddress(ElfFile* elf_file);
+  static uint32_t GetOatDataAddress(ElfFile* elf_file);
 
  protected:
-  ElfWriter(const CompilerDriver& driver, File* elf_file);
-  virtual ~ElfWriter();
+  ElfWriter(const CompilerDriver& driver, File* elf_file)
+    : compiler_driver_(&driver), elf_file_(elf_file) {
+  }
 
-  virtual bool Write(OatWriter& oat_writer,
+  virtual ~ElfWriter() {}
+
+  virtual bool Write(OatWriter* oat_writer,
                      const std::vector<const DexFile*>& dex_files,
                      const std::string& android_root,
                      bool is_host)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) = 0;
 
-  // Setup by constructor
-  const CompilerDriver* compiler_driver_;
-  File* elf_file_;
+  const CompilerDriver* const compiler_driver_;
+  File* const elf_file_;
 };
 
 }  // namespace art

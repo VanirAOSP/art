@@ -17,8 +17,9 @@
 #ifndef ART_RUNTIME_THROW_LOCATION_H_
 #define ART_RUNTIME_THROW_LOCATION_H_
 
+#include "object_callbacks.h"
 #include "base/macros.h"
-#include "root_visitor.h"
+#include "base/mutex.h"
 
 #include <stdint.h>
 #include <string>
@@ -40,7 +41,16 @@ class PACKED(4) ThrowLocation {
                 uint32_t throw_dex_pc) :
       this_object_(throw_this_object),
       method_(throw_method),
-      dex_pc_(throw_dex_pc) {}
+      dex_pc_(throw_dex_pc)
+#ifdef __LP64__
+      , pad_(0)
+#endif
+
+  {
+#ifdef __LP64__
+    UNUSED(pad_);
+#endif
+  }
 
   mirror::Object* GetThis() const {
     return this_object_;
@@ -62,7 +72,7 @@ class PACKED(4) ThrowLocation {
 
   std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void VisitRoots(RootVisitor* visitor, void* arg);
+  void VisitRoots(RootCallback* visitor, void* arg);
 
  private:
   // The 'this' reference of the throwing method.
@@ -71,6 +81,10 @@ class PACKED(4) ThrowLocation {
   mirror::ArtMethod* method_;
   // The instruction within the throwing method.
   uint32_t dex_pc_;
+  // Ensure 8byte alignment on 64bit.
+#ifdef __LP64__
+  uint32_t pad_;
+#endif
 };
 
 }  // namespace art

@@ -17,7 +17,7 @@
 #ifndef ART_RUNTIME_GC_SPACE_DLMALLOC_SPACE_H_
 #define ART_RUNTIME_GC_SPACE_DLMALLOC_SPACE_H_
 
-#include "gc/allocator/dlmalloc.h"
+#include "malloc_space.h"
 #include "space.h"
 
 namespace art {
@@ -29,161 +29,125 @@ namespace collector {
 
 namespace space {
 
-// An alloc space is a space where objects may be allocated and garbage collected.
-class DlMallocSpace : public MemMapSpace, public AllocSpace {
+// An alloc space is a space where objects may be allocated and garbage collected. Not final as may
+// be overridden by a ValgrindMallocSpace.
+class DlMallocSpace : public MallocSpace {
  public:
-  typedef void(*WalkCallback)(void *start, void *end, size_t num_bytes, void* callback_arg);
+  // Create a DlMallocSpace from an existing mem_map.
+  static DlMallocSpace* CreateFromMemMap(MemMap* mem_map, const std::string& name,
+                                         size_t starting_size, size_t initial_size,
+                                         size_t growth_limit, size_t capacity,
+                                         bool can_move_objects);
 
-  SpaceType GetType() const {
-    if (GetGcRetentionPolicy() == kGcRetentionPolicyFullCollect) {
-      return kSpaceTypeZygoteSpace;
-    } else {
-      return kSpaceTypeAllocSpace;
-    }
-  }
-
-  // Create a AllocSpace with the requested sizes. The requested
+  // Create a DlMallocSpace with the requested sizes. The requested
   // base address is not guaranteed to be granted, if it is required,
-  // the caller should call Begin on the returned space to confirm
-  // the request was granted.
+  // the caller should call Begin on the returned space to confirm the
+  // request was granted.
   static DlMallocSpace* Create(const std::string& name, size_t initial_size, size_t growth_limit,
-                               size_t capacity, byte* requested_begin);
+                               size_t capacity, byte* requested_begin, bool can_move_objects);
 
-  // Allocate num_bytes without allowing the underlying mspace to grow.
-  virtual mirror::Object* AllocWithGrowth(Thread* self, size_t num_bytes,
-                                          size_t* bytes_allocated) LOCKS_EXCLUDED(lock_);
+  // Virtual to allow ValgrindMallocSpace to intercept.
+  virtual mirror::Object* AllocWithGrowth(Thread* self, size_t num_bytes, size_t* bytes_allocated,
+                                          size_t* usable_size) OVERRIDE LOCKS_EXCLUDED(lock_);
+  // Virtual to allow ValgrindMallocSpace to intercept.
+  virtual mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated,
+                        size_t* usable_size) OVERRIDE LOCKS_EXCLUDED(lock_) {
+    return AllocNonvirtual(self, num_bytes, bytes_allocated, usable_size);
+  }
+  // Virtual to allow ValgrindMallocSpace to intercept.
+  virtual size_t AllocationSize(mirror::Object* obj, size_t* usable_size) OVERRIDE {
+    return AllocationSizeNonvirtual(obj, usable_size);
+  }
+  // Virtual to allow ValgrindMallocSpace to intercept.
+  virtual size_t Free(Thread* self, mirror::Object* ptr) OVERRIDE
+      LOCKS_EXCLUDED(lock_)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  // Virtual to allow ValgrindMallocSpace to intercept.
+  virtual size_t FreeList(Thread* self, size_t num_ptrs, mirror::Object** ptrs) OVERRIDE
+      LOCKS_EXCLUDED(lock_)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Allocate num_bytes allowing the underlying mspace to grow.
-  virtual mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated);
-
-  // Return the storage space required by obj.
-  virtual size_t AllocationSize(const mirror::Object* obj);
-  virtual size_t Free(Thread* self, mirror::Object* ptr);
-  virtual size_t FreeList(Thread* self, size_t num_ptrs, mirror::Object** ptrs);
-
-  mirror::Object* AllocNonvirtual(Thread* self, size_t num_bytes, size_t* bytes_allocated);
-
-  size_t AllocationSizeNonvirtual(const mirror::Object* obj) {
-    return mspace_usable_size(const_cast<void*>(reinterpret_cast<const void*>(obj))) +
-        kChunkOverhead;
+  // DlMallocSpaces don't have thread local state.
+  void RevokeThreadLocalBuffers(art::Thread*) OVERRIDE {
+  }
+  void RevokeAllThreadLocalBuffers() OVERRIDE {
   }
 
-  void* MoreCore(intptr_t increment);
+  // Faster non-virtual allocation path.
+  mirror::Object* AllocNonvirtual(Thread* self, size_t num_bytes, size_t* bytes_allocated,
+                                  size_t* usable_size) LOCKS_EXCLUDED(lock_);
+
+  // Faster non-virtual allocation size path.
+  size_t AllocationSizeNonvirtual(mirror::Object* obj, size_t* usable_size);
+
+#ifndef NDEBUG
+  // Override only in the debug build.
+  void CheckMoreCoreForPrecondition();
+#endif
 
   void* GetMspace() const {
     return mspace_;
   }
 
-  // Hands unused pages back to the system.
-  size_t Trim();
+  size_t Trim() OVERRIDE;
 
   // Perform a mspace_inspect_all which calls back for each allocation chunk. The chunk may not be
   // in use, indicated by num_bytes equaling zero.
-  void Walk(WalkCallback callback, void* arg) LOCKS_EXCLUDED(lock_);
+  void Walk(WalkCallback callback, void* arg) OVERRIDE LOCKS_EXCLUDED(lock_);
 
   // Returns the number of bytes that the space has currently obtained from the system. This is
   // greater or equal to the amount of live data in the space.
-  size_t GetFootprint();
+  size_t GetFootprint() OVERRIDE;
 
   // Returns the number of bytes that the heap is allowed to obtain from the system via MoreCore.
-  size_t GetFootprintLimit();
+  size_t GetFootprintLimit() OVERRIDE;
 
   // Set the maximum number of bytes that the heap is allowed to obtain from the system via
   // MoreCore. Note this is used to stop the mspace growing beyond the limit to Capacity. When
   // allocations fail we GC before increasing the footprint limit and allowing the mspace to grow.
-  void SetFootprintLimit(size_t limit);
+  void SetFootprintLimit(size_t limit) OVERRIDE;
 
-  // Removes the fork time growth limit on capacity, allowing the application to allocate up to the
-  // maximum reserved size of the heap.
-  void ClearGrowthLimit() {
-    growth_limit_ = NonGrowthLimitCapacity();
+  MallocSpace* CreateInstance(const std::string& name, MemMap* mem_map, void* allocator,
+                              byte* begin, byte* end, byte* limit, size_t growth_limit,
+                              bool can_move_objects);
+
+  uint64_t GetBytesAllocated() OVERRIDE;
+  uint64_t GetObjectsAllocated() OVERRIDE;
+
+  virtual void Clear() OVERRIDE;
+
+  bool IsDlMallocSpace() const OVERRIDE {
+    return true;
   }
 
-  // Override capacity so that we only return the possibly limited capacity
-  size_t Capacity() const {
-    return growth_limit_;
+  DlMallocSpace* AsDlMallocSpace() OVERRIDE {
+    return this;
   }
 
-  // The total amount of memory reserved for the alloc space.
-  size_t NonGrowthLimitCapacity() const {
-    return GetMemMap()->Size();
-  }
-
-  accounting::SpaceBitmap* GetLiveBitmap() const {
-    return live_bitmap_.get();
-  }
-
-  accounting::SpaceBitmap* GetMarkBitmap() const {
-    return mark_bitmap_.get();
-  }
-
-  void Dump(std::ostream& os) const;
-
-  void SetGrowthLimit(size_t growth_limit);
-
-  // Swap the live and mark bitmaps of this space. This is used by the GC for concurrent sweeping.
-  void SwapBitmaps();
-
-  // Turn ourself into a zygote space and return a new alloc space which has our unused memory.
-  DlMallocSpace* CreateZygoteSpace(const char* alloc_space_name);
-
-  uint64_t GetBytesAllocated();
-  uint64_t GetObjectsAllocated();
-  uint64_t GetTotalBytesAllocated() {
-    return GetBytesAllocated() + total_bytes_freed_;
-  }
-  uint64_t GetTotalObjectsAllocated() {
-    return GetObjectsAllocated() + total_objects_freed_;
-  }
-
-  // Returns the class of a recently freed object.
-  mirror::Class* FindRecentFreedObject(const mirror::Object* obj);
+  void LogFragmentationAllocFailure(std::ostream& os, size_t failed_alloc_bytes) OVERRIDE
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  protected:
   DlMallocSpace(const std::string& name, MemMap* mem_map, void* mspace, byte* begin, byte* end,
-                size_t growth_limit);
+                byte* limit, size_t growth_limit, bool can_move_objects, size_t starting_size,
+                size_t initial_size);
 
  private:
-  size_t InternalAllocationSize(const mirror::Object* obj);
-  mirror::Object* AllocWithoutGrowthLocked(size_t num_bytes, size_t* bytes_allocated)
+  mirror::Object* AllocWithoutGrowthLocked(Thread* self, size_t num_bytes, size_t* bytes_allocated,
+                                           size_t* usable_size)
       EXCLUSIVE_LOCKS_REQUIRED(lock_);
-  bool Init(size_t initial_size, size_t maximum_size, size_t growth_size, byte* requested_base);
-  void RegisterRecentFree(mirror::Object* ptr);
-  static void* CreateMallocSpace(void* base, size_t morecore_start, size_t initial_size);
 
-  UniquePtr<accounting::SpaceBitmap> live_bitmap_;
-  UniquePtr<accounting::SpaceBitmap> mark_bitmap_;
-  UniquePtr<accounting::SpaceBitmap> temp_bitmap_;
-
-  // Recent allocation buffer.
-  static constexpr size_t kRecentFreeCount = kDebugSpaces ? (1 << 16) : 0;
-  static constexpr size_t kRecentFreeMask = kRecentFreeCount - 1;
-  std::pair<const mirror::Object*, mirror::Class*> recent_freed_objects_[kRecentFreeCount];
-  size_t recent_free_pos_;
-
-  // Approximate number of bytes and objects which have been deallocated in the space.
-  size_t total_bytes_freed_;
-  size_t total_objects_freed_;
-
-  static size_t bitmap_index_;
+  void* CreateAllocator(void* base, size_t morecore_start, size_t initial_size,
+                        size_t /*maximum_size*/, bool /*low_memory_mode*/) OVERRIDE {
+    return CreateMspace(base, morecore_start, initial_size);
+  }
+  static void* CreateMspace(void* base, size_t morecore_start, size_t initial_size);
 
   // The boundary tag overhead.
   static const size_t kChunkOverhead = kWordSize;
 
-  // Used to ensure mutual exclusion when the allocation spaces data structures are being modified.
-  Mutex lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
-
-  // Underlying malloc space
-  void* const mspace_;
-
-  // The capacity of the alloc space until such time that ClearGrowthLimit is called.
-  // The underlying mem_map_ controls the maximum size we allow the heap to grow to. The growth
-  // limit is a value <= to the mem_map_ capacity used for ergonomic reasons because of the zygote.
-  // Prior to forking the zygote the heap will have a maximally sized mem_map_ but the growth_limit_
-  // will be set to a lower value. The growth_limit_ is used as the capacity of the alloc_space_,
-  // however, capacity normally can't vary. In the case of the growth_limit_ it can be cleared
-  // one time by a call to ClearGrowthLimit.
-  size_t growth_limit_;
+  // Underlying malloc space.
+  void* mspace_;
 
   friend class collector::MarkSweep;
 

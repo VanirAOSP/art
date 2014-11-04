@@ -19,26 +19,27 @@
 #include "mirror/art_method-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
-#include "object_utils.h"
 #include "utils.h"
 
 namespace art {
 
 std::string ThrowLocation::Dump() const {
-  if (method_ != NULL) {
+  if (method_ != nullptr) {
     return StringPrintf("%s:%d", PrettyMethod(method_).c_str(),
-                        MethodHelper(method_).GetLineNumFromDexPC(dex_pc_));
+                        method_->GetLineNumFromDexPC(dex_pc_));
   } else {
     return "unknown throw location";
   }
 }
 
-void ThrowLocation::VisitRoots(RootVisitor* visitor, void* arg) {
-  if (this_object_ != NULL) {
-    visitor(this_object_, arg);
+void ThrowLocation::VisitRoots(RootCallback* visitor, void* arg) {
+  if (this_object_ != nullptr) {
+    visitor(&this_object_, arg, 0, kRootVMInternal);
+    DCHECK(this_object_ != nullptr);
   }
-  if (method_ != NULL) {
-    visitor(method_, arg);
+  if (method_ != nullptr) {
+    visitor(reinterpret_cast<mirror::Object**>(&method_), arg, 0, kRootVMInternal);
+    DCHECK(method_ != nullptr);
   }
 }
 

@@ -17,27 +17,62 @@
 #include "dex/compiler_internals.h"
 #include "dex_file-inl.h"
 #include "gc_map.h"
+#include "gc_map_builder.h"
 #include "mapping_table.h"
 #include "mir_to_lir-inl.h"
+#include "dex/quick/dex_file_method_inliner.h"
+#include "dex/quick/dex_file_to_method_inliner_map.h"
+#include "dex/verification_results.h"
+#include "dex/verified_method.h"
 #include "verifier/dex_gc_map.h"
 #include "verifier/method_verifier.h"
+#include "vmap_table.h"
 
 namespace art {
+
+namespace {
+
+/* Dump a mapping table */
+template <typename It>
+void DumpMappingTable(const char* table_name, const char* descriptor, const char* name,
+                      const Signature& signature, uint32_t size, It first) {
+  if (size != 0) {
+    std::string line(StringPrintf("\n  %s %s%s_%s_table[%u] = {", table_name,
+                     descriptor, name, signature.ToString().c_str(), size));
+    std::replace(line.begin(), line.end(), ';', '_');
+    LOG(INFO) << line;
+    for (uint32_t i = 0; i != size; ++i) {
+      line = StringPrintf("    {0x%05x, 0x%04x},", first.NativePcOffset(), first.DexPc());
+      ++first;
+      LOG(INFO) << line;
+    }
+    LOG(INFO) <<"  };\n\n";
+  }
+}
+
+}  // anonymous namespace
 
 bool Mir2Lir::IsInexpensiveConstant(RegLocation rl_src) {
   bool res = false;
   if (rl_src.is_const) {
     if (rl_src.wide) {
+      // For wide registers, check whether we're the high partner. In that case we need to switch
+      // to the lower one for the correct value.
+      if (rl_src.high_word) {
+        rl_src.high_word = false;
+        rl_src.s_reg_low--;
+        rl_src.orig_sreg--;
+      }
       if (rl_src.fp) {
-         res = InexpensiveConstantDouble(mir_graph_->ConstantValueWide(rl_src));
+        res = InexpensiveConstantDouble(mir_graph_->ConstantValueWide(rl_src));
       } else {
-         res = InexpensiveConstantLong(mir_graph_->ConstantValueWide(rl_src));
+        res = InexpensiveConstantLong(mir_graph_->ConstantValueWide(rl_src));
       }
     } else {
       if (rl_src.fp) {
-         res = InexpensiveConstantFloat(mir_graph_->ConstantValue(rl_src));
+        res = InexpensiveConstantFloat(mir_graph_->ConstantValue(rl_src));
       } else {
-         res = InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src));
+        res = InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src));
       }
     }
   }
@@ -45,52 +80,89 @@ bool Mir2Lir::IsInexpensiveConstant(RegLocation rl_src) {
 }
 
 void Mir2Lir::MarkSafepointPC(LIR* inst) {
-  inst->def_mask = ENCODE_ALL;
+  DCHECK(!inst->flags.use_def_invalid);
+  inst->u.m.def_mask = &kEncodeAll;
   LIR* safepoint_pc = NewLIR0(kPseudoSafepointPC);
-  DCHECK_EQ(safepoint_pc->def_mask, ENCODE_ALL);
+  DCHECK(safepoint_pc->u.m.def_mask->Equals(kEncodeAll));
 }
 
-bool Mir2Lir::FastInstance(uint32_t field_idx, int& field_offset, bool& is_volatile, bool is_put) {
-  return cu_->compiler_driver->ComputeInstanceFieldInfo(
-      field_idx, mir_graph_->GetCurrentDexCompilationUnit(), field_offset, is_volatile, is_put);
+void Mir2Lir::MarkSafepointPCAfter(LIR* after) {
+  DCHECK(!after->flags.use_def_invalid);
+  after->u.m.def_mask = &kEncodeAll;
+  // As NewLIR0 uses Append, we need to create the LIR by hand.
+  LIR* safepoint_pc = RawLIR(current_dalvik_offset_, kPseudoSafepointPC);
+  if (after->next == nullptr) {
+    DCHECK_EQ(after, last_lir_insn_);
+    AppendLIR(safepoint_pc);
+  } else {
+    InsertLIRAfter(after, safepoint_pc);
+  }
+  DCHECK(safepoint_pc->u.m.def_mask->Equals(kEncodeAll));
+}
+
+/* Remove a LIR from the list. */
+void Mir2Lir::UnlinkLIR(LIR* lir) {
+  if (UNLIKELY(lir == first_lir_insn_)) {
+    first_lir_insn_ = lir->next;
+    if (lir->next != NULL) {
+      lir->next->prev = NULL;
+    } else {
+      DCHECK(lir->next == NULL);
+      DCHECK(lir == last_lir_insn_);
+      last_lir_insn_ = NULL;
+    }
+  } else if (lir == last_lir_insn_) {
+    last_lir_insn_ = lir->prev;
+    lir->prev->next = NULL;
+  } else if ((lir->prev != NULL) && (lir->next != NULL)) {
+    lir->prev->next = lir->next;
+    lir->next->prev = lir->prev;
+  }
 }
 
 /* Convert an instruction to a NOP */
 void Mir2Lir::NopLIR(LIR* lir) {
   lir->flags.is_nop = true;
+  if (!cu_->verbose) {
+    UnlinkLIR(lir);
+  }
 }
 
 void Mir2Lir::SetMemRefType(LIR* lir, bool is_load, int mem_type) {
-  uint64_t *mask_ptr;
-  uint64_t mask = ENCODE_MEM;
   DCHECK(GetTargetInstFlags(lir->opcode) & (IS_LOAD | IS_STORE));
+  DCHECK(!lir->flags.use_def_invalid);
+  // TODO: Avoid the extra Arena allocation!
+  const ResourceMask** mask_ptr;
+  ResourceMask mask;
   if (is_load) {
-    mask_ptr = &lir->use_mask;
+    mask_ptr = &lir->u.m.use_mask;
   } else {
-    mask_ptr = &lir->def_mask;
+    mask_ptr = &lir->u.m.def_mask;
   }
+  mask = **mask_ptr;
   /* Clear out the memref flags */
-  *mask_ptr &= ~mask;
+  mask.ClearBits(kEncodeMem);
   /* ..and then add back the one we need */
   switch (mem_type) {
-    case kLiteral:
+    case ResourceMask::kLiteral:
       DCHECK(is_load);
-      *mask_ptr |= ENCODE_LITERAL;
+      mask.SetBit(ResourceMask::kLiteral);
       break;
-    case kDalvikReg:
-      *mask_ptr |= ENCODE_DALVIK_REG;
+    case ResourceMask::kDalvikReg:
+      mask.SetBit(ResourceMask::kDalvikReg);
       break;
-    case kHeapRef:
-      *mask_ptr |= ENCODE_HEAP_REF;
+    case ResourceMask::kHeapRef:
+      mask.SetBit(ResourceMask::kHeapRef);
       break;
-    case kMustNotAlias:
+    case ResourceMask::kMustNotAlias:
       /* Currently only loads can be marked as kMustNotAlias */
       DCHECK(!(GetTargetInstFlags(lir->opcode) & IS_STORE));
-      *mask_ptr |= ENCODE_MUST_NOT_ALIAS;
+      mask.SetBit(ResourceMask::kMustNotAlias);
       break;
     default:
       LOG(FATAL) << "Oat: invalid memref kind - " << mem_type;
   }
+  *mask_ptr = mask_cache_.GetMask(mask);
 }
 
 /*
@@ -98,13 +170,14 @@ void Mir2Lir::SetMemRefType(LIR* lir, bool is_load, int mem_type) {
  */
 void Mir2Lir::AnnotateDalvikRegAccess(LIR* lir, int reg_id, bool is_load,
                                       bool is64bit) {
-  SetMemRefType(lir, is_load, kDalvikReg);
+  DCHECK((is_load ? lir->u.m.use_mask : lir->u.m.def_mask)->Intersection(kEncodeMem).Equals(
+      kEncodeDalvikReg));
 
   /*
    * Store the Dalvik register id in alias_info. Mark the MSB if it is a 64-bit
    * access.
    */
-  lir->alias_info = ENCODE_ALIAS_INFO(reg_id, is64bit);
+  lir->flags.alias_info = ENCODE_ALIAS_INFO(reg_id, is64bit);
 }
 
 /*
@@ -135,10 +208,12 @@ void Mir2Lir::DumpLIRInsn(LIR* lir, unsigned char* base_addr) {
       break;
     case kPseudoDalvikByteCodeBoundary:
       if (lir->operands[0] == 0) {
-         lir->operands[0] = reinterpret_cast<uintptr_t>("No instruction string");
+         // NOTE: only used for debug listings.
+         lir->operands[0] = WrapPointer(ArenaStrdup("No instruction string"));
       }
       LOG(INFO) << "-------- dalvik offset: 0x" << std::hex
-                << lir->dalvik_offset << " @ " << reinterpret_cast<char*>(lir->operands[0]);
+                << lir->dalvik_offset << " @ "
+                << reinterpret_cast<char*>(UnwrapPointer(lir->operands[0]));
       break;
     case kPseudoExitBlock:
       LOG(INFO) << "-------- exit offset: 0x" << std::hex << dest;
@@ -182,29 +257,29 @@ void Mir2Lir::DumpLIRInsn(LIR* lir, unsigned char* base_addr) {
                                                lir, base_addr));
         std::string op_operands(BuildInsnString(GetTargetInstFmt(lir->opcode),
                                                     lir, base_addr));
-        LOG(INFO) << StringPrintf("%05x: %-9s%s%s",
-                                  reinterpret_cast<unsigned int>(base_addr + offset),
+        LOG(INFO) << StringPrintf("%5p: %-9s%s%s",
+                                  base_addr + offset,
                                   op_name.c_str(), op_operands.c_str(),
                                   lir->flags.is_nop ? "(nop)" : "");
       }
       break;
   }
 
-  if (lir->use_mask && (!lir->flags.is_nop || dump_nop)) {
-    DUMP_RESOURCE_MASK(DumpResourceMask(lir, lir->use_mask, "use"));
+  if (lir->u.m.use_mask && (!lir->flags.is_nop || dump_nop)) {
+    DUMP_RESOURCE_MASK(DumpResourceMask(lir, *lir->u.m.use_mask, "use"));
   }
-  if (lir->def_mask && (!lir->flags.is_nop || dump_nop)) {
-    DUMP_RESOURCE_MASK(DumpResourceMask(lir, lir->def_mask, "def"));
+  if (lir->u.m.def_mask && (!lir->flags.is_nop || dump_nop)) {
+    DUMP_RESOURCE_MASK(DumpResourceMask(lir, *lir->u.m.def_mask, "def"));
   }
 }
 
 void Mir2Lir::DumpPromotionMap() {
-  int num_regs = cu_->num_dalvik_registers + cu_->num_compiler_temps + 1;
+  int num_regs = cu_->num_dalvik_registers + mir_graph_->GetNumUsedCompilerTemps();
   for (int i = 0; i < num_regs; i++) {
     PromotionMap v_reg_map = promotion_map_[i];
     std::string buf;
     if (v_reg_map.fp_location == kLocPhysReg) {
-      StringAppendF(&buf, " : s%d", v_reg_map.FpReg & FpRegMask());
+      StringAppendF(&buf, " : s%d", RegStorage::RegNum(v_reg_map.fp_reg));
     }
 
     std::string buf3;
@@ -224,20 +299,16 @@ void Mir2Lir::DumpPromotionMap() {
   }
 }
 
-/* Dump a mapping table */
-void Mir2Lir::DumpMappingTable(const char* table_name, const std::string& descriptor,
-                               const std::string& name, const std::string& signature,
-                               const std::vector<uint32_t>& v) {
-  if (v.size() > 0) {
-    std::string line(StringPrintf("\n  %s %s%s_%s_table[%zu] = {", table_name,
-                     descriptor.c_str(), name.c_str(), signature.c_str(), v.size()));
-    std::replace(line.begin(), line.end(), ';', '_');
-    LOG(INFO) << line;
-    for (uint32_t i = 0; i < v.size(); i+=2) {
-      line = StringPrintf("    {0x%05x, 0x%04x},", v[i], v[i+1]);
-      LOG(INFO) << line;
+void Mir2Lir::UpdateLIROffsets() {
+  // Only used for code listings.
+  size_t offset = 0;
+  for (LIR* lir = first_lir_insn_; lir != nullptr; lir = lir->next) {
+    lir->offset = offset;
+    if (!lir->flags.is_nop && !IsPseudoLirOp(lir->opcode)) {
+      offset += GetInsnSize(lir);
+    } else if (lir->opcode == kPseudoPseudoAlign4) {
+      offset += (offset & 0x2);
     }
-    LOG(INFO) <<"  };\n\n";
   }
 }
 
@@ -253,13 +324,14 @@ void Mir2Lir::CodegenDump() {
   LOG(INFO) << "Outs         : " << cu_->num_outs;
   LOG(INFO) << "CoreSpills       : " << num_core_spills_;
   LOG(INFO) << "FPSpills       : " << num_fp_spills_;
-  LOG(INFO) << "CompilerTemps    : " << cu_->num_compiler_temps;
+  LOG(INFO) << "CompilerTemps    : " << mir_graph_->GetNumUsedCompilerTemps();
   LOG(INFO) << "Frame size       : " << frame_size_;
   LOG(INFO) << "code size is " << total_size_ <<
     " bytes, Dalvik size is " << insns_size * 2;
   LOG(INFO) << "expansion factor: "
             << static_cast<float>(total_size_) / static_cast<float>(insns_size * 2);
   DumpPromotionMap();
+  UpdateLIROffsets();
   for (lir_insn = first_lir_insn_; lir_insn != NULL; lir_insn = lir_insn->next) {
     DumpLIRInsn(lir_insn, 0);
   }
@@ -270,13 +342,18 @@ void Mir2Lir::CodegenDump() {
 
   const DexFile::MethodId& method_id =
       cu_->dex_file->GetMethodId(cu_->method_idx);
-  std::string signature(cu_->dex_file->GetMethodSignature(method_id));
-  std::string name(cu_->dex_file->GetMethodName(method_id));
-  std::string descriptor(cu_->dex_file->GetMethodDeclaringClassDescriptor(method_id));
+  const Signature signature = cu_->dex_file->GetMethodSignature(method_id);
+  const char* name = cu_->dex_file->GetMethodName(method_id);
+  const char* descriptor(cu_->dex_file->GetMethodDeclaringClassDescriptor(method_id));
 
   // Dump mapping tables
-  DumpMappingTable("PC2Dex_MappingTable", descriptor, name, signature, pc2dex_mapping_table_);
-  DumpMappingTable("Dex2PC_MappingTable", descriptor, name, signature, dex2pc_mapping_table_);
+  if (!encoded_mapping_table_.empty()) {
+    MappingTable table(&encoded_mapping_table_[0]);
+    DumpMappingTable("PC2Dex_MappingTable", descriptor, name, signature,
+                     table.PcToDexSize(), table.PcToDexBegin());
+    DumpMappingTable("Dex2PC_MappingTable", descriptor, name, signature,
+                     table.DexToPcSize(), table.DexToPcBegin());
+  }
 }
 
 /*
@@ -312,6 +389,18 @@ LIR* Mir2Lir::ScanLiteralPoolWide(LIR* data_target, int val_lo, int val_hi) {
   return NULL;
 }
 
+/* Search the existing constants in the literal pool for an exact method match */
+LIR* Mir2Lir::ScanLiteralPoolMethod(LIR* data_target, const MethodReference& method) {
+  while (data_target) {
+    if (static_cast<uint32_t>(data_target->operands[0]) == method.dex_method_index &&
+        UnwrapPointer(data_target->operands[1]) == method.dex_file) {
+      return data_target;
+    }
+    data_target = data_target->next;
+  }
+  return nullptr;
+}
+
 /*
  * The following are building blocks to insert constants into the pool or
  * instruction streams.
@@ -321,10 +410,11 @@ LIR* Mir2Lir::ScanLiteralPoolWide(LIR* data_target, int val_lo, int val_hi) {
 LIR* Mir2Lir::AddWordData(LIR* *constant_list_p, int value) {
   /* Add the constant to the literal pool */
   if (constant_list_p) {
-    LIR* new_value = static_cast<LIR*>(arena_->Alloc(sizeof(LIR), ArenaAllocator::kAllocData));
+    LIR* new_value = static_cast<LIR*>(arena_->Alloc(sizeof(LIR), kArenaAllocData));
     new_value->operands[0] = value;
     new_value->next = *constant_list_p;
     *constant_list_p = new_value;
+    estimated_native_code_size_ += sizeof(value);
     return new_value;
   }
   return NULL;
@@ -336,11 +426,22 @@ LIR* Mir2Lir::AddWideData(LIR* *constant_list_p, int val_lo, int val_hi) {
   return AddWordData(constant_list_p, val_lo);
 }
 
-static void PushWord(std::vector<uint8_t>&buf, int data) {
+static void Push32(std::vector<uint8_t>&buf, int data) {
   buf.push_back(data & 0xff);
   buf.push_back((data >> 8) & 0xff);
   buf.push_back((data >> 16) & 0xff);
   buf.push_back((data >> 24) & 0xff);
+}
+
+// Push 8 bytes on 64-bit target systems; 4 on 32-bit target systems.
+static void PushPointer(std::vector<uint8_t>&buf, const void* pointer, bool target64) {
+  uint64_t data = reinterpret_cast<uintptr_t>(pointer);
+  if (target64) {
+    Push32(buf, data & 0xFFFFFFFF);
+    Push32(buf, (data >> 32) & 0xFFFFFFFF);
+  } else {
+    Push32(buf, static_cast<uint32_t>(data));
+  }
 }
 
 static void AlignBuffer(std::vector<uint8_t>&buf, size_t offset) {
@@ -354,40 +455,58 @@ void Mir2Lir::InstallLiteralPools() {
   AlignBuffer(code_buffer_, data_offset_);
   LIR* data_lir = literal_list_;
   while (data_lir != NULL) {
-    PushWord(code_buffer_, data_lir->operands[0]);
+    Push32(code_buffer_, data_lir->operands[0]);
     data_lir = NEXT_LIR(data_lir);
   }
   // Push code and method literals, record offsets for the compiler to patch.
   data_lir = code_literal_list_;
   while (data_lir != NULL) {
-    uint32_t target = data_lir->operands[0];
+    uint32_t target_method_idx = data_lir->operands[0];
+    const DexFile* target_dex_file =
+        reinterpret_cast<const DexFile*>(UnwrapPointer(data_lir->operands[1]));
     cu_->compiler_driver->AddCodePatch(cu_->dex_file,
                                        cu_->class_def_idx,
                                        cu_->method_idx,
                                        cu_->invoke_type,
-                                       target,
-                                       static_cast<InvokeType>(data_lir->operands[1]),
+                                       target_method_idx,
+                                       target_dex_file,
+                                       static_cast<InvokeType>(data_lir->operands[2]),
                                        code_buffer_.size());
-    const DexFile::MethodId& id = cu_->dex_file->GetMethodId(target);
-    // unique based on target to ensure code deduplication works
-    uint32_t unique_patch_value = reinterpret_cast<uint32_t>(&id);
-    PushWord(code_buffer_, unique_patch_value);
+    const DexFile::MethodId& target_method_id = target_dex_file->GetMethodId(target_method_idx);
+    // unique value based on target to ensure code deduplication works
+    PushPointer(code_buffer_, &target_method_id, cu_->target64);
     data_lir = NEXT_LIR(data_lir);
   }
   data_lir = method_literal_list_;
   while (data_lir != NULL) {
-    uint32_t target = data_lir->operands[0];
+    uint32_t target_method_idx = data_lir->operands[0];
+    const DexFile* target_dex_file =
+        reinterpret_cast<const DexFile*>(UnwrapPointer(data_lir->operands[1]));
     cu_->compiler_driver->AddMethodPatch(cu_->dex_file,
                                          cu_->class_def_idx,
                                          cu_->method_idx,
                                          cu_->invoke_type,
-                                         target,
-                                         static_cast<InvokeType>(data_lir->operands[1]),
+                                         target_method_idx,
+                                         target_dex_file,
+                                         static_cast<InvokeType>(data_lir->operands[2]),
                                          code_buffer_.size());
-    const DexFile::MethodId& id = cu_->dex_file->GetMethodId(target);
-    // unique based on target to ensure code deduplication works
-    uint32_t unique_patch_value = reinterpret_cast<uint32_t>(&id);
-    PushWord(code_buffer_, unique_patch_value);
+    const DexFile::MethodId& target_method_id = target_dex_file->GetMethodId(target_method_idx);
+    // unique value based on target to ensure code deduplication works
+    PushPointer(code_buffer_, &target_method_id, cu_->target64);
+    data_lir = NEXT_LIR(data_lir);
+  }
+  // Push class literals.
+  data_lir = class_literal_list_;
+  while (data_lir != NULL) {
+    uint32_t target_method_idx = data_lir->operands[0];
+    cu_->compiler_driver->AddClassPatch(cu_->dex_file,
+                                        cu_->class_def_idx,
+                                        cu_->method_idx,
+                                        target_method_idx,
+                                        code_buffer_.size());
+    const DexFile::TypeId& target_method_id = cu_->dex_file->GetTypeId(target_method_idx);
+    // unique value based on target to ensure code deduplication works
+    PushPointer(code_buffer_, &target_method_id, cu_->target64);
     data_lir = NEXT_LIR(data_lir);
   }
 }
@@ -408,11 +527,14 @@ void Mir2Lir::InstallSwitchTables() {
     int bx_offset = INVALID_OFFSET;
     switch (cu_->instruction_set) {
       case kThumb2:
+        DCHECK(tab_rec->anchor->flags.fixup != kFixupNone);
         bx_offset = tab_rec->anchor->offset + 4;
         break;
       case kX86:
+      case kX86_64:
         bx_offset = 0;
         break;
+      case kArm64:
       case kMips:
         bx_offset = tab_rec->anchor->offset;
         break;
@@ -422,7 +544,7 @@ void Mir2Lir::InstallSwitchTables() {
       LOG(INFO) << "Switch table for offset 0x" << std::hex << bx_offset;
     }
     if (tab_rec->table[0] == Instruction::kSparseSwitchSignature) {
-      const int* keys = reinterpret_cast<const int*>(&(tab_rec->table[2]));
+      const int32_t* keys = reinterpret_cast<const int32_t*>(&(tab_rec->table[2]));
       for (int elems = 0; elems < tab_rec->table[1]; elems++) {
         int disp = tab_rec->targets[elems]->offset - bx_offset;
         if (cu_->verbose) {
@@ -430,8 +552,8 @@ void Mir2Lir::InstallSwitchTables() {
                     << std::hex << keys[elems] << ", disp: 0x"
                     << std::hex << disp;
         }
-        PushWord(code_buffer_, keys[elems]);
-        PushWord(code_buffer_,
+        Push32(code_buffer_, keys[elems]);
+        Push32(code_buffer_,
           tab_rec->targets[elems]->offset - bx_offset);
       }
     } else {
@@ -443,7 +565,7 @@ void Mir2Lir::InstallSwitchTables() {
           LOG(INFO) << "  Case[" << elems << "] disp: 0x"
                     << std::hex << disp;
         }
-        PushWord(code_buffer_, tab_rec->targets[elems]->offset - bx_offset);
+        Push32(code_buffer_, tab_rec->targets[elems]->offset - bx_offset);
       }
     }
   }
@@ -463,7 +585,7 @@ void Mir2Lir::InstallFillArrayData() {
   }
 }
 
-static int AssignLiteralOffsetCommon(LIR* lir, int offset) {
+static int AssignLiteralOffsetCommon(LIR* lir, CodeOffset offset) {
   for (; lir != NULL; lir = lir->next) {
     lir->offset = offset;
     offset += 4;
@@ -471,200 +593,188 @@ static int AssignLiteralOffsetCommon(LIR* lir, int offset) {
   return offset;
 }
 
+static int AssignLiteralPointerOffsetCommon(LIR* lir, CodeOffset offset,
+                                            unsigned int element_size) {
+  // Align to natural pointer size.
+  offset = RoundUp(offset, element_size);
+  for (; lir != NULL; lir = lir->next) {
+    lir->offset = offset;
+    offset += element_size;
+  }
+  return offset;
+}
+
 // Make sure we have a code address for every declared catch entry
 bool Mir2Lir::VerifyCatchEntries() {
+  MappingTable table(&encoded_mapping_table_[0]);
+  std::vector<uint32_t> dex_pcs;
+  dex_pcs.reserve(table.DexToPcSize());
+  for (auto it = table.DexToPcBegin(), end = table.DexToPcEnd(); it != end; ++it) {
+    dex_pcs.push_back(it.DexPc());
+  }
+  // Sort dex_pcs, so that we can quickly check it against the ordered mir_graph_->catches_.
+  std::sort(dex_pcs.begin(), dex_pcs.end());
+
   bool success = true;
-  for (std::set<uint32_t>::const_iterator it = mir_graph_->catches_.begin();
-       it != mir_graph_->catches_.end(); ++it) {
-    uint32_t dex_pc = *it;
-    bool found = false;
-    for (size_t i = 0; i < dex2pc_mapping_table_.size(); i += 2) {
-      if (dex_pc == dex2pc_mapping_table_[i+1]) {
-        found = true;
-        break;
-      }
+  auto it = dex_pcs.begin(), end = dex_pcs.end();
+  for (uint32_t dex_pc : mir_graph_->catches_) {
+    while (it != end && *it < dex_pc) {
+      LOG(INFO) << "Unexpected catch entry @ dex pc 0x" << std::hex << *it;
+      ++it;
+      success = false;
     }
-    if (!found) {
+    if (it == end || *it > dex_pc) {
       LOG(INFO) << "Missing native PC for catch entry @ 0x" << std::hex << dex_pc;
       success = false;
-    }
-  }
-  // Now, try in the other direction
-  for (size_t i = 0; i < dex2pc_mapping_table_.size(); i += 2) {
-    uint32_t dex_pc = dex2pc_mapping_table_[i+1];
-    if (mir_graph_->catches_.find(dex_pc) == mir_graph_->catches_.end()) {
-      LOG(INFO) << "Unexpected catch entry @ dex pc 0x" << std::hex << dex_pc;
-      success = false;
+    } else {
+      ++it;
     }
   }
   if (!success) {
     LOG(INFO) << "Bad dex2pcMapping table in " << PrettyMethod(cu_->method_idx, *cu_->dex_file);
     LOG(INFO) << "Entries @ decode: " << mir_graph_->catches_.size() << ", Entries in table: "
-              << dex2pc_mapping_table_.size()/2;
+              << table.DexToPcSize();
   }
   return success;
 }
 
 
 void Mir2Lir::CreateMappingTables() {
+  uint32_t pc2dex_data_size = 0u;
+  uint32_t pc2dex_entries = 0u;
+  uint32_t pc2dex_offset = 0u;
+  uint32_t pc2dex_dalvik_offset = 0u;
+  uint32_t dex2pc_data_size = 0u;
+  uint32_t dex2pc_entries = 0u;
+  uint32_t dex2pc_offset = 0u;
+  uint32_t dex2pc_dalvik_offset = 0u;
   for (LIR* tgt_lir = first_lir_insn_; tgt_lir != NULL; tgt_lir = NEXT_LIR(tgt_lir)) {
     if (!tgt_lir->flags.is_nop && (tgt_lir->opcode == kPseudoSafepointPC)) {
-      pc2dex_mapping_table_.push_back(tgt_lir->offset);
-      pc2dex_mapping_table_.push_back(tgt_lir->dalvik_offset);
+      pc2dex_entries += 1;
+      DCHECK(pc2dex_offset <= tgt_lir->offset);
+      pc2dex_data_size += UnsignedLeb128Size(tgt_lir->offset - pc2dex_offset);
+      pc2dex_data_size += SignedLeb128Size(static_cast<int32_t>(tgt_lir->dalvik_offset) -
+                                           static_cast<int32_t>(pc2dex_dalvik_offset));
+      pc2dex_offset = tgt_lir->offset;
+      pc2dex_dalvik_offset = tgt_lir->dalvik_offset;
     }
     if (!tgt_lir->flags.is_nop && (tgt_lir->opcode == kPseudoExportedPC)) {
-      dex2pc_mapping_table_.push_back(tgt_lir->offset);
-      dex2pc_mapping_table_.push_back(tgt_lir->dalvik_offset);
+      dex2pc_entries += 1;
+      DCHECK(dex2pc_offset <= tgt_lir->offset);
+      dex2pc_data_size += UnsignedLeb128Size(tgt_lir->offset - dex2pc_offset);
+      dex2pc_data_size += SignedLeb128Size(static_cast<int32_t>(tgt_lir->dalvik_offset) -
+                                           static_cast<int32_t>(dex2pc_dalvik_offset));
+      dex2pc_offset = tgt_lir->offset;
+      dex2pc_dalvik_offset = tgt_lir->dalvik_offset;
     }
   }
+
+  uint32_t total_entries = pc2dex_entries + dex2pc_entries;
+  uint32_t hdr_data_size = UnsignedLeb128Size(total_entries) + UnsignedLeb128Size(pc2dex_entries);
+  uint32_t data_size = hdr_data_size + pc2dex_data_size + dex2pc_data_size;
+  encoded_mapping_table_.resize(data_size);
+  uint8_t* write_pos = &encoded_mapping_table_[0];
+  write_pos = EncodeUnsignedLeb128(write_pos, total_entries);
+  write_pos = EncodeUnsignedLeb128(write_pos, pc2dex_entries);
+  DCHECK_EQ(static_cast<size_t>(write_pos - &encoded_mapping_table_[0]), hdr_data_size);
+  uint8_t* write_pos2 = write_pos + pc2dex_data_size;
+
+  pc2dex_offset = 0u;
+  pc2dex_dalvik_offset = 0u;
+  dex2pc_offset = 0u;
+  dex2pc_dalvik_offset = 0u;
+  for (LIR* tgt_lir = first_lir_insn_; tgt_lir != NULL; tgt_lir = NEXT_LIR(tgt_lir)) {
+    if (!tgt_lir->flags.is_nop && (tgt_lir->opcode == kPseudoSafepointPC)) {
+      DCHECK(pc2dex_offset <= tgt_lir->offset);
+      write_pos = EncodeUnsignedLeb128(write_pos, tgt_lir->offset - pc2dex_offset);
+      write_pos = EncodeSignedLeb128(write_pos, static_cast<int32_t>(tgt_lir->dalvik_offset) -
+                                     static_cast<int32_t>(pc2dex_dalvik_offset));
+      pc2dex_offset = tgt_lir->offset;
+      pc2dex_dalvik_offset = tgt_lir->dalvik_offset;
+    }
+    if (!tgt_lir->flags.is_nop && (tgt_lir->opcode == kPseudoExportedPC)) {
+      DCHECK(dex2pc_offset <= tgt_lir->offset);
+      write_pos2 = EncodeUnsignedLeb128(write_pos2, tgt_lir->offset - dex2pc_offset);
+      write_pos2 = EncodeSignedLeb128(write_pos2, static_cast<int32_t>(tgt_lir->dalvik_offset) -
+                                      static_cast<int32_t>(dex2pc_dalvik_offset));
+      dex2pc_offset = tgt_lir->offset;
+      dex2pc_dalvik_offset = tgt_lir->dalvik_offset;
+    }
+  }
+  DCHECK_EQ(static_cast<size_t>(write_pos - &encoded_mapping_table_[0]),
+            hdr_data_size + pc2dex_data_size);
+  DCHECK_EQ(static_cast<size_t>(write_pos2 - &encoded_mapping_table_[0]), data_size);
+
   if (kIsDebugBuild) {
     CHECK(VerifyCatchEntries());
-  }
-  CHECK_EQ(pc2dex_mapping_table_.size() & 1, 0U);
-  CHECK_EQ(dex2pc_mapping_table_.size() & 1, 0U);
-  uint32_t total_entries = (pc2dex_mapping_table_.size() + dex2pc_mapping_table_.size()) / 2;
-  uint32_t pc2dex_entries = pc2dex_mapping_table_.size() / 2;
-  encoded_mapping_table_.PushBack(total_entries);
-  encoded_mapping_table_.PushBack(pc2dex_entries);
-  encoded_mapping_table_.InsertBack(pc2dex_mapping_table_.begin(), pc2dex_mapping_table_.end());
-  encoded_mapping_table_.InsertBack(dex2pc_mapping_table_.begin(), dex2pc_mapping_table_.end());
-  if (kIsDebugBuild) {
+
     // Verify the encoded table holds the expected data.
-    MappingTable table(&encoded_mapping_table_.GetData()[0]);
+    MappingTable table(&encoded_mapping_table_[0]);
     CHECK_EQ(table.TotalSize(), total_entries);
     CHECK_EQ(table.PcToDexSize(), pc2dex_entries);
-    CHECK_EQ(table.DexToPcSize(), dex2pc_mapping_table_.size() / 2);
-    MappingTable::PcToDexIterator it = table.PcToDexBegin();
-    for (uint32_t i = 0; i < pc2dex_mapping_table_.size(); ++i, ++it) {
-      CHECK_EQ(pc2dex_mapping_table_.at(i), it.NativePcOffset());
-      ++i;
-      CHECK_EQ(pc2dex_mapping_table_.at(i), it.DexPc());
+    auto it = table.PcToDexBegin();
+    auto it2 = table.DexToPcBegin();
+    for (LIR* tgt_lir = first_lir_insn_; tgt_lir != NULL; tgt_lir = NEXT_LIR(tgt_lir)) {
+      if (!tgt_lir->flags.is_nop && (tgt_lir->opcode == kPseudoSafepointPC)) {
+        CHECK_EQ(tgt_lir->offset, it.NativePcOffset());
+        CHECK_EQ(tgt_lir->dalvik_offset, it.DexPc());
+        ++it;
+      }
+      if (!tgt_lir->flags.is_nop && (tgt_lir->opcode == kPseudoExportedPC)) {
+        CHECK_EQ(tgt_lir->offset, it2.NativePcOffset());
+        CHECK_EQ(tgt_lir->dalvik_offset, it2.DexPc());
+        ++it2;
+      }
     }
-    MappingTable::DexToPcIterator it2 = table.DexToPcBegin();
-    for (uint32_t i = 0; i < dex2pc_mapping_table_.size(); ++i, ++it2) {
-      CHECK_EQ(dex2pc_mapping_table_.at(i), it2.NativePcOffset());
-      ++i;
-      CHECK_EQ(dex2pc_mapping_table_.at(i), it2.DexPc());
-    }
+    CHECK(it == table.PcToDexEnd());
+    CHECK(it2 == table.DexToPcEnd());
   }
 }
 
-class NativePcToReferenceMapBuilder {
- public:
-  NativePcToReferenceMapBuilder(std::vector<uint8_t>* table,
-                                size_t entries, uint32_t max_native_offset,
-                                size_t references_width) : entries_(entries),
-                                references_width_(references_width), in_use_(entries),
-                                table_(table) {
-    // Compute width in bytes needed to hold max_native_offset.
-    native_offset_width_ = 0;
-    while (max_native_offset != 0) {
-      native_offset_width_++;
-      max_native_offset >>= 8;
-    }
-    // Resize table and set up header.
-    table->resize((EntryWidth() * entries) + sizeof(uint32_t));
-    CHECK_LT(native_offset_width_, 1U << 3);
-    (*table)[0] = native_offset_width_ & 7;
-    CHECK_LT(references_width_, 1U << 13);
-    (*table)[0] |= (references_width_ << 3) & 0xFF;
-    (*table)[1] = (references_width_ >> 5) & 0xFF;
-    CHECK_LT(entries, 1U << 16);
-    (*table)[2] = entries & 0xFF;
-    (*table)[3] = (entries >> 8) & 0xFF;
-  }
-
-  void AddEntry(uint32_t native_offset, const uint8_t* references) {
-    size_t table_index = TableIndex(native_offset);
-    while (in_use_[table_index]) {
-      table_index = (table_index + 1) % entries_;
-    }
-    in_use_[table_index] = true;
-    SetNativeOffset(table_index, native_offset);
-    DCHECK_EQ(native_offset, GetNativeOffset(table_index));
-    SetReferences(table_index, references);
-  }
-
- private:
-  size_t TableIndex(uint32_t native_offset) {
-    return NativePcOffsetToReferenceMap::Hash(native_offset) % entries_;
-  }
-
-  uint32_t GetNativeOffset(size_t table_index) {
-    uint32_t native_offset = 0;
-    size_t table_offset = (table_index * EntryWidth()) + sizeof(uint32_t);
-    for (size_t i = 0; i < native_offset_width_; i++) {
-      native_offset |= (*table_)[table_offset + i] << (i * 8);
-    }
-    return native_offset;
-  }
-
-  void SetNativeOffset(size_t table_index, uint32_t native_offset) {
-    size_t table_offset = (table_index * EntryWidth()) + sizeof(uint32_t);
-    for (size_t i = 0; i < native_offset_width_; i++) {
-      (*table_)[table_offset + i] = (native_offset >> (i * 8)) & 0xFF;
-    }
-  }
-
-  void SetReferences(size_t table_index, const uint8_t* references) {
-    size_t table_offset = (table_index * EntryWidth()) + sizeof(uint32_t);
-    memcpy(&(*table_)[table_offset + native_offset_width_], references, references_width_);
-  }
-
-  size_t EntryWidth() const {
-    return native_offset_width_ + references_width_;
-  }
-
-  // Number of entries in the table.
-  const size_t entries_;
-  // Number of bytes used to encode the reference bitmap.
-  const size_t references_width_;
-  // Number of bytes used to encode a native offset.
-  size_t native_offset_width_;
-  // Entries that are in use.
-  std::vector<bool> in_use_;
-  // The table we're building.
-  std::vector<uint8_t>* const table_;
-};
-
 void Mir2Lir::CreateNativeGcMap() {
-  const std::vector<uint32_t>& mapping_table = pc2dex_mapping_table_;
+  DCHECK(!encoded_mapping_table_.empty());
+  MappingTable mapping_table(&encoded_mapping_table_[0]);
   uint32_t max_native_offset = 0;
-  for (size_t i = 0; i < mapping_table.size(); i += 2) {
-    uint32_t native_offset = mapping_table[i + 0];
+  for (auto it = mapping_table.PcToDexBegin(), end = mapping_table.PcToDexEnd(); it != end; ++it) {
+    uint32_t native_offset = it.NativePcOffset();
     if (native_offset > max_native_offset) {
       max_native_offset = native_offset;
     }
   }
   MethodReference method_ref(cu_->dex_file, cu_->method_idx);
-  const std::vector<uint8_t>* gc_map_raw = verifier::MethodVerifier::GetDexGcMap(method_ref);
-  verifier::DexPcToReferenceMap dex_gc_map(&(*gc_map_raw)[4], gc_map_raw->size() - 4);
+  const std::vector<uint8_t>& gc_map_raw =
+      mir_graph_->GetCurrentDexCompilationUnit()->GetVerifiedMethod()->GetDexGcMap();
+  verifier::DexPcToReferenceMap dex_gc_map(&(gc_map_raw)[0]);
+  DCHECK_EQ(gc_map_raw.size(), dex_gc_map.RawSize());
   // Compute native offset to references size.
-  NativePcToReferenceMapBuilder native_gc_map_builder(&native_gc_map_,
-                                                      mapping_table.size() / 2, max_native_offset,
-                                                      dex_gc_map.RegWidth());
+  GcMapBuilder native_gc_map_builder(&native_gc_map_,
+                                     mapping_table.PcToDexSize(),
+                                     max_native_offset, dex_gc_map.RegWidth());
 
-  for (size_t i = 0; i < mapping_table.size(); i += 2) {
-    uint32_t native_offset = mapping_table[i + 0];
-    uint32_t dex_pc = mapping_table[i + 1];
+  for (auto it = mapping_table.PcToDexBegin(), end = mapping_table.PcToDexEnd(); it != end; ++it) {
+    uint32_t native_offset = it.NativePcOffset();
+    uint32_t dex_pc = it.DexPc();
     const uint8_t* references = dex_gc_map.FindBitMap(dex_pc, false);
-    CHECK(references != NULL) << "Missing ref for dex pc 0x" << std::hex << dex_pc;
+    CHECK(references != NULL) << "Missing ref for dex pc 0x" << std::hex << dex_pc <<
+        ": " << PrettyMethod(cu_->method_idx, *cu_->dex_file);
     native_gc_map_builder.AddEntry(native_offset, references);
   }
 }
 
 /* Determine the offset of each literal field */
-int Mir2Lir::AssignLiteralOffset(int offset) {
+int Mir2Lir::AssignLiteralOffset(CodeOffset offset) {
   offset = AssignLiteralOffsetCommon(literal_list_, offset);
-  offset = AssignLiteralOffsetCommon(code_literal_list_, offset);
-  offset = AssignLiteralOffsetCommon(method_literal_list_, offset);
+  unsigned int ptr_size = GetInstructionSetPointerSize(cu_->instruction_set);
+  offset = AssignLiteralPointerOffsetCommon(code_literal_list_, offset, ptr_size);
+  offset = AssignLiteralPointerOffsetCommon(method_literal_list_, offset, ptr_size);
+  offset = AssignLiteralPointerOffsetCommon(class_literal_list_, offset, ptr_size);
   return offset;
 }
 
-int Mir2Lir::AssignSwitchTablesOffset(int offset) {
+int Mir2Lir::AssignSwitchTablesOffset(CodeOffset offset) {
   GrowableArray<SwitchTable*>::Iterator iterator(&switch_tables_);
   while (true) {
-    Mir2Lir::SwitchTable *tab_rec = iterator.Next();
+    Mir2Lir::SwitchTable* tab_rec = iterator.Next();
     if (tab_rec == NULL) break;
     tab_rec->offset = offset;
     if (tab_rec->table[0] == Instruction::kSparseSwitchSignature) {
@@ -678,7 +788,7 @@ int Mir2Lir::AssignSwitchTablesOffset(int offset) {
   return offset;
 }
 
-int Mir2Lir::AssignFillArrayDataOffset(int offset) {
+int Mir2Lir::AssignFillArrayDataOffset(CodeOffset offset) {
   GrowableArray<FillArrayData*>::Iterator iterator(&fill_array_data_);
   while (true) {
     Mir2Lir::FillArrayData *tab_rec = iterator.Next();
@@ -686,127 +796,40 @@ int Mir2Lir::AssignFillArrayDataOffset(int offset) {
     tab_rec->offset = offset;
     offset += tab_rec->size;
     // word align
-    offset = (offset + 3) & ~3;
+    offset = RoundUp(offset, 4);
     }
   return offset;
-}
-
-// LIR offset assignment.
-int Mir2Lir::AssignInsnOffsets() {
-  LIR* lir;
-  int offset = 0;
-
-  for (lir = first_lir_insn_; lir != NULL; lir = NEXT_LIR(lir)) {
-    lir->offset = offset;
-    if (lir->opcode >= 0) {
-      if (!lir->flags.is_nop) {
-        offset += lir->flags.size;
-      }
-    } else if (lir->opcode == kPseudoPseudoAlign4) {
-      if (offset & 0x2) {
-        offset += 2;
-        lir->operands[0] = 1;
-      } else {
-        lir->operands[0] = 0;
-      }
-    }
-    /* Pseudo opcodes don't consume space */
-  }
-
-  return offset;
-}
-
-/*
- * Walk the compilation unit and assign offsets to instructions
- * and literals and compute the total size of the compiled unit.
- */
-void Mir2Lir::AssignOffsets() {
-  int offset = AssignInsnOffsets();
-
-  /* Const values have to be word aligned */
-  offset = (offset + 3) & ~3;
-
-  /* Set up offsets for literals */
-  data_offset_ = offset;
-
-  offset = AssignLiteralOffset(offset);
-
-  offset = AssignSwitchTablesOffset(offset);
-
-  offset = AssignFillArrayDataOffset(offset);
-
-  total_size_ = offset;
-}
-
-/*
- * Go over each instruction in the list and calculate the offset from the top
- * before sending them off to the assembler. If out-of-range branch distance is
- * seen rearrange the instructions a bit to correct it.
- */
-void Mir2Lir::AssembleLIR() {
-  AssignOffsets();
-  int assembler_retries = 0;
-  /*
-   * Assemble here.  Note that we generate code with optimistic assumptions
-   * and if found now to work, we'll have to redo the sequence and retry.
-   */
-
-  while (true) {
-    AssemblerStatus res = AssembleInstructions(0);
-    if (res == kSuccess) {
-      break;
-    } else {
-      assembler_retries++;
-      if (assembler_retries > MAX_ASSEMBLER_RETRIES) {
-        CodegenDump();
-        LOG(FATAL) << "Assembler error - too many retries";
-      }
-      // Redo offsets and try again
-      AssignOffsets();
-      code_buffer_.clear();
-    }
-  }
-
-  // Install literals
-  InstallLiteralPools();
-
-  // Install switch tables
-  InstallSwitchTables();
-
-  // Install fill array data
-  InstallFillArrayData();
-
-  // Create the mapping table and native offset to reference map.
-  CreateMappingTables();
-
-  CreateNativeGcMap();
 }
 
 /*
  * Insert a kPseudoCaseLabel at the beginning of the Dalvik
- * offset vaddr.  This label will be used to fix up the case
- * branch table during the assembly phase.  Be sure to set
- * all resource flags on this to prevent code motion across
- * target boundaries.  KeyVal is just there for debugging.
+ * offset vaddr if pretty-printing, otherise use the standard block
+ * label.  The selected label will be used to fix up the case
+ * branch table during the assembly phase.  All resource flags
+ * are set to prevent code motion.  KeyVal is just there for debugging.
  */
-LIR* Mir2Lir::InsertCaseLabel(int vaddr, int keyVal) {
-  SafeMap<unsigned int, LIR*>::iterator it;
-  it = boundary_map_.find(vaddr);
-  if (it == boundary_map_.end()) {
-    LOG(FATAL) << "Error: didn't find vaddr 0x" << std::hex << vaddr;
+LIR* Mir2Lir::InsertCaseLabel(DexOffset vaddr, int keyVal) {
+  LIR* boundary_lir = &block_label_list_[mir_graph_->FindBlock(vaddr)->id];
+  LIR* res = boundary_lir;
+  if (cu_->verbose) {
+    // Only pay the expense if we're pretty-printing.
+    LIR* new_label = static_cast<LIR*>(arena_->Alloc(sizeof(LIR), kArenaAllocLIR));
+    new_label->dalvik_offset = vaddr;
+    new_label->opcode = kPseudoCaseLabel;
+    new_label->operands[0] = keyVal;
+    new_label->flags.fixup = kFixupLabel;
+    DCHECK(!new_label->flags.use_def_invalid);
+    new_label->u.m.def_mask = &kEncodeAll;
+    InsertLIRAfter(boundary_lir, new_label);
+    res = new_label;
   }
-  LIR* new_label = static_cast<LIR*>(arena_->Alloc(sizeof(LIR), ArenaAllocator::kAllocLIR));
-  new_label->dalvik_offset = vaddr;
-  new_label->opcode = kPseudoCaseLabel;
-  new_label->operands[0] = keyVal;
-  InsertLIRAfter(it->second, new_label);
-  return new_label;
+  return res;
 }
 
-void Mir2Lir::MarkPackedCaseLabels(Mir2Lir::SwitchTable *tab_rec) {
+void Mir2Lir::MarkPackedCaseLabels(Mir2Lir::SwitchTable* tab_rec) {
   const uint16_t* table = tab_rec->table;
-  int base_vaddr = tab_rec->vaddr;
-  const int *targets = reinterpret_cast<const int*>(&table[4]);
+  DexOffset base_vaddr = tab_rec->vaddr;
+  const int32_t *targets = reinterpret_cast<const int32_t*>(&table[4]);
   int entries = table[1];
   int low_key = s4FromSwitchData(&table[2]);
   for (int i = 0; i < entries; i++) {
@@ -814,12 +837,12 @@ void Mir2Lir::MarkPackedCaseLabels(Mir2Lir::SwitchTable *tab_rec) {
   }
 }
 
-void Mir2Lir::MarkSparseCaseLabels(Mir2Lir::SwitchTable *tab_rec) {
+void Mir2Lir::MarkSparseCaseLabels(Mir2Lir::SwitchTable* tab_rec) {
   const uint16_t* table = tab_rec->table;
-  int base_vaddr = tab_rec->vaddr;
+  DexOffset base_vaddr = tab_rec->vaddr;
   int entries = table[1];
-  const int* keys = reinterpret_cast<const int*>(&table[2]);
-  const int* targets = &keys[entries];
+  const int32_t* keys = reinterpret_cast<const int32_t*>(&table[2]);
+  const int32_t* targets = &keys[entries];
   for (int i = 0; i < entries; i++) {
     tab_rec->targets[i] = InsertCaseLabel(base_vaddr + targets[i], keys[i]);
   }
@@ -852,8 +875,8 @@ void Mir2Lir::DumpSparseSwitchTable(const uint16_t* table) {
    */
   uint16_t ident = table[0];
   int entries = table[1];
-  const int* keys = reinterpret_cast<const int*>(&table[2]);
-  const int* targets = &keys[entries];
+  const int32_t* keys = reinterpret_cast<const int32_t*>(&table[2]);
+  const int32_t* targets = &keys[entries];
   LOG(INFO) <<  "Sparse switch table - ident:0x" << std::hex << ident
             << ", entries: " << std::dec << entries;
   for (int i = 0; i < entries; i++) {
@@ -872,7 +895,7 @@ void Mir2Lir::DumpPackedSwitchTable(const uint16_t* table) {
    * Total size is (4+size*2) 16-bit code units.
    */
   uint16_t ident = table[0];
-  const int* targets = reinterpret_cast<const int*>(&table[4]);
+  const int32_t* targets = reinterpret_cast<const int32_t*>(&table[4]);
   int entries = table[1];
   int low_key = s4FromSwitchData(&table[2]);
   LOG(INFO) << "Packed switch table - ident:0x" << std::hex << ident
@@ -883,18 +906,10 @@ void Mir2Lir::DumpPackedSwitchTable(const uint16_t* table) {
   }
 }
 
-/*
- * Set up special LIR to mark a Dalvik byte-code instruction start and
- * record it in the boundary_map.  NOTE: in cases such as kMirOpCheck in
- * which we split a single Dalvik instruction, only the first MIR op
- * associated with a Dalvik PC should be entered into the map.
- */
-LIR* Mir2Lir::MarkBoundary(int offset, const char* inst_str) {
-  LIR* res = NewLIR1(kPseudoDalvikByteCodeBoundary, reinterpret_cast<uintptr_t>(inst_str));
-  if (boundary_map_.find(offset) == boundary_map_.end()) {
-    boundary_map_.Put(offset, res);
-  }
-  return res;
+/* Set up special LIR to mark a Dalvik byte-code instruction start for pretty printing */
+void Mir2Lir::MarkBoundary(DexOffset offset, const char* inst_str) {
+  // NOTE: only used for debug listings.
+  NewLIR1(kPseudoDalvikByteCodeBoundary, WrapPointer(ArenaStrdup(inst_str)));
 }
 
 bool Mir2Lir::EvaluateBranch(Instruction::Code opcode, int32_t src1, int32_t src2) {
@@ -936,54 +951,76 @@ ConditionCode Mir2Lir::FlipComparisonOrder(ConditionCode before) {
   return res;
 }
 
+ConditionCode Mir2Lir::NegateComparison(ConditionCode before) {
+  ConditionCode res;
+  switch (before) {
+    case kCondEq: res = kCondNe; break;
+    case kCondNe: res = kCondEq; break;
+    case kCondLt: res = kCondGe; break;
+    case kCondGt: res = kCondLe; break;
+    case kCondLe: res = kCondGt; break;
+    case kCondGe: res = kCondLt; break;
+    default:
+      res = static_cast<ConditionCode>(0);
+      LOG(FATAL) << "Unexpected ccode " << before;
+  }
+  return res;
+}
+
 // TODO: move to mir_to_lir.cc
 Mir2Lir::Mir2Lir(CompilationUnit* cu, MIRGraph* mir_graph, ArenaAllocator* arena)
     : Backend(arena),
       literal_list_(NULL),
       method_literal_list_(NULL),
+      class_literal_list_(NULL),
       code_literal_list_(NULL),
+      first_fixup_(NULL),
       cu_(cu),
       mir_graph_(mir_graph),
       switch_tables_(arena, 4, kGrowableArraySwitchTables),
       fill_array_data_(arena, 4, kGrowableArrayFillArrayData),
-      throw_launchpads_(arena, 2048, kGrowableArrayThrowLaunchPads),
-      suspend_launchpads_(arena, 4, kGrowableArraySuspendLaunchPads),
-      intrinsic_launchpads_(arena, 2048, kGrowableArrayMisc),
+      tempreg_info_(arena, 20, kGrowableArrayMisc),
+      reginfo_map_(arena, RegStorage::kMaxRegs, kGrowableArrayMisc),
+      pointer_storage_(arena, 128, kGrowableArrayMisc),
       data_offset_(0),
       total_size_(0),
       block_label_list_(NULL),
+      promotion_map_(NULL),
       current_dalvik_offset_(0),
+      estimated_native_code_size_(0),
       reg_pool_(NULL),
       live_sreg_(0),
+      core_vmap_table_(mir_graph->GetArena()->Adapter()),
+      fp_vmap_table_(mir_graph->GetArena()->Adapter()),
       num_core_spills_(0),
       num_fp_spills_(0),
       frame_size_(0),
       core_spill_mask_(0),
       fp_spill_mask_(0),
       first_lir_insn_(NULL),
-      last_lir_insn_(NULL) {
-  promotion_map_ = static_cast<PromotionMap*>
-      (arena_->Alloc((cu_->num_dalvik_registers  + cu_->num_compiler_temps + 1) *
-                      sizeof(promotion_map_[0]), ArenaAllocator::kAllocRegAlloc));
+      last_lir_insn_(NULL),
+      slow_paths_(arena, 32, kGrowableArraySlowPaths),
+      mem_ref_type_(ResourceMask::kHeapRef),
+      mask_cache_(arena) {
+  // Reserve pointer id 0 for NULL.
+  size_t null_idx = WrapPointer(NULL);
+  DCHECK_EQ(null_idx, 0U);
 }
 
 void Mir2Lir::Materialize() {
+  cu_->NewTimingSplit("RegisterAllocation");
   CompilerInitializeRegAlloc();  // Needs to happen after SSA naming
 
   /* Allocate Registers using simple local allocation scheme */
   SimpleRegAlloc();
 
-  if (mir_graph_->IsSpecialCase()) {
-      /*
-       * Custom codegen for special cases.  If for any reason the
-       * special codegen doesn't succeed, first_lir_insn_ will
-       * set to NULL;
-       */
-      SpecialMIR2LIR(mir_graph_->GetSpecialCase());
-    }
+  /* First try the custom light codegen for special cases. */
+  DCHECK(cu_->compiler_driver->GetMethodInlinerMap() != nullptr);
+  bool special_worked = cu_->compiler_driver->GetMethodInlinerMap()->GetMethodInliner(cu_->dex_file)
+      ->GenSpecial(this, cu_->method_idx);
 
-  /* Convert MIR to LIR, etc. */
-  if (first_lir_insn_ == NULL) {
+  /* Take normal path for converting MIR to LIR only if the special codegen did not succeed. */
+  if (special_worked == false) {
     MethodMIR2LIR();
   }
 
@@ -995,54 +1032,82 @@ void Mir2Lir::Materialize() {
     /* Convert LIR into machine code. */
     AssembleLIR();
 
-    if (cu_->verbose) {
+    if ((cu_->enable_debug & (1 << kDebugCodegenDump)) != 0) {
       CodegenDump();
     }
   }
 }
 
 CompiledMethod* Mir2Lir::GetCompiledMethod() {
-  // Combine vmap tables - core regs, then fp regs - into vmap_table
-  std::vector<uint16_t> raw_vmap_table;
-  // Core regs may have been inserted out of order - sort first
-  std::sort(core_vmap_table_.begin(), core_vmap_table_.end());
-  for (size_t i = 0 ; i < core_vmap_table_.size(); ++i) {
-    // Copy, stripping out the phys register sort key
-    raw_vmap_table.push_back(~(-1 << VREG_NUM_WIDTH) & core_vmap_table_[i]);
-  }
-  // If we have a frame, push a marker to take place of lr
+  // Combine vmap tables - core regs, then fp regs - into vmap_table.
+  Leb128EncodingVector vmap_encoder;
   if (frame_size_ > 0) {
-    raw_vmap_table.push_back(INVALID_VREG);
+    // Prefix the encoded data with its size.
+    size_t size = core_vmap_table_.size() + 1 /* marker */ + fp_vmap_table_.size();
+    vmap_encoder.Reserve(size + 1u);  // All values are likely to be one byte in ULEB128 (<128).
+    vmap_encoder.PushBackUnsigned(size);
+    // Core regs may have been inserted out of order - sort first.
+    std::sort(core_vmap_table_.begin(), core_vmap_table_.end());
+    for (size_t i = 0 ; i < core_vmap_table_.size(); ++i) {
+      // Copy, stripping out the phys register sort key.
+      vmap_encoder.PushBackUnsigned(
+          ~(-1 << VREG_NUM_WIDTH) & (core_vmap_table_[i] + VmapTable::kEntryAdjustment));
+    }
+    // Push a marker to take place of lr.
+    vmap_encoder.PushBackUnsigned(VmapTable::kAdjustedFpMarker);
+    if (cu_->instruction_set == kThumb2) {
+      // fp regs already sorted.
+      for (uint32_t i = 0; i < fp_vmap_table_.size(); i++) {
+        vmap_encoder.PushBackUnsigned(fp_vmap_table_[i] + VmapTable::kEntryAdjustment);
+      }
+    } else {
+      // For other platforms regs may have been inserted out of order - sort first.
+      std::sort(fp_vmap_table_.begin(), fp_vmap_table_.end());
+      for (size_t i = 0 ; i < fp_vmap_table_.size(); ++i) {
+        // Copy, stripping out the phys register sort key.
+        vmap_encoder.PushBackUnsigned(
+            ~(-1 << VREG_NUM_WIDTH) & (fp_vmap_table_[i] + VmapTable::kEntryAdjustment));
+      }
+    }
   } else {
-    DCHECK_EQ(__builtin_popcount(core_spill_mask_), 0);
-    DCHECK_EQ(__builtin_popcount(fp_spill_mask_), 0);
+    DCHECK_EQ(POPCOUNT(core_spill_mask_), 0);
+    DCHECK_EQ(POPCOUNT(fp_spill_mask_), 0);
+    DCHECK_EQ(core_vmap_table_.size(), 0u);
+    DCHECK_EQ(fp_vmap_table_.size(), 0u);
+    vmap_encoder.PushBackUnsigned(0u);  // Size is 0.
   }
-  // Combine vmap tables - core regs, then fp regs. fp regs already sorted
-  for (uint32_t i = 0; i < fp_vmap_table_.size(); i++) {
-    raw_vmap_table.push_back(fp_vmap_table_[i]);
-  }
-  UnsignedLeb128EncodingVector vmap_encoder;
-  // Prefix the encoded data with its size.
-  vmap_encoder.PushBack(raw_vmap_table.size());
-  for (uint16_t cur : raw_vmap_table) {
-    vmap_encoder.PushBack(cur);
-  }
+
+  std::unique_ptr<std::vector<uint8_t>> cfi_info(ReturnCallFrameInformation());
   CompiledMethod* result =
-      new CompiledMethod(*cu_->compiler_driver, cu_->instruction_set, code_buffer_, frame_size_,
-                         core_spill_mask_, fp_spill_mask_, encoded_mapping_table_.GetData(),
-                         vmap_encoder.GetData(), native_gc_map_);
+      new CompiledMethod(cu_->compiler_driver, cu_->instruction_set, code_buffer_, frame_size_,
+                         core_spill_mask_, fp_spill_mask_, encoded_mapping_table_,
+                         vmap_encoder.GetData(), native_gc_map_, cfi_info.get());
   return result;
+}
+
+size_t Mir2Lir::GetMaxPossibleCompilerTemps() const {
+  // Chose a reasonably small value in order to contain stack growth.
+  // Backends that are smarter about spill region can return larger values.
+  const size_t max_compiler_temps = 10;
+  return max_compiler_temps;
+}
+
+size_t Mir2Lir::GetNumBytesForCompilerTempSpillRegion() {
+  // By default assume that the Mir2Lir will need one slot for each temporary.
+  // If the backend can better determine temps that have non-overlapping ranges and
+  // temps that do not need spilled, it can actually provide a small region.
+  return (mir_graph_->GetNumUsedCompilerTemps() * sizeof(uint32_t));
 }
 
 int Mir2Lir::ComputeFrameSize() {
   /* Figure out the frame size */
-  static const uint32_t kAlignMask = kStackAlignment - 1;
-  uint32_t size = (num_core_spills_ + num_fp_spills_ +
-                   1 /* filler word */ + cu_->num_regs + cu_->num_outs +
-                   cu_->num_compiler_temps + 1 /* cur_method* */)
-                   * sizeof(uint32_t);
+  uint32_t size = num_core_spills_ * GetBytesPerGprSpillLocation(cu_->instruction_set)
+                  + num_fp_spills_ * GetBytesPerFprSpillLocation(cu_->instruction_set)
+                  + sizeof(uint32_t)  // Filler.
+                  + (cu_->num_regs + cu_->num_outs) * sizeof(uint32_t)
+                  + GetNumBytesForCompilerTempSpillRegion();
   /* Align and set */
-  return (size + kAlignMask) & ~(kAlignMask);
+  return RoundUp(size, kStackAlignment);
 }
 
 /*
@@ -1080,7 +1145,7 @@ void Mir2Lir::InsertLIRBefore(LIR* current_lir, LIR* new_lir) {
 
 /*
  * Insert an LIR instruction after the current instruction, which cannot be the
- * first instruction.
+ * last instruction.
  *
  * current_lir -> new_lir -> old_next
  */
@@ -1091,5 +1156,122 @@ void Mir2Lir::InsertLIRAfter(LIR* current_lir, LIR* new_lir) {
   new_lir->next->prev = new_lir;
 }
 
+bool Mir2Lir::IsPowerOfTwo(uint64_t x) {
+  return (x & (x - 1)) == 0;
+}
+
+// Returns the index of the lowest set bit in 'x'.
+int32_t Mir2Lir::LowestSetBit(uint64_t x) {
+  int bit_posn = 0;
+  while ((x & 0xf) == 0) {
+    bit_posn += 4;
+    x >>= 4;
+  }
+  while ((x & 1) == 0) {
+    bit_posn++;
+    x >>= 1;
+  }
+  return bit_posn;
+}
+
+bool Mir2Lir::BadOverlap(RegLocation rl_src, RegLocation rl_dest) {
+  DCHECK(rl_src.wide);
+  DCHECK(rl_dest.wide);
+  return (abs(mir_graph_->SRegToVReg(rl_src.s_reg_low) - mir_graph_->SRegToVReg(rl_dest.s_reg_low)) == 1);
+}
+
+LIR *Mir2Lir::OpCmpMemImmBranch(ConditionCode cond, RegStorage temp_reg, RegStorage base_reg,
+                                int offset, int check_value, LIR* target, LIR** compare) {
+  // Handle this for architectures that can't compare to memory.
+  LIR* inst = Load32Disp(base_reg, offset, temp_reg);
+  if (compare != nullptr) {
+    *compare = inst;
+  }
+  LIR* branch = OpCmpImmBranch(cond, temp_reg, check_value, target);
+  return branch;
+}
+
+void Mir2Lir::AddSlowPath(LIRSlowPath* slowpath) {
+  slow_paths_.Insert(slowpath);
+}
+
+void Mir2Lir::LoadCodeAddress(const MethodReference& target_method, InvokeType type,
+                              SpecialTargetRegister symbolic_reg) {
+  LIR* data_target = ScanLiteralPoolMethod(code_literal_list_, target_method);
+  if (data_target == NULL) {
+    data_target = AddWordData(&code_literal_list_, target_method.dex_method_index);
+    data_target->operands[1] = WrapPointer(const_cast<DexFile*>(target_method.dex_file));
+    // NOTE: The invoke type doesn't contribute to the literal identity. In fact, we can have
+    // the same method invoked with kVirtual, kSuper and kInterface but the class linker will
+    // resolve these invokes to the same method, so we don't care which one we record here.
+    data_target->operands[2] = type;
+  }
+  // Loads a code pointer. Code from oat file can be mapped anywhere.
+  LIR* load_pc_rel = OpPcRelLoad(TargetPtrReg(symbolic_reg), data_target);
+  AppendLIR(load_pc_rel);
+  DCHECK_NE(cu_->instruction_set, kMips) << reinterpret_cast<void*>(data_target);
+}
+
+void Mir2Lir::LoadMethodAddress(const MethodReference& target_method, InvokeType type,
+                                SpecialTargetRegister symbolic_reg) {
+  LIR* data_target = ScanLiteralPoolMethod(method_literal_list_, target_method);
+  if (data_target == NULL) {
+    data_target = AddWordData(&method_literal_list_, target_method.dex_method_index);
+    data_target->operands[1] = WrapPointer(const_cast<DexFile*>(target_method.dex_file));
+    // NOTE: The invoke type doesn't contribute to the literal identity. In fact, we can have
+    // the same method invoked with kVirtual, kSuper and kInterface but the class linker will
+    // resolve these invokes to the same method, so we don't care which one we record here.
+    data_target->operands[2] = type;
+  }
+  // Loads an ArtMethod pointer, which is a reference as it lives in the heap.
+  LIR* load_pc_rel = OpPcRelLoad(TargetReg(symbolic_reg, kRef), data_target);
+  AppendLIR(load_pc_rel);
+  DCHECK_NE(cu_->instruction_set, kMips) << reinterpret_cast<void*>(data_target);
+}
+
+void Mir2Lir::LoadClassType(uint32_t type_idx, SpecialTargetRegister symbolic_reg) {
+  // Use the literal pool and a PC-relative load from a data word.
+  LIR* data_target = ScanLiteralPool(class_literal_list_, type_idx, 0);
+  if (data_target == nullptr) {
+    data_target = AddWordData(&class_literal_list_, type_idx);
+  }
+  // Loads a Class pointer, which is a reference as it lives in the heap.
+  LIR* load_pc_rel = OpPcRelLoad(TargetReg(symbolic_reg, kRef), data_target);
+  AppendLIR(load_pc_rel);
+}
+
+std::vector<uint8_t>* Mir2Lir::ReturnCallFrameInformation() {
+  // Default case is to do nothing.
+  return nullptr;
+}
+
+RegLocation Mir2Lir::NarrowRegLoc(RegLocation loc) {
+  if (loc.location == kLocPhysReg) {
+    DCHECK(!loc.reg.Is32Bit());
+    if (loc.reg.IsPair()) {
+      RegisterInfo* info_lo = GetRegInfo(loc.reg.GetLow());
+      RegisterInfo* info_hi = GetRegInfo(loc.reg.GetHigh());
+      info_lo->SetIsWide(false);
+      info_hi->SetIsWide(false);
+      loc.reg = info_lo->GetReg();
+    } else {
+      RegisterInfo* info = GetRegInfo(loc.reg);
+      RegisterInfo* info_new = info->FindMatchingView(RegisterInfo::k32SoloStorageMask);
+      DCHECK(info_new != nullptr);
+      if (info->IsLive() && (info->SReg() == loc.s_reg_low)) {
+        info->MarkDead();
+        info_new->MarkLive(loc.s_reg_low);
+      }
+      loc.reg = info_new->GetReg();
+    }
+    DCHECK(loc.reg.Valid());
+  }
+  loc.wide = false;
+  return loc;
+}
+
+void Mir2Lir::GenMachineSpecificExtendedMethodMIR(BasicBlock* bb, MIR* mir) {
+  LOG(FATAL) << "Unknown MIR opcode not supported on this architecture";
+}
 
 }  // namespace art

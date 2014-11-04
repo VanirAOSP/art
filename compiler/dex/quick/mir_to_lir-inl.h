@@ -25,22 +25,25 @@ namespace art {
 
 /* Mark a temp register as dead.  Does not affect allocation state. */
 inline void Mir2Lir::ClobberBody(RegisterInfo* p) {
-  if (p->is_temp) {
-    DCHECK(!(p->live && p->dirty))  << "Live & dirty temp in clobber";
-    p->live = false;
-    p->s_reg = INVALID_SREG;
-    p->def_start = NULL;
-    p->def_end = NULL;
-    if (p->pair) {
-      p->pair = false;
-      Clobber(p->partner);
+  DCHECK(p->IsTemp());
+  if (p->SReg() != INVALID_SREG) {
+    DCHECK(!(p->IsLive() && p->IsDirty()))  << "Live & dirty temp in clobber";
+    p->MarkDead();
+    if (p->IsWide()) {
+      p->SetIsWide(false);
+      if (p->GetReg().NotExactlyEquals(p->Partner())) {
+        // Register pair - deal with the other half.
+        p = GetRegInfo(p->Partner());
+        p->SetIsWide(false);
+        p->MarkDead();
+      }
     }
   }
 }
 
-inline LIR* Mir2Lir::RawLIR(int dalvik_offset, int opcode, int op0,
+inline LIR* Mir2Lir::RawLIR(DexOffset dalvik_offset, int opcode, int op0,
                             int op1, int op2, int op3, int op4, LIR* target) {
-  LIR* insn = static_cast<LIR*>(arena_->Alloc(sizeof(LIR), ArenaAllocator::kAllocLIR));
+  LIR* insn = static_cast<LIR*>(arena_->Alloc(sizeof(LIR), kArenaAllocLIR));
   insn->dalvik_offset = dalvik_offset;
   insn->opcode = opcode;
   insn->operands[0] = op0;
@@ -53,7 +56,8 @@ inline LIR* Mir2Lir::RawLIR(int dalvik_offset, int opcode, int op0,
   if ((opcode == kPseudoTargetLabel) || (opcode == kPseudoSafepointPC) ||
       (opcode == kPseudoExportedPC)) {
     // Always make labels scheduling barriers
-    insn->use_mask = insn->def_mask = ENCODE_ALL;
+    DCHECK(!insn->flags.use_def_invalid);
+    insn->u.m.use_mask = insn->u.m.def_mask = &kEncodeAll;
   }
   return insn;
 }
@@ -63,7 +67,7 @@ inline LIR* Mir2Lir::RawLIR(int dalvik_offset, int opcode, int op0,
  * operands.
  */
 inline LIR* Mir2Lir::NewLIR0(int opcode) {
-  DCHECK(is_pseudo_opcode(opcode) || (GetTargetInstFlags(opcode) & NO_OPERAND))
+  DCHECK(IsPseudoLirOp(opcode) || (GetTargetInstFlags(opcode) & NO_OPERAND))
       << GetTargetInstName(opcode) << " " << opcode << " "
       << PrettyMethod(cu_->method_idx, *cu_->dex_file) << " "
       << current_dalvik_offset_;
@@ -73,7 +77,7 @@ inline LIR* Mir2Lir::NewLIR0(int opcode) {
 }
 
 inline LIR* Mir2Lir::NewLIR1(int opcode, int dest) {
-  DCHECK(is_pseudo_opcode(opcode) || (GetTargetInstFlags(opcode) & IS_UNARY_OP))
+  DCHECK(IsPseudoLirOp(opcode) || (GetTargetInstFlags(opcode) & IS_UNARY_OP))
       << GetTargetInstName(opcode) << " " << opcode << " "
       << PrettyMethod(cu_->method_idx, *cu_->dex_file) << " "
       << current_dalvik_offset_;
@@ -83,7 +87,7 @@ inline LIR* Mir2Lir::NewLIR1(int opcode, int dest) {
 }
 
 inline LIR* Mir2Lir::NewLIR2(int opcode, int dest, int src1) {
-  DCHECK(is_pseudo_opcode(opcode) || (GetTargetInstFlags(opcode) & IS_BINARY_OP))
+  DCHECK(IsPseudoLirOp(opcode) || (GetTargetInstFlags(opcode) & IS_BINARY_OP))
       << GetTargetInstName(opcode) << " " << opcode << " "
       << PrettyMethod(cu_->method_idx, *cu_->dex_file) << " "
       << current_dalvik_offset_;
@@ -92,8 +96,18 @@ inline LIR* Mir2Lir::NewLIR2(int opcode, int dest, int src1) {
   return insn;
 }
 
+inline LIR* Mir2Lir::NewLIR2NoDest(int opcode, int src, int info) {
+  DCHECK(IsPseudoLirOp(opcode) || (GetTargetInstFlags(opcode) & IS_UNARY_OP))
+      << GetTargetInstName(opcode) << " " << opcode << " "
+      << PrettyMethod(cu_->method_idx, *cu_->dex_file) << " "
+      << current_dalvik_offset_;
+  LIR* insn = RawLIR(current_dalvik_offset_, opcode, src, info);
+  AppendLIR(insn);
+  return insn;
+}
+
 inline LIR* Mir2Lir::NewLIR3(int opcode, int dest, int src1, int src2) {
-  DCHECK(is_pseudo_opcode(opcode) || (GetTargetInstFlags(opcode) & IS_TERTIARY_OP))
+  DCHECK(IsPseudoLirOp(opcode) || (GetTargetInstFlags(opcode) & IS_TERTIARY_OP))
       << GetTargetInstName(opcode) << " " << opcode << " "
       << PrettyMethod(cu_->method_idx, *cu_->dex_file) << " "
       << current_dalvik_offset_;
@@ -103,7 +117,7 @@ inline LIR* Mir2Lir::NewLIR3(int opcode, int dest, int src1, int src2) {
 }
 
 inline LIR* Mir2Lir::NewLIR4(int opcode, int dest, int src1, int src2, int info) {
-  DCHECK(is_pseudo_opcode(opcode) || (GetTargetInstFlags(opcode) & IS_QUAD_OP))
+  DCHECK(IsPseudoLirOp(opcode) || (GetTargetInstFlags(opcode) & IS_QUAD_OP))
       << GetTargetInstName(opcode) << " " << opcode << " "
       << PrettyMethod(cu_->method_idx, *cu_->dex_file) << " "
       << current_dalvik_offset_;
@@ -114,7 +128,7 @@ inline LIR* Mir2Lir::NewLIR4(int opcode, int dest, int src1, int src2, int info)
 
 inline LIR* Mir2Lir::NewLIR5(int opcode, int dest, int src1, int src2, int info1,
                              int info2) {
-  DCHECK(is_pseudo_opcode(opcode) || (GetTargetInstFlags(opcode) & IS_QUIN_OP))
+  DCHECK(IsPseudoLirOp(opcode) || (GetTargetInstFlags(opcode) & IS_QUIN_OP))
       << GetTargetInstName(opcode) << " " << opcode << " "
       << PrettyMethod(cu_->method_idx, *cu_->dex_file) << " "
       << current_dalvik_offset_;
@@ -126,8 +140,19 @@ inline LIR* Mir2Lir::NewLIR5(int opcode, int dest, int src1, int src2, int info1
 /*
  * Mark the corresponding bit(s).
  */
-inline void Mir2Lir::SetupRegMask(uint64_t* mask, int reg) {
-  *mask |= GetRegMaskCommon(reg);
+inline void Mir2Lir::SetupRegMask(ResourceMask* mask, int reg) {
+  DCHECK_EQ((reg & ~RegStorage::kRegValMask), 0);
+  DCHECK(reginfo_map_.Get(reg) != nullptr) << "No info for 0x" << reg;
+  *mask = mask->Union(reginfo_map_.Get(reg)->DefUseMask());
+}
+
+/*
+ * Clear the corresponding bit(s).
+ */
+inline void Mir2Lir::ClearRegMask(ResourceMask* mask, int reg) {
+  DCHECK_EQ((reg & ~RegStorage::kRegValMask), 0);
+  DCHECK(reginfo_map_.Get(reg) != nullptr) << "No info for 0x" << reg;
+  *mask = mask->ClearBits(reginfo_map_.Get(reg)->DefUseMask());
 }
 
 /*
@@ -136,24 +161,42 @@ inline void Mir2Lir::SetupRegMask(uint64_t* mask, int reg) {
 inline void Mir2Lir::SetupResourceMasks(LIR* lir) {
   int opcode = lir->opcode;
 
-  if (opcode <= 0) {
-    lir->use_mask = lir->def_mask = 0;
+  if (IsPseudoLirOp(opcode)) {
+    lir->u.m.use_mask = lir->u.m.def_mask = &kEncodeNone;
+    if (opcode != kPseudoBarrier) {
+      lir->flags.fixup = kFixupLabel;
+    }
     return;
   }
 
   uint64_t flags = GetTargetInstFlags(opcode);
 
   if (flags & NEEDS_FIXUP) {
-    lir->flags.pcRelFixup = true;
+    // Note: target-specific setup may specialize the fixup kind.
+    lir->flags.fixup = kFixupLabel;
   }
 
-  /* Get the starting size of the instruction's template */
+  /* Get the starting size of the instruction's template. */
   lir->flags.size = GetInsnSize(lir);
+  estimated_native_code_size_ += lir->flags.size;
 
-  /* Set up the mask for resources that are updated */
+  /* Set up the mask for resources. */
+  ResourceMask use_mask;
+  ResourceMask def_mask;
+
   if (flags & (IS_LOAD | IS_STORE)) {
-    /* Default to heap - will catch specialized classes later */
-    SetMemRefType(lir, flags & IS_LOAD, kHeapRef);
+    /* Set memory reference type (defaults to heap, overridden by ScopedMemRefType). */
+    if (flags & IS_LOAD) {
+      use_mask.SetBit(mem_ref_type_);
+    } else {
+      /* Currently only loads can be marked as kMustNotAlias. */
+      DCHECK(mem_ref_type_ != ResourceMask::kMustNotAlias);
+    }
+    if (flags & IS_STORE) {
+      /* Literals cannot be written to. */
+      DCHECK(mem_ref_type_ != ResourceMask::kLiteral);
+      def_mask.SetBit(mem_ref_type_);
+    }
   }
 
   /*
@@ -161,39 +204,75 @@ inline void Mir2Lir::SetupResourceMasks(LIR* lir) {
    * turn will trash everything.
    */
   if (flags & IS_BRANCH) {
-    lir->def_mask = lir->use_mask = ENCODE_ALL;
+    lir->u.m.def_mask = lir->u.m.use_mask = &kEncodeAll;
     return;
   }
 
   if (flags & REG_DEF0) {
-    SetupRegMask(&lir->def_mask, lir->operands[0]);
+    SetupRegMask(&def_mask, lir->operands[0]);
   }
 
   if (flags & REG_DEF1) {
-    SetupRegMask(&lir->def_mask, lir->operands[1]);
+    SetupRegMask(&def_mask, lir->operands[1]);
   }
 
+  if (flags & REG_DEF2) {
+    SetupRegMask(&def_mask, lir->operands[2]);
+  }
+
+  if (flags & REG_USE0) {
+    SetupRegMask(&use_mask, lir->operands[0]);
+  }
+
+  if (flags & REG_USE1) {
+    SetupRegMask(&use_mask, lir->operands[1]);
+  }
+
+  if (flags & REG_USE2) {
+    SetupRegMask(&use_mask, lir->operands[2]);
+  }
+
+  if (flags & REG_USE3) {
+    SetupRegMask(&use_mask, lir->operands[3]);
+  }
+
+  if (flags & REG_USE4) {
+    SetupRegMask(&use_mask, lir->operands[4]);
+  }
 
   if (flags & SETS_CCODES) {
-    lir->def_mask |= ENCODE_CCODE;
-  }
-
-  if (flags & (REG_USE0 | REG_USE1 | REG_USE2 | REG_USE3)) {
-    int i;
-
-    for (i = 0; i < 4; i++) {
-      if (flags & (1 << (kRegUse0 + i))) {
-        SetupRegMask(&lir->use_mask, lir->operands[i]);
-      }
-    }
+    def_mask.SetBit(ResourceMask::kCCode);
   }
 
   if (flags & USES_CCODES) {
-    lir->use_mask |= ENCODE_CCODE;
+    use_mask.SetBit(ResourceMask::kCCode);
   }
 
   // Handle target-specific actions
-  SetupTargetResourceMasks(lir);
+  SetupTargetResourceMasks(lir, flags, &use_mask, &def_mask);
+
+  lir->u.m.use_mask = mask_cache_.GetMask(use_mask);
+  lir->u.m.def_mask = mask_cache_.GetMask(def_mask);
+}
+
+inline art::Mir2Lir::RegisterInfo* Mir2Lir::GetRegInfo(RegStorage reg) {
+  RegisterInfo* res = reg.IsPair() ? reginfo_map_.Get(reg.GetLowReg()) :
+      reginfo_map_.Get(reg.GetReg());
+  DCHECK(res != nullptr);
+  return res;
+}
+
+inline void Mir2Lir::CheckRegLocation(RegLocation rl) const {
+  if (kFailOnSizeError || kReportSizeError) {
+    CheckRegLocationImpl(rl, kFailOnSizeError, kReportSizeError);
+  }
+}
+
+inline void Mir2Lir::CheckRegStorage(RegStorage rs, WidenessCheck wide, RefCheck ref, FPCheck fp)
+    const {
+  if (kFailOnSizeError || kReportSizeError) {
+    CheckRegStorageImpl(rs, wide, ref, fp, kFailOnSizeError, kReportSizeError);
+  }
 }
 
 }  // namespace art

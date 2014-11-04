@@ -17,6 +17,7 @@
 #ifndef ART_RUNTIME_VERIFIER_METHOD_VERIFIER_H_
 #define ART_RUNTIME_VERIFIER_METHOD_VERIFIER_H_
 
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -28,16 +29,15 @@
 #include "dex_instruction.h"
 #include "instruction_flags.h"
 #include "method_reference.h"
-#include "mirror/object.h"
 #include "reg_type.h"
-#include "reg_type_cache-inl.h"
+#include "reg_type_cache.h"
 #include "register_line.h"
 #include "safe_map.h"
-#include "UniquePtr.h"
 
 namespace art {
 
 struct ReferenceMap2Visitor;
+template<class T> class Handle;
 
 namespace verifier {
 
@@ -125,7 +125,7 @@ class PcToRegisterLineTable {
   }
 
  private:
-  UniquePtr<RegisterLine*[]> register_lines_;
+  std::unique_ptr<RegisterLine*[]> register_lines_;
   size_t size_;
 };
 
@@ -139,20 +139,22 @@ class MethodVerifier {
   };
 
   /* Verify a class. Returns "kNoFailure" on success. */
-  static FailureKind VerifyClass(const mirror::Class* klass, bool allow_soft_failures,
-                                 std::string* error)
+  static FailureKind VerifyClass(mirror::Class* klass, bool allow_soft_failures, std::string* error)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static FailureKind VerifyClass(const DexFile* dex_file, mirror::DexCache* dex_cache,
-                                 mirror::ClassLoader* class_loader,
+  static FailureKind VerifyClass(const DexFile* dex_file, Handle<mirror::DexCache> dex_cache,
+                                 Handle<mirror::ClassLoader> class_loader,
                                  const DexFile::ClassDef* class_def,
                                  bool allow_soft_failures, std::string* error)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  static void VerifyMethodAndDump(std::ostream& os, uint32_t method_idx, const DexFile* dex_file,
-                                  mirror::DexCache* dex_cache, mirror::ClassLoader* class_loader,
-                                  const DexFile::ClassDef* class_def,
-                                  const DexFile::CodeItem* code_item,
-                                  mirror::ArtMethod* method, uint32_t method_access_flags)
+  static MethodVerifier* VerifyMethodAndDump(std::ostream& os, uint32_t method_idx,
+                                             const DexFile* dex_file,
+                                             Handle<mirror::DexCache> dex_cache,
+                                             Handle<mirror::ClassLoader> class_loader,
+                                             const DexFile::ClassDef* class_def,
+                                             const DexFile::CodeItem* code_item,
+                                             mirror::ArtMethod* method,
+                                             uint32_t method_access_flags)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   uint8_t EncodePcToReferenceMapData() const;
@@ -169,10 +171,7 @@ class MethodVerifier {
   std::ostream& Fail(VerifyError error);
 
   // Log for verification information.
-  std::ostream& LogVerifyInfo() {
-    return info_messages_ << "VFY: " << PrettyMethod(dex_method_idx_, *dex_file_)
-                          << '[' << reinterpret_cast<void*>(work_insn_idx_) << "] : ";
-  }
+  std::ostream& LogVerifyInfo();
 
   // Dump the failures encountered by the verifier.
   std::ostream& DumpFailures(std::ostream& os);
@@ -181,20 +180,10 @@ class MethodVerifier {
   // information
   void Dump(std::ostream& os) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  static const std::vector<uint8_t>* GetDexGcMap(MethodReference ref)
-      LOCKS_EXCLUDED(dex_gc_maps_lock_);
-
-  static const MethodReference* GetDevirtMap(const MethodReference& ref, uint32_t dex_pc)
-      LOCKS_EXCLUDED(devirt_maps_lock_);
-
-  // Returns true if the cast can statically be verified to be redundant
-  // by using the check-cast elision peephole optimization in the verifier
-  static bool IsSafeCast(MethodReference ref, uint32_t pc) LOCKS_EXCLUDED(safecast_map_lock_);
-
   // Fills 'monitor_enter_dex_pcs' with the dex pcs of the monitor-enter instructions corresponding
   // to the locks held at 'dex_pc' in method 'm'.
   static void FindLocksAtDexPc(mirror::ArtMethod* m, uint32_t dex_pc,
-                               std::vector<uint32_t>& monitor_enter_dex_pcs)
+                               std::vector<uint32_t>* monitor_enter_dex_pcs)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Returns the accessed field corresponding to the quick instruction's field
@@ -210,23 +199,20 @@ class MethodVerifier {
   static void Init() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void Shutdown();
 
-  static bool IsClassRejected(ClassReference ref)
-      LOCKS_EXCLUDED(rejected_classes_lock_);
-
   bool CanLoadClasses() const {
     return can_load_classes_;
   }
 
-  MethodVerifier(const DexFile* dex_file, mirror::DexCache* dex_cache,
-                 mirror::ClassLoader* class_loader, const DexFile::ClassDef* class_def,
-                 const DexFile::CodeItem* code_item,
-                 uint32_t method_idx, mirror::ArtMethod* method,
-                 uint32_t access_flags, bool can_load_classes, bool allow_soft_failures)
-          SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  MethodVerifier(const DexFile* dex_file, Handle<mirror::DexCache>* dex_cache,
+                 Handle<mirror::ClassLoader>* class_loader, const DexFile::ClassDef* class_def,
+                 const DexFile::CodeItem* code_item, uint32_t method_idx, mirror::ArtMethod* method,
+                 uint32_t access_flags, bool can_load_classes, bool allow_soft_failures,
+                 bool need_precise_constants) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
+      : MethodVerifier(dex_file, dex_cache, class_loader, class_def, code_item, method_idx, method,
+                       access_flags, can_load_classes, allow_soft_failures, need_precise_constants,
+                       false) {}
 
-  ~MethodVerifier() {
-    STLDeleteElements(&failure_messages_);
-  }
+  ~MethodVerifier();
 
   // Run verification on the method. Returns true if verification completes and false if the input
   // has an irrecoverable corruption.
@@ -235,10 +221,33 @@ class MethodVerifier {
   // Describe VRegs at the given dex pc.
   std::vector<int32_t> DescribeVRegs(uint32_t dex_pc);
 
-  static bool IsCandidateForCompilation(MethodReference& method_ref,
-                                        const uint32_t access_flags);
+  static void VisitStaticRoots(RootCallback* callback, void* arg)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void VisitRoots(RootCallback* callback, void* arg) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  // Accessors used by the compiler via CompilerCallback
+  const DexFile::CodeItem* CodeItem() const;
+  RegisterLine* GetRegLine(uint32_t dex_pc);
+  const InstructionFlags& GetInstructionFlags(size_t index) const;
+  mirror::ClassLoader* GetClassLoader() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  mirror::DexCache* GetDexCache() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  MethodReference GetMethodReference() const;
+  uint32_t GetAccessFlags() const;
+  bool HasCheckCasts() const;
+  bool HasVirtualOrInterfaceInvokes() const;
+  bool HasFailures() const;
+  RegType& ResolveCheckedClass(uint32_t class_idx)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  private:
+  // Private constructor for dumping.
+  MethodVerifier(const DexFile* dex_file, Handle<mirror::DexCache>* dex_cache,
+                 Handle<mirror::ClassLoader>* class_loader, const DexFile::ClassDef* class_def,
+                 const DexFile::CodeItem* code_item, uint32_t method_idx, mirror::ArtMethod* method,
+                 uint32_t access_flags, bool can_load_classes, bool allow_soft_failures,
+                 bool need_precise_constants, bool verify_to_dump)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
   // Adds the given string to the beginning of the last failure message.
   void PrependToLastFailMessage(std::string);
 
@@ -257,13 +266,13 @@ class MethodVerifier {
    *      for code flow problems.
    */
   static FailureKind VerifyMethod(uint32_t method_idx, const DexFile* dex_file,
-                                  mirror::DexCache* dex_cache,
-                                  mirror::ClassLoader* class_loader,
+                                  Handle<mirror::DexCache> dex_cache,
+                                  Handle<mirror::ClassLoader> class_loader,
                                   const DexFile::ClassDef* class_def_idx,
                                   const DexFile::CodeItem* code_item,
                                   mirror::ArtMethod* method, uint32_t method_access_flags,
-                                  bool allow_soft_failures)
-          SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+                                  bool allow_soft_failures, bool need_precise_constants)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   void FindLocksAtDexPc() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
@@ -349,7 +358,7 @@ class MethodVerifier {
   /* Ensure that the wide register index is valid for this code item. */
   bool CheckWideRegisterIndex(uint32_t idx);
 
-  // Perform static checks on a field get or set instruction. All we do here is ensure that the
+  // Perform static checks on a field Get or set instruction. All we do here is ensure that the
   // field index is in the valid range.
   bool CheckFieldIndex(uint32_t idx);
 
@@ -476,55 +485,55 @@ class MethodVerifier {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Helper to perform verification on puts of primitive type.
-  void VerifyPrimitivePut(const RegType& target_type, const RegType& insn_type,
+  void VerifyPrimitivePut(RegType& target_type, RegType& insn_type,
                           const uint32_t vregA) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Perform verification of an aget instruction. The destination register's type will be set to
   // be that of component type of the array unless the array type is unknown, in which case a
   // bottom type inferred from the type of instruction is used. is_primitive is false for an
   // aget-object.
-  void VerifyAGet(const Instruction* inst, const RegType& insn_type,
+  void VerifyAGet(const Instruction* inst, RegType& insn_type,
                   bool is_primitive) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Perform verification of an aput instruction.
-  void VerifyAPut(const Instruction* inst, const RegType& insn_type,
+  void VerifyAPut(const Instruction* inst, RegType& insn_type,
                   bool is_primitive) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Lookup instance field and fail for resolution violations
-  mirror::ArtField* GetInstanceField(const RegType& obj_type, int field_idx)
+  mirror::ArtField* GetInstanceField(RegType& obj_type, int field_idx)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Lookup static field and fail for resolution violations
   mirror::ArtField* GetStaticField(int field_idx) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Perform verification of an iget or sget instruction.
-  void VerifyISGet(const Instruction* inst, const RegType& insn_type,
+  void VerifyISGet(const Instruction* inst, RegType& insn_type,
                    bool is_primitive, bool is_static)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Perform verification of an iput or sput instruction.
-  void VerifyISPut(const Instruction* inst, const RegType& insn_type,
+  void VerifyISPut(const Instruction* inst, RegType& insn_type,
                    bool is_primitive, bool is_static)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  // Returns the access field of a quick field access (iget/iput-quick) or NULL
+  // Returns the access field of a quick field access (iget/iput-quick) or nullptr
   // if it cannot be found.
   mirror::ArtField* GetQuickFieldAccess(const Instruction* inst, RegisterLine* reg_line)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Perform verification of an iget-quick instruction.
-  void VerifyIGetQuick(const Instruction* inst, const RegType& insn_type,
+  void VerifyIGetQuick(const Instruction* inst, RegType& insn_type,
                        bool is_primitive)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Perform verification of an iput-quick instruction.
-  void VerifyIPutQuick(const Instruction* inst, const RegType& insn_type,
+  void VerifyIPutQuick(const Instruction* inst, RegType& insn_type,
                        bool is_primitive)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Resolves a class based on an index and performs access checks to ensure the referrer can
   // access the resolved class.
-  const RegType& ResolveClassAndCheckAccess(uint32_t class_idx)
+  RegType& ResolveClassAndCheckAccess(uint32_t class_idx)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   /*
@@ -532,7 +541,7 @@ class MethodVerifier {
    * address, determine the Join of all exceptions that can land here. Fails if no matching
    * exception handler can be found or if the Join of exception types fails.
    */
-  const RegType& GetCaughtExceptionType()
+  RegType& GetCaughtExceptionType()
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   /*
@@ -562,12 +571,24 @@ class MethodVerifier {
    * Widening conversions on integers and references are allowed, but
    * narrowing conversions are not.
    *
-   * Returns the resolved method on success, NULL on failure (with *failure
+   * Returns the resolved method on success, nullptr on failure (with *failure
    * set appropriately).
    */
   mirror::ArtMethod* VerifyInvocationArgs(const Instruction* inst,
                                           MethodType method_type,
                                           bool is_range, bool is_super)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  // Similar checks to the above, but on the proto. Will be used when the method cannot be
+  // resolved.
+  void VerifyInvocationArgsUnresolvedMethod(const Instruction* inst, MethodType method_type,
+                                            bool is_range)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  template <class T>
+  mirror::ArtMethod* VerifyInvocationArgsFromIterator(T* it, const Instruction* inst,
+                                                      MethodType method_type, bool is_range,
+                                                      mirror::ArtMethod* res_method)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   mirror::ArtMethod* GetQuickInvokedMethod(const Instruction* inst,
@@ -588,9 +609,11 @@ class MethodVerifier {
   /*
   * Control can transfer to "next_insn". Merge the registers from merge_line into the table at
   * next_insn, and set the changed flag on the target address if any of the registers were changed.
+  * In the case of fall-through, update the merge line on a change as its the working line for the
+  * next instruction.
   * Returns "false" if an error is encountered.
   */
-  bool UpdateRegisters(uint32_t next_insn, const RegisterLine* merge_line)
+  bool UpdateRegisters(uint32_t next_insn, RegisterLine* merge_line, bool update_merge_line)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Is the method being verified a constructor?
@@ -604,98 +627,49 @@ class MethodVerifier {
   }
 
   // Return the register type for the method.
-  const RegType& GetMethodReturnType() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  RegType& GetMethodReturnType() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Get a type representing the declaring class of the method.
-  const RegType& GetDeclaringClass() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  /*
-   * Generate the GC map for a method that has just been verified (i.e. we're doing this as part of
-   * verification). For type-precise determination we have all the data we need, so we just need to
-   * encode it in some clever fashion.
-   * Returns a pointer to a newly-allocated RegisterMap, or NULL on failure.
-   */
-  const std::vector<uint8_t>* GenerateLengthPrefixedGcMap();
-
-  // Verify that the GC map associated with method_ is well formed
-  void VerifyLengthPrefixedGcMap(const std::vector<uint8_t>& data);
-
-  // Compute sizes for GC map data
-  void ComputeGcMapSizes(size_t* gc_points, size_t* ref_bitmap_bits, size_t* log2_max_gc_pc);
+  RegType& GetDeclaringClass() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   InstructionFlags* CurrentInsnFlags();
 
-  // All the GC maps that the verifier has created
-  typedef SafeMap<const MethodReference, const std::vector<uint8_t>*,
-      MethodReferenceComparator> DexGcMapTable;
-  static ReaderWriterMutex* dex_gc_maps_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
-  static DexGcMapTable* dex_gc_maps_ GUARDED_BY(dex_gc_maps_lock_);
-  static void SetDexGcMap(MethodReference ref, const std::vector<uint8_t>* dex_gc_map)
-      LOCKS_EXCLUDED(dex_gc_maps_lock_);
-
-
-  // Cast elision types.
-  typedef std::set<uint32_t> MethodSafeCastSet;
-  typedef SafeMap<const MethodReference, const MethodSafeCastSet*,
-      MethodReferenceComparator> SafeCastMap;
-  MethodVerifier::MethodSafeCastSet* GenerateSafeCastSet()
+  RegType& DetermineCat1Constant(int32_t value, bool precise)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static void SetSafeCastMap(MethodReference ref, const MethodSafeCastSet* mscs);
-      LOCKS_EXCLUDED(safecast_map_lock_);
-  static ReaderWriterMutex* safecast_map_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
-  static SafeCastMap* safecast_map_ GUARDED_BY(safecast_map_lock_);
-
-  // Devirtualization map.
-  typedef SafeMap<const uint32_t, MethodReference> PcToConcreteMethodMap;
-  typedef SafeMap<const MethodReference, const PcToConcreteMethodMap*,
-      MethodReferenceComparator> DevirtualizationMapTable;
-  MethodVerifier::PcToConcreteMethodMap* GenerateDevirtMap()
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  static ReaderWriterMutex* devirt_maps_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
-  static DevirtualizationMapTable* devirt_maps_ GUARDED_BY(devirt_maps_lock_);
-  static void SetDevirtMap(MethodReference ref,
-                           const PcToConcreteMethodMap* pc_method_map)
-        LOCKS_EXCLUDED(devirt_maps_lock_);
-  typedef std::set<ClassReference> RejectedClassesTable;
-  static ReaderWriterMutex* rejected_classes_lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
-  static RejectedClassesTable* rejected_classes_ GUARDED_BY(rejected_classes_lock_);
-
-  static void AddRejectedClass(ClassReference ref)
-      LOCKS_EXCLUDED(rejected_classes_lock_);
 
   RegTypeCache reg_types_;
 
   PcToRegisterLineTable reg_table_;
 
   // Storage for the register status we're currently working on.
-  UniquePtr<RegisterLine> work_line_;
+  std::unique_ptr<RegisterLine> work_line_;
 
   // The address of the instruction we're currently working on, note that this is in 2 byte
   // quantities
   uint32_t work_insn_idx_;
 
   // Storage for the register status we're saving for later.
-  UniquePtr<RegisterLine> saved_line_;
+  std::unique_ptr<RegisterLine> saved_line_;
 
   const uint32_t dex_method_idx_;  // The method we're working on.
   // Its object representation if known.
   mirror::ArtMethod* mirror_method_ GUARDED_BY(Locks::mutator_lock_);
   const uint32_t method_access_flags_;  // Method's access flags.
+  RegType* return_type_;  // Lazily computed return type of the method.
   const DexFile* const dex_file_;  // The dex file containing the method.
   // The dex_cache for the declaring class of the method.
-  mirror::DexCache* dex_cache_ GUARDED_BY(Locks::mutator_lock_);
+  Handle<mirror::DexCache>* dex_cache_ GUARDED_BY(Locks::mutator_lock_);
   // The class loader for the declaring class of the method.
-  mirror::ClassLoader* class_loader_ GUARDED_BY(Locks::mutator_lock_);
+  Handle<mirror::ClassLoader>* class_loader_ GUARDED_BY(Locks::mutator_lock_);
   const DexFile::ClassDef* const class_def_;  // The class def of the declaring class of the method.
   const DexFile::CodeItem* const code_item_;  // The code item containing the code for the method.
-  const RegType* declaring_class_;  // Lazily computed reg type of the method's declaring class.
+  RegType* declaring_class_;  // Lazily computed reg type of the method's declaring class.
   // Instruction widths and flags, one entry per code unit.
-  UniquePtr<InstructionFlags[]> insn_flags_;
+  std::unique_ptr<InstructionFlags[]> insn_flags_;
   // The dex PC of a FindLocksAtDexPc request, -1 otherwise.
   uint32_t interesting_dex_pc_;
   // The container into which FindLocksAtDexPc should write the registers containing held locks,
-  // NULL if we're not doing FindLocksAtDexPc.
+  // nullptr if we're not doing FindLocksAtDexPc.
   std::vector<uint32_t>* monitor_enter_dex_pcs_;
 
   // The types of any error that occurs.
@@ -723,12 +697,25 @@ class MethodVerifier {
   // running and the verifier is called from the class linker.
   const bool allow_soft_failures_;
 
-  // Indicates if the method being verified contains at least one check-cast instruction.
+  // An optimization where instead of generating unique RegTypes for constants we use imprecise
+  // constants that cover a range of constants. This isn't good enough for deoptimization that
+  // avoids loading from registers in the case of a constant as the dex instruction set lost the
+  // notion of whether a value should be in a floating point or general purpose register file.
+  const bool need_precise_constants_;
+
+  // Indicates the method being verified contains at least one check-cast or aput-object
+  // instruction. Aput-object operations implicitly check for array-store exceptions, similar to
+  // check-cast.
   bool has_check_casts_;
 
-  // Indicates if the method being verified contains at least one invoke-virtual/range
+  // Indicates the method being verified contains at least one invoke-virtual/range
   // or invoke-interface/range.
   bool has_virtual_or_interface_invokes_;
+
+  // Indicates whether we verify to dump the info. In that case we accept quickened instructions
+  // even though we might detect to be a compiler. Should only be set when running
+  // VerifyMethodAndDump.
+  const bool verify_to_dump_;
 };
 std::ostream& operator<<(std::ostream& os, const MethodVerifier::FailureKind& rhs);
 

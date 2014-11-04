@@ -27,127 +27,412 @@ namespace art {
    * interesting orders.  Note that for efficiency, the visit orders have been pre-computed.
    * The order itself will not change during the iteration.  However, for some uses,
    * auxiliary data associated with the basic blocks may be changed during the iteration,
-   * necessitating another pass over the list.
-   *
-   * To support this usage, we have is_iterative_.  If false, the iteration is a one-shot
-   * pass through the pre-computed list using Next().  If true, the caller must tell the
-   * iterator whether a change has been made that necessitates another pass.  Use
-   * Next(had_change) for this.  The general idea is that the iterative_ use case means
-   * that the iterator will keep repeating the full basic block list until a complete pass
-   * is made through it with no changes.  Note that calling Next(true) does not affect
-   * the iteration order or short-curcuit the current pass - it simply tells the iterator
-   * that once it has finished walking through the block list it should reset and do another
-   * full pass through the list.
+   * necessitating another pass over the list.  If this behavior is required, use the
+   * "Repeating" variant.  For the repeating variant, the caller must tell the iterator
+   * whether a change has been made that necessitates another pass.  Note that calling Next(true)
+   * does not affect the iteration order or short-circuit the current pass - it simply tells
+   * the iterator that once it has finished walking through the block list it should reset and
+   * do another full pass through the list.
+   */
+  /**
+   * @class DataflowIterator
+   * @brief The main iterator class, all other iterators derive of this one to define an iteration order.
    */
   class DataflowIterator {
     public:
       virtual ~DataflowIterator() {}
 
-      // Return the next BasicBlock* to visit.
-      BasicBlock* Next() {
-        DCHECK(!is_iterative_);
-        return NextBody(false);
-      }
-
-      /*
-       * Return the next BasicBlock* to visit, and tell the iterator whether any change
-       * has occurred that requires another full pass over the block list.
+      /**
+       * @brief How many times have we repeated the iterator across the BasicBlocks?
+       * @return the number of iteration repetitions.
        */
-      BasicBlock* Next(bool had_change) {
-        DCHECK(is_iterative_);
-        return NextBody(had_change);
-      }
+      int32_t GetRepeatCount() { return repeats_; }
+
+      /**
+       * @brief Has the user of the iterator reported a change yet?
+       * @details Does not mean there was or not a change, it is only whether the user passed a true to the Next function call.
+       * @return whether the user of the iterator reported a change yet.
+       */
+      int32_t GetChanged() { return changed_; }
+
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) = 0;
 
     protected:
-      DataflowIterator(MIRGraph* mir_graph, bool is_iterative, int start_idx, int end_idx,
-                       bool reverse)
+      /**
+       * @param mir_graph the MIRGraph we are interested in.
+       * @param start_idx the first index we want to iterate across.
+       * @param end_idx the last index we want to iterate (not included).
+       */
+      DataflowIterator(MIRGraph* mir_graph, int32_t start_idx, int32_t end_idx)
           : mir_graph_(mir_graph),
-            is_iterative_(is_iterative),
             start_idx_(start_idx),
             end_idx_(end_idx),
-            reverse_(reverse),
             block_id_list_(NULL),
             idx_(0),
+            repeats_(0),
             changed_(false) {}
 
-      virtual BasicBlock* NextBody(bool had_change) ALWAYS_INLINE;
+      /**
+       * @brief Get the next BasicBlock iterating forward.
+       * @return the next BasicBlock iterating forward.
+       */
+      virtual BasicBlock* ForwardSingleNext() ALWAYS_INLINE;
 
-      MIRGraph* const mir_graph_;
-      const bool is_iterative_;
-      const int start_idx_;
-      const int end_idx_;
-      const bool reverse_;
-      GrowableArray<int>* block_id_list_;
-      int idx_;
-      bool changed_;
+      /**
+       * @brief Get the next BasicBlock iterating backward.
+       * @return the next BasicBlock iterating backward.
+       */
+      virtual BasicBlock* ReverseSingleNext() ALWAYS_INLINE;
+
+      /**
+       * @brief Get the next BasicBlock iterating forward, restart if a BasicBlock was reported changed during the last iteration.
+       * @return the next BasicBlock iterating forward, with chance of repeating the iteration.
+       */
+      virtual BasicBlock* ForwardRepeatNext() ALWAYS_INLINE;
+
+      /**
+       * @brief Get the next BasicBlock iterating backward, restart if a BasicBlock was reported changed during the last iteration.
+       * @return the next BasicBlock iterating backward, with chance of repeating the iteration.
+       */
+      virtual BasicBlock* ReverseRepeatNext() ALWAYS_INLINE;
+
+      MIRGraph* const mir_graph_;                       /**< @brief the MIRGraph */
+      const int32_t start_idx_;                         /**< @brief the start index for the iteration */
+      const int32_t end_idx_;                           /**< @brief the last index for the iteration */
+      GrowableArray<BasicBlockId>* block_id_list_;      /**< @brief the list of BasicBlocks we want to iterate on */
+      int32_t idx_;                                     /**< @brief Current index for the iterator */
+      int32_t repeats_;                                 /**< @brief Number of repeats over the iteration */
+      bool changed_;                                    /**< @brief Has something changed during the current iteration? */
   };  // DataflowIterator
 
-  class ReachableNodesIterator : public DataflowIterator {
-    public:
-      ReachableNodesIterator(MIRGraph* mir_graph, bool is_iterative)
-          : DataflowIterator(mir_graph, is_iterative, 0,
-                             mir_graph->GetNumReachableBlocks(), false) {
-        idx_ = start_idx_;
-        block_id_list_ = mir_graph->GetDfsOrder();
-      }
-  };
-
+  /**
+   * @class PreOrderDfsIterator
+   * @brief Used to perform a Pre-order Depth-First-Search Iteration of a MIRGraph.
+   */
   class PreOrderDfsIterator : public DataflowIterator {
     public:
-      PreOrderDfsIterator(MIRGraph* mir_graph, bool is_iterative)
-          : DataflowIterator(mir_graph, is_iterative, 0,
-                             mir_graph->GetNumReachableBlocks(), false) {
+      /**
+       * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+       * @param mir_graph The MIRGraph considered.
+       */
+      explicit PreOrderDfsIterator(MIRGraph* mir_graph)
+          : DataflowIterator(mir_graph, 0, mir_graph->GetNumReachableBlocks()) {
+        // Extra setup for the PreOrderDfsIterator.
         idx_ = start_idx_;
         block_id_list_ = mir_graph->GetDfsOrder();
       }
-  };
 
-  class PostOrderDfsIterator : public DataflowIterator {
-    public:
-      PostOrderDfsIterator(MIRGraph* mir_graph, bool is_iterative)
-          : DataflowIterator(mir_graph, is_iterative, 0,
-                             mir_graph->GetNumReachableBlocks(), false) {
-        idx_ = start_idx_;
-        block_id_list_ = mir_graph->GetDfsPostOrder();
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) {
+        // Update changed: if had_changed is true, we remember it for the whole iteration.
+        changed_ |= had_change;
+
+        return ForwardSingleNext();
       }
   };
 
+  /**
+   * @class RepeatingPreOrderDfsIterator
+   * @brief Used to perform a Repeating Pre-order Depth-First-Search Iteration of a MIRGraph.
+   * @details If there is a change during an iteration, the iteration starts over at the end of the iteration.
+   */
+  class RepeatingPreOrderDfsIterator : public DataflowIterator {
+    public:
+      /**
+       * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+       * @param mir_graph The MIRGraph considered.
+       */
+      explicit RepeatingPreOrderDfsIterator(MIRGraph* mir_graph)
+          : DataflowIterator(mir_graph, 0, mir_graph->GetNumReachableBlocks()) {
+        // Extra setup for the RepeatingPreOrderDfsIterator.
+        idx_ = start_idx_;
+        block_id_list_ = mir_graph->GetDfsOrder();
+      }
+
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) {
+        // Update changed: if had_changed is true, we remember it for the whole iteration.
+        changed_ |= had_change;
+
+        return ForwardRepeatNext();
+      }
+  };
+
+  /**
+   * @class RepeatingPostOrderDfsIterator
+   * @brief Used to perform a Repeating Post-order Depth-First-Search Iteration of a MIRGraph.
+   * @details If there is a change during an iteration, the iteration starts over at the end of the iteration.
+   */
+  class RepeatingPostOrderDfsIterator : public DataflowIterator {
+    public:
+      /**
+       * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+       * @param mir_graph The MIRGraph considered.
+       */
+      explicit RepeatingPostOrderDfsIterator(MIRGraph* mir_graph)
+          : DataflowIterator(mir_graph, 0, mir_graph->GetNumReachableBlocks()) {
+        // Extra setup for the RepeatingPostOrderDfsIterator.
+        idx_ = start_idx_;
+        block_id_list_ = mir_graph->GetDfsPostOrder();
+      }
+
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) {
+        // Update changed: if had_changed is true, we remember it for the whole iteration.
+        changed_ |= had_change;
+
+        return ForwardRepeatNext();
+      }
+  };
+
+  /**
+   * @class ReversePostOrderDfsIterator
+   * @brief Used to perform a Reverse Post-order Depth-First-Search Iteration of a MIRGraph.
+   */
   class ReversePostOrderDfsIterator : public DataflowIterator {
     public:
-      ReversePostOrderDfsIterator(MIRGraph* mir_graph, bool is_iterative)
-          : DataflowIterator(mir_graph, is_iterative,
-                             mir_graph->GetNumReachableBlocks() -1, 0, true) {
+      /**
+       * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+       * @param mir_graph The MIRGraph considered.
+       */
+      explicit ReversePostOrderDfsIterator(MIRGraph* mir_graph)
+          : DataflowIterator(mir_graph, mir_graph->GetNumReachableBlocks() -1, 0) {
+        // Extra setup for the ReversePostOrderDfsIterator.
         idx_ = start_idx_;
         block_id_list_ = mir_graph->GetDfsPostOrder();
       }
+
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) {
+        // Update changed: if had_changed is true, we remember it for the whole iteration.
+        changed_ |= had_change;
+
+        return ReverseSingleNext();
+      }
   };
 
+  /**
+   * @class ReversePostOrderDfsIterator
+   * @brief Used to perform a Repeating Reverse Post-order Depth-First-Search Iteration of a MIRGraph.
+   * @details If there is a change during an iteration, the iteration starts over at the end of the iteration.
+   */
+  class RepeatingReversePostOrderDfsIterator : public DataflowIterator {
+    public:
+      /**
+       * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+       * @param mir_graph The MIRGraph considered.
+       */
+      explicit RepeatingReversePostOrderDfsIterator(MIRGraph* mir_graph)
+          : DataflowIterator(mir_graph, mir_graph->GetNumReachableBlocks() -1, 0) {
+        // Extra setup for the RepeatingReversePostOrderDfsIterator
+        idx_ = start_idx_;
+        block_id_list_ = mir_graph->GetDfsPostOrder();
+      }
+
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) {
+        // Update changed: if had_changed is true, we remember it for the whole iteration.
+        changed_ |= had_change;
+
+        return ReverseRepeatNext();
+      }
+  };
+
+  /**
+   * @class PostOrderDOMIterator
+   * @brief Used to perform a Post-order Domination Iteration of a MIRGraph.
+   */
   class PostOrderDOMIterator : public DataflowIterator {
     public:
-      PostOrderDOMIterator(MIRGraph* mir_graph, bool is_iterative)
-          : DataflowIterator(mir_graph, is_iterative, 0,
-                             mir_graph->GetNumReachableBlocks(), false) {
+      /**
+       * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+       * @param mir_graph The MIRGraph considered.
+       */
+      explicit PostOrderDOMIterator(MIRGraph* mir_graph)
+          : DataflowIterator(mir_graph, 0, mir_graph->GetNumReachableBlocks()) {
+        // Extra setup for thePostOrderDOMIterator.
         idx_ = start_idx_;
         block_id_list_ = mir_graph->GetDomPostOrder();
       }
+
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) {
+        // Update changed: if had_changed is true, we remember it for the whole iteration.
+        changed_ |= had_change;
+
+        return ForwardSingleNext();
+      }
   };
 
+  /**
+   * @class AllNodesIterator
+   * @brief Used to perform an iteration on all the BasicBlocks a MIRGraph.
+   */
   class AllNodesIterator : public DataflowIterator {
     public:
-      AllNodesIterator(MIRGraph* mir_graph, bool is_iterative)
-          : DataflowIterator(mir_graph, is_iterative, 0, 0, false) {
-        all_nodes_iterator_ =
-            new (mir_graph->GetArena()) GrowableArray<BasicBlock*>::Iterator(mir_graph->GetBlockList());
+      /**
+       * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+       * @param mir_graph The MIRGraph considered.
+       */
+      explicit AllNodesIterator(MIRGraph* mir_graph)
+          : DataflowIterator(mir_graph, 0, 0),
+            all_nodes_iterator_(mir_graph->GetBlockList()) {
       }
 
+      /**
+       * @brief Resetting the iterator.
+       */
       void Reset() {
-        all_nodes_iterator_->Reset();
+        all_nodes_iterator_.Reset();
       }
 
-      BasicBlock* NextBody(bool had_change) ALWAYS_INLINE;
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) ALWAYS_INLINE;
 
     private:
-      GrowableArray<BasicBlock*>::Iterator* all_nodes_iterator_;
+      GrowableArray<BasicBlock*>::Iterator all_nodes_iterator_;    /**< @brief The list of all the nodes */
+  };
+
+  /**
+   * @class TopologicalSortIterator
+   * @brief Used to perform a Topological Sort Iteration of a MIRGraph.
+   */
+  class TopologicalSortIterator : public DataflowIterator {
+    public:
+      /**
+       * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+       * @param mir_graph The MIRGraph considered.
+       */
+      explicit TopologicalSortIterator(MIRGraph* mir_graph)
+          : DataflowIterator(mir_graph, 0, mir_graph->GetTopologicalSortOrder()->Size()) {
+        // Extra setup for TopologicalSortIterator.
+        idx_ = start_idx_;
+        block_id_list_ = mir_graph->GetTopologicalSortOrder();
+      }
+
+      /**
+       * @brief Get the next BasicBlock depending on iteration order.
+       * @param had_change did the user of the iteration change the previous BasicBlock.
+       * @return the next BasicBlock following the iteration order, 0 if finished.
+       */
+      virtual BasicBlock* Next(bool had_change = false) {
+        // Update changed: if had_changed is true, we remember it for the whole iteration.
+        changed_ |= had_change;
+
+        return ForwardSingleNext();
+      }
+  };
+
+  /**
+   * @class RepeatingTopologicalSortIterator
+   * @brief Used to perform a Topological Sort Iteration of a MIRGraph.
+   * @details If there is a change during an iteration, the iteration starts over at the end of the
+   *          iteration.
+   */
+  class RepeatingTopologicalSortIterator : public DataflowIterator {
+    public:
+     /**
+      * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+      * @param mir_graph The MIRGraph considered.
+      */
+     explicit RepeatingTopologicalSortIterator(MIRGraph* mir_graph)
+         : DataflowIterator(mir_graph, 0, mir_graph->GetTopologicalSortOrder()->Size()) {
+       // Extra setup for RepeatingTopologicalSortIterator.
+       idx_ = start_idx_;
+       block_id_list_ = mir_graph->GetTopologicalSortOrder();
+     }
+
+     /**
+      * @brief Get the next BasicBlock depending on iteration order.
+      * @param had_change did the user of the iteration change the previous BasicBlock.
+      * @return the next BasicBlock following the iteration order, 0 if finished.
+      */
+     virtual BasicBlock* Next(bool had_change = false) {
+       // Update changed: if had_changed is true, we remember it for the whole iteration.
+       changed_ |= had_change;
+
+       return ForwardRepeatNext();
+     }
+  };
+
+  /**
+   * @class LoopRepeatingTopologicalSortIterator
+   * @brief Used to perform a Topological Sort Iteration of a MIRGraph, repeating loops as needed.
+   * @details The iterator uses the visited flags to keep track of the blocks that need
+   * recalculation and keeps a stack of loop heads in the MIRGraph. At the end of the loop
+   * it returns back to the loop head if it needs to be recalculated. Due to the use of
+   * the visited flags and the loop head stack in the MIRGraph, it's not possible to use
+   * two iterators at the same time or modify this data during iteration (though inspection
+   * of this data is allowed and sometimes even expected).
+   *
+   * NOTE: This iterator is not suitable for passes that need to propagate changes to
+   * predecessors, such as type inferrence.
+   */
+  class LoopRepeatingTopologicalSortIterator : public DataflowIterator {
+    public:
+     /**
+      * @brief The constructor, using all of the reachable blocks of the MIRGraph.
+      * @param mir_graph The MIRGraph considered.
+      */
+     explicit LoopRepeatingTopologicalSortIterator(MIRGraph* mir_graph)
+         : DataflowIterator(mir_graph, 0, mir_graph->GetTopologicalSortOrder()->Size()),
+           loop_ends_(mir_graph->GetTopologicalSortOrderLoopEnds()),
+           loop_head_stack_(mir_graph_->GetTopologicalSortOrderLoopHeadStack()) {
+       // Extra setup for RepeatingTopologicalSortIterator.
+       idx_ = start_idx_;
+       block_id_list_ = mir_graph->GetTopologicalSortOrder();
+       // Clear visited flags and check that the loop head stack is empty.
+       mir_graph->ClearAllVisitedFlags();
+       DCHECK_EQ(loop_head_stack_->Size(), 0u);
+     }
+
+     ~LoopRepeatingTopologicalSortIterator() {
+       DCHECK_EQ(loop_head_stack_->Size(), 0u);
+     }
+
+     /**
+      * @brief Get the next BasicBlock depending on iteration order.
+      * @param had_change did the user of the iteration change the previous BasicBlock.
+      * @return the next BasicBlock following the iteration order, 0 if finished.
+      */
+     virtual BasicBlock* Next(bool had_change = false) OVERRIDE;
+
+    private:
+     const GrowableArray<BasicBlockId>* const loop_ends_;
+     GrowableArray<std::pair<uint16_t, bool>>* const loop_head_stack_;
   };
 
 }  // namespace art

@@ -122,11 +122,12 @@ void JdwpNetStateBase::Close() {
 }
 
 /*
- * Write a packet. Grabs a mutex to assure atomicity.
+ * Write a packet of "length" bytes. Grabs a mutex to assure atomicity.
  */
-ssize_t JdwpNetStateBase::WritePacket(ExpandBuf* pReply) {
+ssize_t JdwpNetStateBase::WritePacket(ExpandBuf* pReply, size_t length) {
   MutexLock mu(Thread::Current(), socket_lock_);
-  return TEMP_FAILURE_RETRY(write(clientSock, expandBufGetBuffer(pReply), expandBufGetLength(pReply)));
+  DCHECK_LE(length, expandBufGetLength(pReply));
+  return TEMP_FAILURE_RETRY(write(clientSock, expandBufGetBuffer(pReply), length));
 }
 
 /*
@@ -142,7 +143,7 @@ bool JdwpState::IsConnected() {
 }
 
 void JdwpState::SendBufferedRequest(uint32_t type, const std::vector<iovec>& iov) {
-  if (netState->clientSock < 0) {
+  if (!IsConnected()) {
     // Can happen with some DDMS events.
     VLOG(jdwp) << "Not sending JDWP packet: no debugger attached!";
     return;
@@ -156,26 +157,26 @@ void JdwpState::SendBufferedRequest(uint32_t type, const std::vector<iovec>& iov
   errno = 0;
   ssize_t actual = netState->WriteBufferedPacket(iov);
   if (static_cast<size_t>(actual) != expected) {
-    PLOG(ERROR) << StringPrintf("Failed to send JDWP packet %c%c%c%c to debugger (%d of %d)",
-                                static_cast<uint8_t>(type >> 24),
-                                static_cast<uint8_t>(type >> 16),
-                                static_cast<uint8_t>(type >> 8),
-                                static_cast<uint8_t>(type),
+    PLOG(ERROR) << StringPrintf("Failed to send JDWP packet %c%c%c%c to debugger (%zd of %zu)",
+                                static_cast<char>(type >> 24),
+                                static_cast<char>(type >> 16),
+                                static_cast<char>(type >> 8),
+                                static_cast<char>(type),
                                 actual, expected);
   }
 }
 
 void JdwpState::SendRequest(ExpandBuf* pReq) {
-  if (netState->clientSock < 0) {
+  if (!IsConnected()) {
     // Can happen with some DDMS events.
     VLOG(jdwp) << "Not sending JDWP packet: no debugger attached!";
     return;
   }
 
   errno = 0;
-  ssize_t actual = netState->WritePacket(pReq);
+  ssize_t actual = netState->WritePacket(pReq, expandBufGetLength(pReq));
   if (static_cast<size_t>(actual) != expandBufGetLength(pReq)) {
-    PLOG(ERROR) << StringPrintf("Failed to send JDWP packet to debugger (%d of %d)",
+    PLOG(ERROR) << StringPrintf("Failed to send JDWP packet to debugger (%zd of %zu)",
                                 actual, expandBufGetLength(pReq));
   }
 }
@@ -217,6 +218,9 @@ JdwpState::JdwpState(const JdwpOptions* options)
       event_thread_lock_("JDWP event thread lock"),
       event_thread_cond_("JDWP event thread condition variable", event_thread_lock_),
       event_thread_id_(0),
+      process_request_lock_("JDWP process request lock"),
+      process_request_cond_("JDWP process request condition variable", process_request_lock_),
+      processing_request_(false),
       ddm_is_active_(false),
       should_exit_(false),
       exit_status_(0) {
@@ -231,57 +235,43 @@ JdwpState::JdwpState(const JdwpOptions* options)
 JdwpState* JdwpState::Create(const JdwpOptions* options) {
   Thread* self = Thread::Current();
   Locks::mutator_lock_->AssertNotHeld(self);
-  UniquePtr<JdwpState> state(new JdwpState(options));
+  std::unique_ptr<JdwpState> state(new JdwpState(options));
   switch (options->transport) {
-  case kJdwpTransportSocket:
-    InitSocketTransport(state.get(), options);
-    break;
+    case kJdwpTransportSocket:
+      InitSocketTransport(state.get(), options);
+      break;
 #ifdef HAVE_ANDROID_OS
-  case kJdwpTransportAndroidAdb:
-    InitAdbTransport(state.get(), options);
-    break;
+    case kJdwpTransportAndroidAdb:
+      InitAdbTransport(state.get(), options);
+      break;
 #endif
-  default:
-    LOG(FATAL) << "Unknown transport: " << options->transport;
+    default:
+      LOG(FATAL) << "Unknown transport: " << options->transport;
   }
 
-  if (!options->suspend) {
+  {
     /*
      * Grab a mutex before starting the thread.  This ensures they
      * won't signal the cond var before we're waiting.
      */
     MutexLock thread_start_locker(self, state->thread_start_lock_);
+
     /*
      * We have bound to a port, or are trying to connect outbound to a
      * debugger.  Create the JDWP thread and let it continue the mission.
      */
-    CHECK_PTHREAD_CALL(pthread_create, (&state->pthread_, NULL, StartJdwpThread, state.get()), "JDWP thread");
+    CHECK_PTHREAD_CALL(pthread_create, (&state->pthread_, nullptr, StartJdwpThread, state.get()),
+                       "JDWP thread");
 
     /*
      * Wait until the thread finishes basic initialization.
-     * TODO: cond vars should be waited upon in a loop
      */
-    state->thread_start_cond_.Wait(self);
-  } else {
-    {
-      /*
-       * Grab a mutex before starting the thread.  This ensures they
-       * won't signal the cond var before we're waiting.
-       */
-      MutexLock thread_start_locker(self, state->thread_start_lock_);
-      /*
-       * We have bound to a port, or are trying to connect outbound to a
-       * debugger.  Create the JDWP thread and let it continue the mission.
-       */
-      CHECK_PTHREAD_CALL(pthread_create, (&state->pthread_, NULL, StartJdwpThread, state.get()), "JDWP thread");
-
-      /*
-       * Wait until the thread finishes basic initialization.
-       * TODO: cond vars should be waited upon in a loop
-       */
+    while (!state->debug_thread_started_) {
       state->thread_start_cond_.Wait(self);
     }
+  }
 
+  if (options->suspend) {
     /*
      * For suspend=y, wait for the debugger to connect to us or for us to
      * connect to the debugger.
@@ -293,7 +283,9 @@ JdwpState* JdwpState::Create(const JdwpOptions* options) {
     {
       ScopedThreadStateChange tsc(self, kWaitingForDebuggerToAttach);
       MutexLock attach_locker(self, state->attach_lock_);
-      state->attach_cond_.Wait(self);
+      while (state->debug_thread_id_ == 0) {
+        state->attach_cond_.Wait(self);
+      }
     }
     if (!state->IsActive()) {
       LOG(ERROR) << "JDWP connection failed";
@@ -328,6 +320,8 @@ void JdwpState::ResetState() {
     CHECK(event_list_ == NULL);
   }
 
+  Dbg::ProcessDelayedFullUndeoptimizations();
+
   /*
    * Should not have one of these in progress.  If the debugger went away
    * mid-request, though, we could see this.
@@ -343,10 +337,6 @@ void JdwpState::ResetState() {
  */
 JdwpState::~JdwpState() {
   if (netState != NULL) {
-    if (IsConnected()) {
-      PostVMDeath();
-    }
-
     /*
      * Close down the network to inspire the thread to halt.
      */
@@ -383,9 +373,16 @@ bool JdwpState::HandlePacket() {
   JDWP::Request request(netStateBase->input_buffer_, netStateBase->input_count_);
 
   ExpandBuf* pReply = expandBufAlloc();
-  ProcessRequest(request, pReply);
-  ssize_t cc = netStateBase->WritePacket(pReply);
-  if (cc != (ssize_t) expandBufGetLength(pReply)) {
+  size_t replyLength = ProcessRequest(request, pReply);
+  ssize_t cc = netStateBase->WritePacket(pReply, replyLength);
+
+  /*
+   * We processed this request and sent its reply. Notify other threads waiting for us they can now
+   * send events.
+   */
+  EndProcessingRequest();
+
+  if (cc != static_cast<ssize_t>(replyLength)) {
     PLOG(ERROR) << "Failed sending reply to debugger";
     expandBufFree(pReply);
     return false;
@@ -459,6 +456,7 @@ void JdwpState::Run() {
       if (!netState->Establish(options_)) {
         /* wake anybody who was waiting for us to succeed */
         MutexLock mu(thread_, attach_lock_);
+        debug_thread_id_ = static_cast<ObjectId>(-1);
         attach_cond_.Broadcast(thread_);
         break;
       }
@@ -470,11 +468,8 @@ void JdwpState::Run() {
     /* process requests until the debugger drops */
     bool first = true;
     while (!Dbg::IsDisposed()) {
-      {
-        // sanity check -- shouldn't happen?
-        MutexLock mu(thread_, *Locks::thread_suspend_count_lock_);
-        CHECK_EQ(thread_->GetState(), kWaitingInMainDebuggerLoop);
-      }
+      // sanity check -- shouldn't happen?
+      CHECK_EQ(thread_->GetState(), kWaitingInMainDebuggerLoop);
 
       if (!netState->ProcessIncoming()) {
         /* blocking read */
@@ -577,11 +572,11 @@ Thread* JdwpState::GetDebugThread() {
  */
 int64_t JdwpState::LastDebuggerActivity() {
   if (!Dbg::IsDebuggerActive()) {
-    LOG(DEBUG) << "no active debugger";
+    LOG(WARNING) << "no active debugger";
     return -1;
   }
 
-  int64_t last = QuasiAtomic::Read64(&last_activity_time_ms_);
+  int64_t last = last_activity_time_ms_.LoadSequentiallyConsistent();
 
   /* initializing or in the middle of something? */
   if (last == 0) {
@@ -606,7 +601,7 @@ void JdwpState::ExitAfterReplying(int exit_status) {
 std::ostream& operator<<(std::ostream& os, const JdwpLocation& rhs) {
   os << "JdwpLocation["
      << Dbg::GetClassName(rhs.class_id) << "." << Dbg::GetMethodName(rhs.method_id)
-     << "@" << StringPrintf("%#llx", rhs.dex_pc) << " " << rhs.type_tag << "]";
+     << "@" << StringPrintf("%#" PRIx64, rhs.dex_pc) << " " << rhs.type_tag << "]";
   return os;
 }
 

@@ -21,29 +21,23 @@
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
-#include "mirror/proxy.h"
-#include "object_utils.h"
 #include "reflection.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_fast_native_object_access.h"
 #include "well_known_classes.h"
 
 namespace art {
 
-static jobject Method_invoke(JNIEnv* env,
-                             jobject javaMethod, jobject javaReceiver, jobject javaArgs) {
-  ScopedObjectAccess soa(env);
-  return InvokeMethod(soa, javaMethod, javaReceiver, javaArgs);
+static jobject Method_invoke(JNIEnv* env, jobject javaMethod, jobject javaReceiver,
+                             jobject javaArgs, jboolean accessible) {
+  ScopedFastNativeObjectAccess soa(env);
+  return InvokeMethod(soa, javaMethod, javaReceiver, javaArgs, (accessible == JNI_TRUE));
 }
 
 static jobject Method_getExceptionTypesNative(JNIEnv* env, jobject javaMethod) {
-  ScopedObjectAccess soa(env);
-  jobject art_method = soa.Env()->GetObjectField(
-      javaMethod, WellKnownClasses::java_lang_reflect_AbstractMethod_artMethod);
-
-  mirror::ArtMethod* proxy_method = soa.Decode<mirror::Object*>(art_method)->AsArtMethod();
+  ScopedFastNativeObjectAccess soa(env);
+  mirror::ArtMethod* proxy_method = mirror::ArtMethod::FromReflectedMethod(soa, javaMethod);
   CHECK(proxy_method->GetDeclaringClass()->IsProxyClass());
-  mirror::SynthesizedProxyClass* proxy_class =
-      down_cast<mirror::SynthesizedProxyClass*>(proxy_method->GetDeclaringClass());
+  mirror::Class* proxy_class = proxy_method->GetDeclaringClass();
   int throws_index = -1;
   size_t num_virt_methods = proxy_class->NumVirtualMethods();
   for (size_t i = 0; i < num_virt_methods; i++) {
@@ -59,8 +53,8 @@ static jobject Method_getExceptionTypesNative(JNIEnv* env, jobject javaMethod) {
 }
 
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(Method, invoke, "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"),
-  NATIVE_METHOD(Method, getExceptionTypesNative, "()[Ljava/lang/Class;"),
+  NATIVE_METHOD(Method, invoke, "!(Ljava/lang/Object;[Ljava/lang/Object;Z)Ljava/lang/Object;"),
+  NATIVE_METHOD(Method, getExceptionTypesNative, "!()[Ljava/lang/Class;"),
 };
 
 void register_java_lang_reflect_Method(JNIEnv* env) {

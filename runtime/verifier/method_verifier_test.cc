@@ -14,23 +14,25 @@
  * limitations under the License.
  */
 
-#include <stdio.h>
-
-#include "UniquePtr.h"
-#include "class_linker.h"
-#include "common_test.h"
-#include "dex_file.h"
 #include "method_verifier.h"
+
+#include <stdio.h>
+#include <memory>
+
+#include "class_linker-inl.h"
+#include "common_runtime_test.h"
+#include "dex_file.h"
+#include "scoped_thread_state_change.h"
 
 namespace art {
 namespace verifier {
 
-class MethodVerifierTest : public CommonTest {
+class MethodVerifierTest : public CommonRuntimeTest {
  protected:
   void VerifyClass(const std::string& descriptor)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     ASSERT_TRUE(descriptor != NULL);
-    mirror::Class* klass = class_linker_->FindSystemClass(descriptor.c_str());
+    mirror::Class* klass = class_linker_->FindSystemClass(Thread::Current(), descriptor.c_str());
 
     // Verify the class
     std::string error_msg;

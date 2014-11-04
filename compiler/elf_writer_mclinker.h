@@ -17,9 +17,9 @@
 #ifndef ART_COMPILER_ELF_WRITER_MCLINKER_H_
 #define ART_COMPILER_ELF_WRITER_MCLINKER_H_
 
-#include "elf_writer.h"
+#include <memory>
 
-#include "UniquePtr.h"
+#include "elf_writer.h"
 #include "safe_map.h"
 
 namespace mcld {
@@ -29,6 +29,7 @@ class LDSection;
 class LDSymbol;
 class Linker;
 class LinkerConfig;
+class LinkerScript;
 class Module;
 }  // namespace mcld
 
@@ -36,11 +37,11 @@ namespace art {
 
 class CompiledCode;
 
-class ElfWriterMclinker : public ElfWriter {
+class ElfWriterMclinker FINAL : public ElfWriter {
  public:
   // Write an ELF file. Returns true on success, false on failure.
   static bool Create(File* file,
-                     OatWriter& oat_writer,
+                     OatWriter* oat_writer,
                      const std::vector<const DexFile*>& dex_files,
                      const std::string& android_root,
                      bool is_host,
@@ -48,10 +49,11 @@ class ElfWriterMclinker : public ElfWriter {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  protected:
-  virtual bool Write(OatWriter& oat_writer,
-                     const std::vector<const DexFile*>& dex_files,
-                     const std::string& android_root,
-                     bool is_host)
+  bool Write(OatWriter* oat_writer,
+             const std::vector<const DexFile*>& dex_files,
+             const std::string& android_root,
+             bool is_host)
+      OVERRIDE
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  private:
@@ -64,19 +66,18 @@ class ElfWriterMclinker : public ElfWriter {
   void AddCompiledCodeInput(const CompiledCode& compiled_code);
   void AddRuntimeInputs(const std::string& android_root, bool is_host);
   bool Link();
-#if defined(ART_USE_PORTABLE_COMPILER)
   void FixupOatMethodOffsets(const std::vector<const DexFile*>& dex_files)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   uint32_t FixupCompiledCodeOffset(ElfFile& elf_file,
-                                   llvm::ELF::Elf32_Addr oatdata_address,
+                                   uint32_t oatdata_address,
                                    const CompiledCode& compiled_code);
-#endif
 
   // Setup by Init()
-  UniquePtr<mcld::LinkerConfig> linker_config_;
-  UniquePtr<mcld::Module> module_;
-  UniquePtr<mcld::IRBuilder> ir_builder_;
-  UniquePtr<mcld::Linker> linker_;
+  std::unique_ptr<mcld::LinkerConfig> linker_config_;
+  std::unique_ptr<mcld::LinkerScript> linker_script_;
+  std::unique_ptr<mcld::Module> module_;
+  std::unique_ptr<mcld::IRBuilder> ir_builder_;
+  std::unique_ptr<mcld::Linker> linker_;
 
   // Setup by AddOatInput()
   // TODO: ownership of oat_input_?

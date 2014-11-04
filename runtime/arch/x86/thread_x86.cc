@@ -21,7 +21,7 @@
 
 #include "asm_support_x86.h"
 #include "base/macros.h"
-#include "thread.h"
+#include "thread-inl.h"
 #include "thread_list.h"
 
 #if defined(__APPLE__)
@@ -41,8 +41,8 @@ struct descriptor_table_entry_t {
 namespace art {
 
 void Thread::InitCpu() {
-  static Mutex modify_ldt_lock("modify_ldt lock");
-  MutexLock mu(Thread::Current(), modify_ldt_lock);
+  // Take the ldt lock, Thread::Current isn't yet established.
+  MutexLock mu(nullptr, *Locks::modify_ldt_lock_);
 
   const uintptr_t base = reinterpret_cast<uintptr_t>(this);
   const size_t limit = kPageSize;
@@ -113,19 +113,17 @@ void Thread::InitCpu() {
   uint16_t table_indicator = 1 << 2;  // LDT
   uint16_t rpl = 3;  // Requested privilege level
   uint16_t selector = (entry_number << 3) | table_indicator | rpl;
-  // TODO: use our assembler to generate code
   __asm__ __volatile__("movw %w0, %%fs"
       :    // output
       : "q"(selector)  // input
       :);  // clobber
 
   // Allow easy indirection back to Thread*.
-  self_ = this;
+  tlsPtr_.self = this;
 
   // Sanity check that reads from %fs point to this Thread*.
   Thread* self_check;
-  // TODO: use our assembler to generate code
-  CHECK_EQ(THREAD_SELF_OFFSET, OFFSETOF_MEMBER(Thread, self_));
+  CHECK_EQ(THREAD_SELF_OFFSET, SelfOffset<4>().Int32Value());
   __asm__ __volatile__("movl %%fs:(%1), %0"
       : "=r"(self_check)  // output
       : "r"(THREAD_SELF_OFFSET)  // input
@@ -133,7 +131,45 @@ void Thread::InitCpu() {
   CHECK_EQ(self_check, this);
 
   // Sanity check other offsets.
-  CHECK_EQ(THREAD_EXCEPTION_OFFSET, OFFSETOF_MEMBER(Thread, exception_));
+  CHECK_EQ(THREAD_EXCEPTION_OFFSET, ExceptionOffset<4>().Int32Value());
+  CHECK_EQ(THREAD_CARD_TABLE_OFFSET, CardTableOffset<4>().Int32Value());
+  CHECK_EQ(THREAD_ID_OFFSET, ThinLockIdOffset<4>().Int32Value());
+}
+
+void Thread::CleanupCpu() {
+  MutexLock mu(this, *Locks::modify_ldt_lock_);
+
+  // Sanity check that reads from %fs point to this Thread*.
+  Thread* self_check;
+  __asm__ __volatile__("movl %%fs:(%1), %0"
+      : "=r"(self_check)  // output
+      : "r"(THREAD_SELF_OFFSET)  // input
+      :);  // clobber
+  CHECK_EQ(self_check, this);
+
+  // Extract the LDT entry number from the FS register.
+  uint16_t selector;
+  __asm__ __volatile__("movw %%fs, %w0"
+      : "=q"(selector)  // output
+      :  // input
+      :);  // clobber
+
+  // Free LDT entry.
+#if defined(__APPLE__)
+  // TODO: release selectors on OS/X this is a leak which will cause ldt entries to be exhausted
+  // after enough threads are created. However, the following code results in kernel panics in OS/X
+  // 10.9.
+  UNUSED(selector);
+  // i386_set_ldt(selector >> 3, 0, 1);
+#else
+  user_desc ldt_entry;
+  memset(&ldt_entry, 0, sizeof(ldt_entry));
+  ldt_entry.entry_number = selector >> 3;
+  ldt_entry.contents = MODIFY_LDT_CONTENTS_DATA;
+  ldt_entry.seg_not_present = 1;
+
+  syscall(__NR_modify_ldt, 1, &ldt_entry, sizeof(ldt_entry));
+#endif
 }
 
 }  // namespace art

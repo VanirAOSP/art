@@ -81,7 +81,8 @@ Field name is cantTouchThis
  Field type is int
  Access flags are 0x11
   cantTouchThis is 77
-  cantTouchThis is now 99
+  as expected: set-final throws exception
+  cantTouchThis is still 77
   public final int Target.cantTouchThis accessible=false
   public final int Target.cantTouchThis accessible=true
   cantTouchThis is now 87
@@ -91,6 +92,8 @@ SuperTarget constructor ()V
 Target constructor (IF)V : ii=7 ff=3.3333
 myMethod (I)I
  arg=17 anInt=7
+got expected exception for Class.newInstance
+got expected exception for Constructor.newInstance
 ReflectTest done!
 public method
 static java.lang.Object java.util.Collections.checkType(java.lang.Object,java.lang.Class) accessible=false

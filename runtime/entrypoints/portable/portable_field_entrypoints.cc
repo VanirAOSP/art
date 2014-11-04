@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "mirror/art_field-inl.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
@@ -30,17 +30,15 @@ extern "C" int32_t art_portable_set32_static_from_code(uint32_t field_idx,
                                StaticPrimitiveWrite,
                                sizeof(uint32_t));
   if (LIKELY(field != NULL)) {
-    field->Set32(field->GetDeclaringClass(), new_value);
+    // Compiled code can't use transactional mode.
+    field->Set32<false>(field->GetDeclaringClass(), new_value);
     return 0;
   }
-  field = FindFieldFromCode(field_idx,
-                            referrer,
-                            Thread::Current(),
-                            StaticPrimitiveWrite,
-                            sizeof(uint32_t),
-                            true);
+  field = FindFieldFromCode<StaticPrimitiveWrite, true>(field_idx, referrer, Thread::Current(),
+                                                        sizeof(uint32_t));
   if (LIKELY(field != NULL)) {
-    field->Set32(field->GetDeclaringClass(), new_value);
+    // Compiled code can't use transactional mode.
+    field->Set32<false>(field->GetDeclaringClass(), new_value);
     return 0;
   }
   return -1;
@@ -52,17 +50,15 @@ extern "C" int32_t art_portable_set64_static_from_code(uint32_t field_idx,
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   mirror::ArtField* field = FindFieldFast(field_idx, referrer, StaticPrimitiveWrite, sizeof(uint64_t));
   if (LIKELY(field != NULL)) {
-    field->Set64(field->GetDeclaringClass(), new_value);
+    // Compiled code can't use transactional mode.
+    field->Set64<false>(field->GetDeclaringClass(), new_value);
     return 0;
   }
-  field = FindFieldFromCode(field_idx,
-                            referrer,
-                            Thread::Current(),
-                            StaticPrimitiveWrite,
-                            sizeof(uint64_t),
-                            true);
+  field = FindFieldFromCode<StaticPrimitiveWrite, true>(field_idx, referrer, Thread::Current(),
+                                                        sizeof(uint64_t));
   if (LIKELY(field != NULL)) {
-    field->Set64(field->GetDeclaringClass(), new_value);
+    // Compiled code can't use transactional mode.
+    field->Set64<false>(field->GetDeclaringClass(), new_value);
     return 0;
   }
   return -1;
@@ -73,15 +69,17 @@ extern "C" int32_t art_portable_set_obj_static_from_code(uint32_t field_idx,
                                                          mirror::Object* new_value)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   mirror::ArtField* field = FindFieldFast(field_idx, referrer, StaticObjectWrite,
-                                          sizeof(mirror::Object*));
+                                          sizeof(mirror::HeapReference<mirror::Object>));
   if (LIKELY(field != NULL)) {
-    field->SetObj(field->GetDeclaringClass(), new_value);
+    // Compiled code can't use transactional mode.
+    field->SetObj<false>(field->GetDeclaringClass(), new_value);
     return 0;
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            StaticObjectWrite, sizeof(mirror::Object*), true);
+  field = FindFieldFromCode<StaticObjectWrite, true>(field_idx, referrer, Thread::Current(),
+                                                     sizeof(mirror::HeapReference<mirror::Object>));
   if (LIKELY(field != NULL)) {
-    field->SetObj(field->GetDeclaringClass(), new_value);
+    // Compiled code can't use transactional mode.
+    field->SetObj<false>(field->GetDeclaringClass(), new_value);
     return 0;
   }
   return -1;
@@ -94,8 +92,8 @@ extern "C" int32_t art_portable_get32_static_from_code(uint32_t field_idx,
   if (LIKELY(field != NULL)) {
     return field->Get32(field->GetDeclaringClass());
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            StaticPrimitiveRead, sizeof(uint32_t), true);
+  field = FindFieldFromCode<StaticPrimitiveRead, true>(field_idx, referrer, Thread::Current(),
+                                                       sizeof(uint32_t));
   if (LIKELY(field != NULL)) {
     return field->Get32(field->GetDeclaringClass());
   }
@@ -109,8 +107,8 @@ extern "C" int64_t art_portable_get64_static_from_code(uint32_t field_idx,
   if (LIKELY(field != NULL)) {
     return field->Get64(field->GetDeclaringClass());
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            StaticPrimitiveRead, sizeof(uint64_t), true);
+  field = FindFieldFromCode<StaticPrimitiveRead, true>(field_idx, referrer, Thread::Current(),
+                                                       sizeof(uint64_t));
   if (LIKELY(field != NULL)) {
     return field->Get64(field->GetDeclaringClass());
   }
@@ -121,12 +119,12 @@ extern "C" mirror::Object* art_portable_get_obj_static_from_code(uint32_t field_
                                                                  mirror::ArtMethod* referrer)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   mirror::ArtField* field = FindFieldFast(field_idx, referrer, StaticObjectRead,
-                                          sizeof(mirror::Object*));
+                                          sizeof(mirror::HeapReference<mirror::Object>));
   if (LIKELY(field != NULL)) {
     return field->GetObj(field->GetDeclaringClass());
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            StaticObjectRead, sizeof(mirror::Object*), true);
+  field = FindFieldFromCode<StaticObjectRead, true>(field_idx, referrer, Thread::Current(),
+                                                    sizeof(mirror::HeapReference<mirror::Object>));
   if (LIKELY(field != NULL)) {
     return field->GetObj(field->GetDeclaringClass());
   }
@@ -139,13 +137,15 @@ extern "C" int32_t art_portable_set32_instance_from_code(uint32_t field_idx,
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   mirror::ArtField* field = FindFieldFast(field_idx, referrer, InstancePrimitiveWrite, sizeof(uint32_t));
   if (LIKELY(field != NULL)) {
-    field->Set32(obj, new_value);
+    // Compiled code can't use transactional mode.
+    field->Set32<false>(obj, new_value);
     return 0;
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            InstancePrimitiveWrite, sizeof(uint32_t), true);
+  field = FindFieldFromCode<InstancePrimitiveWrite, true>(field_idx, referrer, Thread::Current(),
+                                                          sizeof(uint32_t));
   if (LIKELY(field != NULL)) {
-    field->Set32(obj, new_value);
+    // Compiled code can't use transactional mode.
+    field->Set32<false>(obj, new_value);
     return 0;
   }
   return -1;
@@ -157,13 +157,15 @@ extern "C" int32_t art_portable_set64_instance_from_code(uint32_t field_idx,
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   mirror::ArtField* field = FindFieldFast(field_idx, referrer, InstancePrimitiveWrite, sizeof(uint64_t));
   if (LIKELY(field != NULL)) {
-    field->Set64(obj, new_value);
+    // Compiled code can't use transactional mode.
+    field->Set64<false>(obj, new_value);
     return 0;
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            InstancePrimitiveWrite, sizeof(uint64_t), true);
+  field = FindFieldFromCode<InstancePrimitiveWrite, true>(field_idx, referrer, Thread::Current(),
+                                                          sizeof(uint64_t));
   if (LIKELY(field != NULL)) {
-    field->Set64(obj, new_value);
+    // Compiled code can't use transactional mode.
+    field->Set64<false>(obj, new_value);
     return 0;
   }
   return -1;
@@ -175,15 +177,17 @@ extern "C" int32_t art_portable_set_obj_instance_from_code(uint32_t field_idx,
                                                            mirror::Object* new_value)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   mirror::ArtField* field = FindFieldFast(field_idx, referrer, InstanceObjectWrite,
-                                          sizeof(mirror::Object*));
+                                          sizeof(mirror::HeapReference<mirror::Object>));
   if (LIKELY(field != NULL)) {
-    field->SetObj(obj, new_value);
+    // Compiled code can't use transactional mode.
+    field->SetObj<false>(obj, new_value);
     return 0;
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            InstanceObjectWrite, sizeof(mirror::Object*), true);
+  field = FindFieldFromCode<InstanceObjectWrite, true>(field_idx, referrer, Thread::Current(),
+                                                       sizeof(mirror::HeapReference<mirror::Object>));
   if (LIKELY(field != NULL)) {
-    field->SetObj(obj, new_value);
+    // Compiled code can't use transactional mode.
+    field->SetObj<false>(obj, new_value);
     return 0;
   }
   return -1;
@@ -197,8 +201,8 @@ extern "C" int32_t art_portable_get32_instance_from_code(uint32_t field_idx,
   if (LIKELY(field != NULL)) {
     return field->Get32(obj);
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            InstancePrimitiveRead, sizeof(uint32_t), true);
+  field = FindFieldFromCode<InstancePrimitiveRead, true>(field_idx, referrer, Thread::Current(),
+                                                         sizeof(uint32_t));
   if (LIKELY(field != NULL)) {
     return field->Get32(obj);
   }
@@ -213,8 +217,8 @@ extern "C" int64_t art_portable_get64_instance_from_code(uint32_t field_idx,
   if (LIKELY(field != NULL)) {
     return field->Get64(obj);
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            InstancePrimitiveRead, sizeof(uint64_t), true);
+  field = FindFieldFromCode<InstancePrimitiveRead, true>(field_idx, referrer, Thread::Current(),
+                                                         sizeof(uint64_t));
   if (LIKELY(field != NULL)) {
     return field->Get64(obj);
   }
@@ -226,12 +230,12 @@ extern "C" mirror::Object* art_portable_get_obj_instance_from_code(uint32_t fiel
                                                                    mirror::Object* obj)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   mirror::ArtField* field = FindFieldFast(field_idx, referrer, InstanceObjectRead,
-                                          sizeof(mirror::Object*));
+                                          sizeof(mirror::HeapReference<mirror::Object>));
   if (LIKELY(field != NULL)) {
     return field->GetObj(obj);
   }
-  field = FindFieldFromCode(field_idx, referrer, Thread::Current(),
-                            InstanceObjectRead, sizeof(mirror::Object*), true);
+  field = FindFieldFromCode<InstanceObjectRead, true>(field_idx, referrer, Thread::Current(),
+                                                      sizeof(mirror::HeapReference<mirror::Object>));
   if (LIKELY(field != NULL)) {
     return field->GetObj(obj);
   }

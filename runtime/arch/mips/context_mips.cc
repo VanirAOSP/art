@@ -16,21 +16,22 @@
 
 #include "context_mips.h"
 
-#include "mirror/art_method.h"
+#include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
+#include "quick/quick_method_frame_info.h"
 #include "stack.h"
 
 namespace art {
 namespace mips {
 
-static const uint32_t gZero = 0;
+static constexpr uint32_t gZero = 0;
 
 void MipsContext::Reset() {
   for (size_t i = 0; i < kNumberOfCoreRegisters; i++) {
-    gprs_[i] = NULL;
+    gprs_[i] = nullptr;
   }
   for (size_t i = 0; i < kNumberOfFRegisters; i++) {
-    fprs_[i] = NULL;
+    fprs_[i] = nullptr;
   }
   gprs_[SP] = &sp_;
   gprs_[RA] = &ra_;
@@ -41,17 +42,15 @@ void MipsContext::Reset() {
 
 void MipsContext::FillCalleeSaves(const StackVisitor& fr) {
   mirror::ArtMethod* method = fr.GetMethod();
-  uint32_t core_spills = method->GetCoreSpillMask();
-  uint32_t fp_core_spills = method->GetFpSpillMask();
-  size_t spill_count = __builtin_popcount(core_spills);
-  size_t fp_spill_count = __builtin_popcount(fp_core_spills);
-  size_t frame_size = method->GetFrameSizeInBytes();
+  const QuickMethodFrameInfo frame_info = method->GetQuickFrameInfo();
+  size_t spill_count = POPCOUNT(frame_info.CoreSpillMask());
+  size_t fp_spill_count = POPCOUNT(frame_info.FpSpillMask());
   if (spill_count > 0) {
     // Lowest number spill is farthest away, walk registers and fill into context.
     int j = 1;
     for (size_t i = 0; i < kNumberOfCoreRegisters; i++) {
-      if (((core_spills >> i) & 1) != 0) {
-        gprs_[i] = fr.CalleeSaveAddress(spill_count - j, frame_size);
+      if (((frame_info.CoreSpillMask() >> i) & 1) != 0) {
+        gprs_[i] = fr.CalleeSaveAddress(spill_count - j, frame_info.FrameSizeInBytes());
         j++;
       }
     }
@@ -60,28 +59,44 @@ void MipsContext::FillCalleeSaves(const StackVisitor& fr) {
     // Lowest number spill is farthest away, walk registers and fill into context.
     int j = 1;
     for (size_t i = 0; i < kNumberOfFRegisters; i++) {
-      if (((fp_core_spills >> i) & 1) != 0) {
-        fprs_[i] = fr.CalleeSaveAddress(spill_count + fp_spill_count - j, frame_size);
+      if (((frame_info.FpSpillMask() >> i) & 1) != 0) {
+        fprs_[i] = fr.CalleeSaveAddress(spill_count + fp_spill_count - j,
+                                        frame_info.FrameSizeInBytes());
         j++;
       }
     }
   }
 }
 
-void MipsContext::SetGPR(uint32_t reg, uintptr_t value) {
+bool MipsContext::SetGPR(uint32_t reg, uintptr_t value) {
   CHECK_LT(reg, static_cast<uint32_t>(kNumberOfCoreRegisters));
   CHECK_NE(gprs_[reg], &gZero);  // Can't overwrite this static value since they are never reset.
-  CHECK(gprs_[reg] != NULL);
-  *gprs_[reg] = value;
+  if (gprs_[reg] != nullptr) {
+    *gprs_[reg] = value;
+    return true;
+  } else {
+    return false;
+  }
+}
+
+bool MipsContext::SetFPR(uint32_t reg, uintptr_t value) {
+  CHECK_LT(reg, static_cast<uint32_t>(kNumberOfFRegisters));
+  CHECK_NE(fprs_[reg], &gZero);  // Can't overwrite this static value since they are never reset.
+  if (fprs_[reg] != nullptr) {
+    *fprs_[reg] = value;
+    return true;
+  } else {
+    return false;
+  }
 }
 
 void MipsContext::SmashCallerSaves() {
   // This needs to be 0 because we want a null/zero return value.
   gprs_[V0] = const_cast<uint32_t*>(&gZero);
   gprs_[V1] = const_cast<uint32_t*>(&gZero);
-  gprs_[A1] = NULL;
-  gprs_[A2] = NULL;
-  gprs_[A3] = NULL;
+  gprs_[A1] = nullptr;
+  gprs_[A2] = nullptr;
+  gprs_[A3] = nullptr;
 }
 
 extern "C" void art_quick_do_long_jump(uint32_t*, uint32_t*);
@@ -90,10 +105,10 @@ void MipsContext::DoLongJump() {
   uintptr_t gprs[kNumberOfCoreRegisters];
   uint32_t fprs[kNumberOfFRegisters];
   for (size_t i = 0; i < kNumberOfCoreRegisters; ++i) {
-    gprs[i] = gprs_[i] != NULL ? *gprs_[i] : MipsContext::kBadGprBase + i;
+    gprs[i] = gprs_[i] != nullptr ? *gprs_[i] : MipsContext::kBadGprBase + i;
   }
   for (size_t i = 0; i < kNumberOfFRegisters; ++i) {
-    fprs[i] = fprs_[i] != NULL ? *fprs_[i] : MipsContext::kBadGprBase + i;
+    fprs[i] = fprs_[i] != nullptr ? *fprs_[i] : MipsContext::kBadGprBase + i;
   }
   art_quick_do_long_jump(gprs, fprs);
 }

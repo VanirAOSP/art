@@ -14,15 +14,15 @@
  * limitations under the License.
  */
 
-#include "common_test.h"
+#include "indirect_reference_table-inl.h"
 
-#include "indirect_reference_table.h"
+#include "common_runtime_test.h"
 #include "mirror/object-inl.h"
+#include "scoped_thread_state_change.h"
 
 namespace art {
 
-class IndirectReferenceTableTest : public CommonTest {
-};
+class IndirectReferenceTableTest : public CommonRuntimeTest {};
 
 static void CheckDump(IndirectReferenceTable* irt, size_t num_objects, size_t num_unique)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
@@ -48,7 +48,7 @@ TEST_F(IndirectReferenceTableTest, BasicTest) {
   static const size_t kTableMax = 20;
   IndirectReferenceTable irt(kTableInitial, kTableMax, kGlobal);
 
-  mirror::Class* c = class_linker_->FindSystemClass("Ljava/lang/Object;");
+  mirror::Class* c = class_linker_->FindSystemClass(soa.Self(), "Ljava/lang/Object;");
   ASSERT_TRUE(c != NULL);
   mirror::Object* obj0 = c->AllocObject(soa.Self());
   ASSERT_TRUE(obj0 != NULL);

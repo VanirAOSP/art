@@ -20,6 +20,7 @@
 #include <stdint.h>
 
 #include <cstddef>
+#include <memory>
 #include <set>
 #include <string>
 
@@ -30,7 +31,6 @@
 #include "os.h"
 #include "safe_map.h"
 #include "gc/space/space.h"
-#include "UniquePtr.h"
 
 namespace art {
 
@@ -40,8 +40,9 @@ class ImageWriter {
   explicit ImageWriter(const CompilerDriver& compiler_driver)
       : compiler_driver_(compiler_driver), oat_file_(NULL), image_end_(0), image_begin_(NULL),
         oat_data_begin_(NULL), interpreter_to_interpreter_bridge_offset_(0),
-        interpreter_to_compiled_code_bridge_offset_(0), portable_resolution_trampoline_offset_(0),
-        quick_resolution_trampoline_offset_(0) {}
+        interpreter_to_compiled_code_bridge_offset_(0), portable_imt_conflict_trampoline_offset_(0),
+        portable_resolution_trampoline_offset_(0), quick_generic_jni_trampoline_offset_(0),
+        quick_imt_conflict_trampoline_offset_(0), quick_resolution_trampoline_offset_(0) {}
 
   ~ImageWriter() {}
 
@@ -62,40 +63,28 @@ class ImageWriter {
   void RecordImageAllocations() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // We use the lock word to store the offset of the object in the image.
-  void AssignImageOffset(mirror::Object* object)
+  void AssignImageOffset(mirror::Object* object) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void SetImageOffset(mirror::Object* object, size_t offset)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool IsImageOffsetAssigned(mirror::Object* object) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  size_t GetImageOffset(mirror::Object* object) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  static void* GetImageAddressCallback(void* writer, mirror::Object* obj)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    DCHECK(object != NULL);
-    SetImageOffset(object, image_end_);
-    image_end_ += RoundUp(object->SizeOf(), 8);  // 64-bit alignment
-    DCHECK_LT(image_end_, image_->Size());
+    return reinterpret_cast<ImageWriter*>(writer)->GetImageAddress(obj);
   }
 
-  void SetImageOffset(mirror::Object* object, size_t offset) {
-    DCHECK(object != NULL);
-    DCHECK_NE(offset, 0U);
-    DCHECK(!IsImageOffsetAssigned(object));
-    offsets_.Put(object, offset);
-  }
-
-  size_t IsImageOffsetAssigned(const mirror::Object* object) const {
-    DCHECK(object != NULL);
-    return offsets_.find(object) != offsets_.end();
-  }
-
-  size_t GetImageOffset(const mirror::Object* object) const {
-    DCHECK(object != NULL);
-    DCHECK(IsImageOffsetAssigned(object));
-    return offsets_.find(object)->second;
-  }
-
-  mirror::Object* GetImageAddress(const mirror::Object* object) const {
+  mirror::Object* GetImageAddress(mirror::Object* object) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     if (object == NULL) {
       return NULL;
     }
     return reinterpret_cast<mirror::Object*>(image_begin_ + GetImageOffset(object));
   }
 
-  mirror::Object* GetLocalAddress(const mirror::Object* object) const {
+  mirror::Object* GetLocalAddress(mirror::Object* object) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     size_t offset = GetImageOffset(object);
     byte* dst = image_->Begin() + offset;
     return reinterpret_cast<mirror::Object*>(dst);
@@ -115,7 +104,7 @@ class ImageWriter {
   }
 
   // Returns true if the class was in the original requested image classes list.
-  bool IsImageClass(const mirror::Class* klass) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool IsImageClass(mirror::Class* klass) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Debug aid that list of requested image classes.
   void DumpImageClasses();
@@ -127,7 +116,7 @@ class ImageWriter {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Wire dex cache resolved strings to strings in the image to avoid runtime resolution.
-  void ComputeEagerResolvedStrings();
+  void ComputeEagerResolvedStrings() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static void ComputeEagerResolvedStringsCallback(mirror::Object* obj, void* arg)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
@@ -146,47 +135,43 @@ class ImageWriter {
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   mirror::ObjectArray<mirror::Object>* CreateImageRoots() const
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  static void CalculateNewObjectOffsetsCallback(mirror::Object* obj, void* arg)
+  void CalculateObjectOffsets(mirror::Object* obj)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  void WalkInstanceFields(mirror::Object* obj, mirror::Class* klass)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void WalkFieldsInOrder(mirror::Object* obj)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  static void WalkFieldsCallback(mirror::Object* obj, void* arg)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Creates the contiguous image in memory and adjusts pointers.
   void CopyAndFixupObjects();
   static void CopyAndFixupObjectsCallback(mirror::Object* obj, void* arg)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void FixupClass(const mirror::Class* orig, mirror::Class* copy)
+  void FixupMethod(mirror::ArtMethod* orig, mirror::ArtMethod* copy)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void FixupMethod(const mirror::ArtMethod* orig, mirror::ArtMethod* copy)
+  void FixupObject(mirror::Object* orig, mirror::Object* copy)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void FixupObject(const mirror::Object* orig, mirror::Object* copy)
+
+  // Get quick code for non-resolution/imt_conflict/abstract method.
+  const byte* GetQuickCode(mirror::ArtMethod* method, bool* quick_is_interpreted)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void FixupObjectArray(const mirror::ObjectArray<mirror::Object>* orig,
-                        mirror::ObjectArray<mirror::Object>* copy)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void FixupInstanceFields(const mirror::Object* orig, mirror::Object* copy)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void FixupStaticFields(const mirror::Class* orig, mirror::Class* copy)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void FixupFields(const mirror::Object* orig, mirror::Object* copy, uint32_t ref_offsets,
-                   bool is_static)
+
+  const byte* GetQuickEntryPoint(mirror::ArtMethod* method)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Patches references in OatFile to expect runtime addresses.
-  void PatchOatCodeAndMethods()
+  void PatchOatCodeAndMethods(File* elf_file)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  void SetPatchLocation(const CompilerDriver::PatchInformation* patch, uint32_t value)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
 
   const CompilerDriver& compiler_driver_;
-
-  // Map of Object to where it will be at runtime.
-  SafeMap<const mirror::Object*, size_t> offsets_;
 
   // oat file with code for this image
   OatFile* oat_file_;
 
   // Memory mapped for generating the image.
-  UniquePtr<MemMap> image_;
+  std::unique_ptr<MemMap> image_;
 
   // Offset to the free space in image_.
   size_t image_end_;
@@ -194,23 +179,30 @@ class ImageWriter {
   // Beginning target image address for the output image.
   byte* image_begin_;
 
+  // Saved hashes (objects are inside of the image so that they don't move).
+  std::vector<std::pair<mirror::Object*, uint32_t>> saved_hashes_;
+
   // Beginning target oat address for the pointers from the output image to its oat file.
   const byte* oat_data_begin_;
 
   // Image bitmap which lets us know where the objects inside of the image reside.
-  UniquePtr<gc::accounting::SpaceBitmap> image_bitmap_;
+  std::unique_ptr<gc::accounting::ContinuousSpaceBitmap> image_bitmap_;
 
   // Offset from oat_data_begin_ to the stubs.
   uint32_t interpreter_to_interpreter_bridge_offset_;
   uint32_t interpreter_to_compiled_code_bridge_offset_;
   uint32_t jni_dlsym_lookup_offset_;
+  uint32_t portable_imt_conflict_trampoline_offset_;
   uint32_t portable_resolution_trampoline_offset_;
   uint32_t portable_to_interpreter_bridge_offset_;
+  uint32_t quick_generic_jni_trampoline_offset_;
+  uint32_t quick_imt_conflict_trampoline_offset_;
   uint32_t quick_resolution_trampoline_offset_;
   uint32_t quick_to_interpreter_bridge_offset_;
 
-  // DexCaches seen while scanning for fixing up CodeAndDirectMethods
-  std::set<mirror::DexCache*> dex_caches_;
+  friend class FixupVisitor;
+  friend class FixupClassVisitor;
+  DISALLOW_COPY_AND_ASSIGN(ImageWriter);
 };
 
 }  // namespace art

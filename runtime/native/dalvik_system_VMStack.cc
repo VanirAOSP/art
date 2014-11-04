@@ -20,55 +20,67 @@
 #include "mirror/class-inl.h"
 #include "mirror/class_loader.h"
 #include "mirror/object-inl.h"
+#include "scoped_fast_native_object_access.h"
 #include "scoped_thread_state_change.h"
 #include "thread_list.h"
 
 namespace art {
 
-static jobject GetThreadStack(JNIEnv* env, jobject peer) {
-  {
-    ScopedObjectAccess soa(env);
-    if (soa.Decode<mirror::Object*>(peer) == soa.Self()->GetPeer()) {
-      return soa.Self()->CreateInternalStackTrace(soa);
-    }
-  }
-  // Suspend thread to build stack trace.
-  bool timed_out;
-  Thread* thread = Thread::SuspendForDebugger(peer, true, &timed_out);
-  if (thread != NULL) {
-    jobject trace;
-    {
-      ScopedObjectAccess soa(env);
-      trace = thread->CreateInternalStackTrace(soa);
-    }
-    // Restart suspended thread.
-    Runtime::Current()->GetThreadList()->Resume(thread, true);
-    return trace;
+static jobject GetThreadStack(const ScopedFastNativeObjectAccess& soa, jobject peer)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  jobject trace = nullptr;
+  if (soa.Decode<mirror::Object*>(peer) == soa.Self()->GetPeer()) {
+    trace = soa.Self()->CreateInternalStackTrace<false>(soa);
   } else {
-    if (timed_out) {
-      LOG(ERROR) << "Trying to get thread's stack failed as the thread failed to suspend within a "
-          "generous timeout.";
+    // Suspend thread to build stack trace.
+    soa.Self()->TransitionFromRunnableToSuspended(kNative);
+    ThreadList* thread_list = Runtime::Current()->GetThreadList();
+    bool timed_out;
+    Thread* thread;
+    {
+      // Take suspend thread lock to avoid races with threads trying to suspend this one.
+      MutexLock mu(soa.Self(), *Locks::thread_list_suspend_thread_lock_);
+      thread = thread_list->SuspendThreadByPeer(peer, true, false, &timed_out);
     }
-    return NULL;
+    if (thread != nullptr) {
+      // Must be runnable to create returned array.
+      CHECK_EQ(soa.Self()->TransitionFromSuspendedToRunnable(), kNative);
+      trace = thread->CreateInternalStackTrace<false>(soa);
+      soa.Self()->TransitionFromRunnableToSuspended(kNative);
+      // Restart suspended thread.
+      thread_list->Resume(thread, false);
+    } else {
+      if (timed_out) {
+        LOG(ERROR) << "Trying to get thread's stack failed as the thread failed to suspend within a "
+            "generous timeout.";
+      }
+    }
+    CHECK_EQ(soa.Self()->TransitionFromSuspendedToRunnable(), kNative);
   }
+  return trace;
 }
 
 static jint VMStack_fillStackTraceElements(JNIEnv* env, jclass, jobject javaThread,
                                            jobjectArray javaSteArray) {
-  jobject trace = GetThreadStack(env, javaThread);
-  if (trace == NULL) {
+  ScopedFastNativeObjectAccess soa(env);
+  jobject trace = GetThreadStack(soa, javaThread);
+  if (trace == nullptr) {
     return 0;
   }
   int32_t depth;
-  Thread::InternalStackTraceToStackTraceElementArray(env, trace, javaSteArray, &depth);
+  Thread::InternalStackTraceToStackTraceElementArray(soa, trace, javaSteArray, &depth);
   return depth;
 }
 
 // Returns the defining class loader of the caller's caller.
 static jobject VMStack_getCallingClassLoader(JNIEnv* env, jclass) {
-  ScopedObjectAccess soa(env);
+  ScopedFastNativeObjectAccess soa(env);
   NthCallerVisitor visitor(soa.Self(), 2);
   visitor.WalkStack();
+  if (UNLIKELY(visitor.caller == nullptr)) {
+    // The caller is an attached native thread.
+    return nullptr;
+  }
   return soa.AddLocalReference<jobject>(visitor.caller->GetDeclaringClass()->GetClassLoader());
 }
 
@@ -78,7 +90,7 @@ static jobject VMStack_getClosestUserClassLoader(JNIEnv* env, jclass, jobject ja
     ClosestUserClassLoaderVisitor(Thread* thread, mirror::Object* bootstrap, mirror::Object* system)
       : StackVisitor(thread, NULL), bootstrap(bootstrap), system(system), class_loader(NULL) {}
 
-    bool VisitFrame() {
+    bool VisitFrame() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
       DCHECK(class_loader == NULL);
       mirror::Class* c = GetMethod()->GetDeclaringClass();
       mirror::Object* cl = c->GetClassLoader();
@@ -93,7 +105,7 @@ static jobject VMStack_getClosestUserClassLoader(JNIEnv* env, jclass, jobject ja
     mirror::Object* system;
     mirror::Object* class_loader;
   };
-  ScopedObjectAccess soa(env);
+  ScopedFastNativeObjectAccess soa(env);
   mirror::Object* bootstrap = soa.Decode<mirror::Object*>(javaBootstrap);
   mirror::Object* system = soa.Decode<mirror::Object*>(javaSystem);
   ClosestUserClassLoaderVisitor visitor(soa.Self(), bootstrap, system);
@@ -103,26 +115,31 @@ static jobject VMStack_getClosestUserClassLoader(JNIEnv* env, jclass, jobject ja
 
 // Returns the class of the caller's caller's caller.
 static jclass VMStack_getStackClass2(JNIEnv* env, jclass) {
-  ScopedObjectAccess soa(env);
+  ScopedFastNativeObjectAccess soa(env);
   NthCallerVisitor visitor(soa.Self(), 3);
   visitor.WalkStack();
+  if (UNLIKELY(visitor.caller == nullptr)) {
+    // The caller is an attached native thread.
+    return nullptr;
+  }
   return soa.AddLocalReference<jclass>(visitor.caller->GetDeclaringClass());
 }
 
 static jobjectArray VMStack_getThreadStackTrace(JNIEnv* env, jclass, jobject javaThread) {
-  jobject trace = GetThreadStack(env, javaThread);
-  if (trace == NULL) {
-    return NULL;
+  ScopedFastNativeObjectAccess soa(env);
+  jobject trace = GetThreadStack(soa, javaThread);
+  if (trace == nullptr) {
+    return nullptr;
   }
-  return Thread::InternalStackTraceToStackTraceElementArray(env, trace);
+  return Thread::InternalStackTraceToStackTraceElementArray(soa, trace);
 }
 
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(VMStack, fillStackTraceElements, "(Ljava/lang/Thread;[Ljava/lang/StackTraceElement;)I"),
-  NATIVE_METHOD(VMStack, getCallingClassLoader, "()Ljava/lang/ClassLoader;"),
-  NATIVE_METHOD(VMStack, getClosestUserClassLoader, "(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)Ljava/lang/ClassLoader;"),
-  NATIVE_METHOD(VMStack, getStackClass2, "()Ljava/lang/Class;"),
-  NATIVE_METHOD(VMStack, getThreadStackTrace, "(Ljava/lang/Thread;)[Ljava/lang/StackTraceElement;"),
+  NATIVE_METHOD(VMStack, fillStackTraceElements, "!(Ljava/lang/Thread;[Ljava/lang/StackTraceElement;)I"),
+  NATIVE_METHOD(VMStack, getCallingClassLoader, "!()Ljava/lang/ClassLoader;"),
+  NATIVE_METHOD(VMStack, getClosestUserClassLoader, "!(Ljava/lang/ClassLoader;Ljava/lang/ClassLoader;)Ljava/lang/ClassLoader;"),
+  NATIVE_METHOD(VMStack, getStackClass2, "!()Ljava/lang/Class;"),
+  NATIVE_METHOD(VMStack, getThreadStackTrace, "!(Ljava/lang/Thread;)[Ljava/lang/StackTraceElement;"),
 };
 
 void register_dalvik_system_VMStack(JNIEnv* env) {

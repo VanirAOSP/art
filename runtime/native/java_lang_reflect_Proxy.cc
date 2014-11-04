@@ -19,29 +19,22 @@
 #include "mirror/class_loader.h"
 #include "mirror/object_array.h"
 #include "mirror/string.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_fast_native_object_access.h"
+#include "verify_object-inl.h"
 
 namespace art {
 
-static jclass Proxy_generateProxy(JNIEnv* env, jclass, jstring javaName,
-                                  jobjectArray javaInterfaces, jobject javaLoader,
-                                  jobjectArray javaMethods, jobjectArray javaThrows) {
-  ScopedObjectAccess soa(env);
-  mirror::String* name = soa.Decode<mirror::String*>(javaName);
-  mirror::ObjectArray<mirror::Class>* interfaces =
-      soa.Decode<mirror::ObjectArray<mirror::Class>*>(javaInterfaces);
-  mirror::ClassLoader* loader = soa.Decode<mirror::ClassLoader*>(javaLoader);
-  mirror::ObjectArray<mirror::ArtMethod>* methods =
-      soa.Decode<mirror::ObjectArray<mirror::ArtMethod>*>(javaMethods);
-  mirror::ObjectArray<mirror::ObjectArray<mirror::Class> >* throws =
-      soa.Decode<mirror::ObjectArray<mirror::ObjectArray<mirror::Class> >*>(javaThrows);
+static jclass Proxy_generateProxy(JNIEnv* env, jclass, jstring name, jobjectArray interfaces,
+                                  jobject loader, jobjectArray methods, jobjectArray throws) {
+  ScopedFastNativeObjectAccess soa(env);
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  mirror::Class* result = class_linker->CreateProxyClass(name, interfaces, loader, methods, throws);
+  mirror::Class* result = class_linker->CreateProxyClass(soa, name, interfaces, loader, methods,
+                                                         throws);
   return soa.AddLocalReference<jclass>(result);
 }
 
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(Proxy, generateProxy, "(Ljava/lang/String;[Ljava/lang/Class;Ljava/lang/ClassLoader;[Ljava/lang/reflect/ArtMethod;[[Ljava/lang/Class;)Ljava/lang/Class;"),
+  NATIVE_METHOD(Proxy, generateProxy, "!(Ljava/lang/String;[Ljava/lang/Class;Ljava/lang/ClassLoader;[Ljava/lang/reflect/ArtMethod;[[Ljava/lang/Class;)Ljava/lang/Class;"),
 };
 
 void register_java_lang_reflect_Proxy(JNIEnv* env) {

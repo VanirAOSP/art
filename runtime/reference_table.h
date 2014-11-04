@@ -22,8 +22,10 @@
 #include <string>
 #include <vector>
 
-#include "locks.h"
-#include "root_visitor.h"
+#include "base/allocator.h"
+#include "base/mutex.h"
+#include "gc_root.h"
+#include "object_callbacks.h"
 
 namespace art {
 namespace mirror {
@@ -39,19 +41,20 @@ class ReferenceTable {
   ReferenceTable(const char* name, size_t initial_size, size_t max_size);
   ~ReferenceTable();
 
-  void Add(const mirror::Object* obj);
+  void Add(mirror::Object* obj) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void Remove(const mirror::Object* obj);
+  void Remove(mirror::Object* obj) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   size_t Size() const;
 
-  void Dump(std::ostream& os) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void Dump(std::ostream& os) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void VisitRoots(RootVisitor* visitor, void* arg);
+  void VisitRoots(RootCallback* visitor, void* arg, uint32_t tid, RootType root_type);
 
  private:
-  typedef std::vector<const mirror::Object*> Table;
-  static void Dump(std::ostream& os, const Table& entries)
+  typedef std::vector<GcRoot<mirror::Object>,
+                      TrackingAllocator<GcRoot<mirror::Object>, kAllocatorTagReferenceTable>> Table;
+  static void Dump(std::ostream& os, Table& entries)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   friend class IndirectReferenceTable;  // For Dump.
 

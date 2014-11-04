@@ -23,8 +23,12 @@
 #include <string>
 
 #include "base/logging.h"
+#include "base/mutex.h"
+#include "gc_root.h"
+#include "mem_map.h"
+#include "object_callbacks.h"
 #include "offsets.h"
-#include "root_visitor.h"
+#include "read_barrier_option.h"
 
 namespace art {
 namespace mirror {
@@ -71,7 +75,7 @@ class Object;
  * To make everything fit nicely in 32-bit integers, the maximum size of
  * the table is capped at 64K.
  *
- * None of the table functions are synchronized.
+ * Only SynchronizedGet is synchronized.
  */
 
 /*
@@ -109,7 +113,7 @@ static mirror::Object* const kClearedJniWeakGlobal = reinterpret_cast<mirror::Ob
  * For convenience these match up with enum jobjectRefType from jni.h.
  */
 enum IndirectRefKind {
-  kSirtOrInvalid = 0,  // <<stack indirect reference table or invalid reference>>
+  kHandleScopeOrInvalid = 0,  // <<stack indirect reference table or invalid reference>>
   kLocal         = 1,  // <<local reference>>
   kGlobal        = 2,  // <<global reference>>
   kWeakGlobal    = 3   // <<weak global reference>>
@@ -190,11 +194,6 @@ static const uint32_t IRT_FIRST_SEGMENT = 0;
  * and local refs to improve performance.  A large circular buffer might
  * reduce the amortized cost of adding global references.
  *
- * TODO: if we can guarantee that the underlying storage doesn't move,
- * e.g. by using oversized mmap regions to handle expanding tables, we may
- * be able to avoid having to synchronize lookups.  Might make sense to
- * add a "synchronized lookup" call that takes the mutex as an argument,
- * and either locks or doesn't lock based on internal details.
  */
 union IRTSegmentState {
   uint32_t          all;
@@ -206,19 +205,21 @@ union IRTSegmentState {
 
 class IrtIterator {
  public:
-  explicit IrtIterator(const mirror::Object** table, size_t i, size_t capacity)
+  explicit IrtIterator(GcRoot<mirror::Object>* table, size_t i, size_t capacity)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
       : table_(table), i_(i), capacity_(capacity) {
     SkipNullsAndTombstones();
   }
 
-  IrtIterator& operator++() {
+  IrtIterator& operator++() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     ++i_;
     SkipNullsAndTombstones();
     return *this;
   }
 
-  const mirror::Object** operator*() {
-    return &table_[i_];
+  mirror::Object** operator*() {
+    // This does not have a read barrier as this is used to visit roots.
+    return table_[i_].AddressWithoutBarrier();
   }
 
   bool equals(const IrtIterator& rhs) const {
@@ -226,14 +227,16 @@ class IrtIterator {
   }
 
  private:
-  void SkipNullsAndTombstones() {
+  void SkipNullsAndTombstones() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     // We skip NULLs and tombstones. Clients don't want to see implementation details.
-    while (i_ < capacity_ && (table_[i_] == NULL || table_[i_] == kClearedJniWeakGlobal)) {
+    while (i_ < capacity_ &&
+           (table_[i_].IsNull() ||
+            table_[i_].Read<kWithoutReadBarrier>() == kClearedJniWeakGlobal)) {
       ++i_;
     }
   }
 
-  const mirror::Object** table_;
+  GcRoot<mirror::Object>* const table_;
   size_t i_;
   size_t capacity_;
 };
@@ -258,7 +261,7 @@ class IndirectReferenceTable {
    * Returns NULL if the table is full (max entries reached, or alloc
    * failed during expansion).
    */
-  IndirectRef Add(uint32_t cookie, const mirror::Object* obj)
+  IndirectRef Add(uint32_t cookie, mirror::Object* obj)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   /*
@@ -266,15 +269,17 @@ class IndirectReferenceTable {
    *
    * Returns kInvalidIndirectRefObject if iref is invalid.
    */
-  const mirror::Object* Get(IndirectRef iref) const {
-    if (!GetChecked(iref)) {
-      return kInvalidIndirectRefObject;
-    }
-    return table_[ExtractIndex(iref)];
-  }
+  template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
+  mirror::Object* Get(IndirectRef iref) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
+      ALWAYS_INLINE;
 
-  // TODO: remove when we remove work_around_app_jni_bugs support.
-  bool ContainsDirectPointer(mirror::Object* direct_pointer) const;
+  // Synchronized get which reads a reference, acquiring a lock if necessary.
+  template<ReadBarrierOption kReadBarrierOption = kWithReadBarrier>
+  mirror::Object* SynchronizedGet(Thread* /*self*/, ReaderWriterMutex* /*mutex*/,
+                                  IndirectRef iref) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return Get<kReadBarrierOption>(iref);
+  }
 
   /*
    * Remove an existing entry.
@@ -299,6 +304,7 @@ class IndirectReferenceTable {
     return segment_state_.parts.topIndex;
   }
 
+  // Note IrtIterator does not have a read barrier as it's used to visit roots.
   IrtIterator begin() {
     return IrtIterator(table_, 0, Capacity());
   }
@@ -307,7 +313,8 @@ class IndirectReferenceTable {
     return IrtIterator(table_, Capacity(), Capacity());
   }
 
-  void VisitRoots(RootVisitor* visitor, void* arg);
+  void VisitRoots(RootCallback* callback, void* arg, uint32_t tid, RootType root_type)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   uint32_t GetSegmentState() const {
     return segment_state_.all;
@@ -326,7 +333,7 @@ class IndirectReferenceTable {
    * Extract the table index from an indirect reference.
    */
   static uint32_t ExtractIndex(IndirectRef iref) {
-    uint32_t uref = (uint32_t) iref;
+    uintptr_t uref = reinterpret_cast<uintptr_t>(iref);
     return (uref >> 2) & 0xffff;
   }
 
@@ -334,11 +341,11 @@ class IndirectReferenceTable {
    * The object pointer itself is subject to relocation in some GC
    * implementations, so we shouldn't really be using it here.
    */
-  IndirectRef ToIndirectRef(const mirror::Object* /*o*/, uint32_t tableIndex) const {
+  IndirectRef ToIndirectRef(uint32_t tableIndex) const {
     DCHECK_LT(tableIndex, 65536U);
     uint32_t serialChunk = slot_data_[tableIndex].serial;
-    uint32_t uref = serialChunk << 20 | (tableIndex << 2) | kind_;
-    return (IndirectRef) uref;
+    uintptr_t uref = serialChunk << 20 | (tableIndex << 2) | kind_;
+    return reinterpret_cast<IndirectRef>(uref);
   }
 
   /*
@@ -355,6 +362,9 @@ class IndirectReferenceTable {
     }
   }
 
+  // Abort if check_jni is not enabled.
+  static void AbortIfNoCheckJNI();
+
   /* extra debugging checks */
   bool GetChecked(IndirectRef) const;
   bool CheckEntry(const char*, IndirectRef, int) const;
@@ -362,8 +372,13 @@ class IndirectReferenceTable {
   /* semi-public - read/write by jni down calls */
   IRTSegmentState segment_state_;
 
-  /* bottom of the stack */
-  const mirror::Object** table_;
+  // Mem map where we store the indirect refs.
+  std::unique_ptr<MemMap> table_mem_map_;
+  // Mem map where we store the extended debugging info.
+  std::unique_ptr<MemMap> slot_mem_map_;
+  // bottom of the stack. Do not directly access the object references
+  // in this as they are roots. Use Get() that has a read barrier.
+  GcRoot<mirror::Object>* table_;
   /* bit mask, ORed into all irefs */
   IndirectRefKind kind_;
   /* extended debugging info */

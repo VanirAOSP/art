@@ -17,7 +17,7 @@
 #ifndef ART_RUNTIME_GC_SPACE_LARGE_OBJECT_SPACE_H_
 #define ART_RUNTIME_GC_SPACE_LARGE_OBJECT_SPACE_H_
 
-#include "gc/accounting/gc_allocator.h"
+#include "base/allocator.h"
 #include "dlmalloc_space.h"
 #include "safe_map.h"
 #include "space.h"
@@ -29,44 +29,79 @@ namespace art {
 namespace gc {
 namespace space {
 
+class AllocationInfo;
+
 // Abstraction implemented by all large object spaces.
 class LargeObjectSpace : public DiscontinuousSpace, public AllocSpace {
  public:
-  virtual SpaceType GetType() const {
+  SpaceType GetType() const OVERRIDE {
     return kSpaceTypeLargeObjectSpace;
   }
-
-  virtual void SwapBitmaps();
-  virtual void CopyLiveToMarked();
+  void SwapBitmaps();
+  void CopyLiveToMarked();
   virtual void Walk(DlMallocSpace::WalkCallback, void* arg) = 0;
   virtual ~LargeObjectSpace() {}
 
-  uint64_t GetBytesAllocated() {
+  uint64_t GetBytesAllocated() OVERRIDE {
     return num_bytes_allocated_;
   }
-
-  uint64_t GetObjectsAllocated() {
+  uint64_t GetObjectsAllocated() OVERRIDE {
     return num_objects_allocated_;
   }
-
-  uint64_t GetTotalBytesAllocated() {
+  uint64_t GetTotalBytesAllocated() const {
     return total_bytes_allocated_;
   }
-
-  uint64_t GetTotalObjectsAllocated() {
+  uint64_t GetTotalObjectsAllocated() const {
     return total_objects_allocated_;
   }
-
-  size_t FreeList(Thread* self, size_t num_ptrs, mirror::Object** ptrs);
+  size_t FreeList(Thread* self, size_t num_ptrs, mirror::Object** ptrs) OVERRIDE;
+  // LargeObjectSpaces don't have thread local state.
+  void RevokeThreadLocalBuffers(art::Thread*) OVERRIDE {
+  }
+  void RevokeAllThreadLocalBuffers() OVERRIDE {
+  }
+  bool IsAllocSpace() const OVERRIDE {
+    return true;
+  }
+  AllocSpace* AsAllocSpace() OVERRIDE {
+    return this;
+  }
+  collector::ObjectBytePair Sweep(bool swap_bitmaps);
+  virtual bool CanMoveObjects() const OVERRIDE {
+    return false;
+  }
+  // Current address at which the space begins, which may vary as the space is filled.
+  byte* Begin() const {
+    return begin_;
+  }
+  // Current address at which the space ends, which may vary as the space is filled.
+  byte* End() const {
+    return end_;
+  }
+  // Current size of space
+  size_t Size() const {
+    return End() - Begin();
+  }
+  // Return true if we contain the specified address.
+  bool Contains(const mirror::Object* obj) const {
+    const byte* byte_obj = reinterpret_cast<const byte*>(obj);
+    return Begin() <= byte_obj && byte_obj < End();
+  }
+  void LogFragmentationAllocFailure(std::ostream& os, size_t failed_alloc_bytes) OVERRIDE
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  protected:
-  explicit LargeObjectSpace(const std::string& name);
+  explicit LargeObjectSpace(const std::string& name, byte* begin, byte* end);
+  static void SweepCallback(size_t num_ptrs, mirror::Object** ptrs, void* arg);
 
   // Approximate number of bytes which have been allocated into the space.
-  size_t num_bytes_allocated_;
-  size_t num_objects_allocated_;
-  size_t total_bytes_allocated_;
-  size_t total_objects_allocated_;
+  uint64_t num_bytes_allocated_;
+  uint64_t num_objects_allocated_;
+  uint64_t total_bytes_allocated_;
+  uint64_t total_objects_allocated_;
+  // Begin and end, may change as more large objects are allocated.
+  byte* begin_;
+  byte* end_;
 
   friend class Space;
 
@@ -80,152 +115,77 @@ class LargeObjectMapSpace : public LargeObjectSpace {
   // Creates a large object space. Allocations into the large object space use memory maps instead
   // of malloc.
   static LargeObjectMapSpace* Create(const std::string& name);
-
   // Return the storage space required by obj.
-  size_t AllocationSize(const mirror::Object* obj);
-  mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated);
+  size_t AllocationSize(mirror::Object* obj, size_t* usable_size);
+  mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated,
+                        size_t* usable_size);
   size_t Free(Thread* self, mirror::Object* ptr);
-  void Walk(DlMallocSpace::WalkCallback, void* arg) LOCKS_EXCLUDED(lock_);
+  void Walk(DlMallocSpace::WalkCallback, void* arg) OVERRIDE LOCKS_EXCLUDED(lock_);
   // TODO: disabling thread safety analysis as this may be called when we already hold lock_.
   bool Contains(const mirror::Object* obj) const NO_THREAD_SAFETY_ANALYSIS;
 
- private:
+ protected:
   explicit LargeObjectMapSpace(const std::string& name);
   virtual ~LargeObjectMapSpace() {}
 
   // Used to ensure mutual exclusion when the allocation spaces data structures are being modified.
   mutable Mutex lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
-  std::vector<mirror::Object*,
-      accounting::GCAllocator<mirror::Object*> > large_objects_ GUARDED_BY(lock_);
+  std::vector<mirror::Object*, TrackingAllocator<mirror::Object*, kAllocatorTagLOS>> large_objects_
+      GUARDED_BY(lock_);
   typedef SafeMap<mirror::Object*, MemMap*, std::less<mirror::Object*>,
-      accounting::GCAllocator<std::pair<const mirror::Object*, MemMap*> > > MemMaps;
+      TrackingAllocator<std::pair<mirror::Object*, MemMap*>, kAllocatorTagLOSMaps>> MemMaps;
   MemMaps mem_maps_ GUARDED_BY(lock_);
 };
 
 // A continuous large object space with a free-list to handle holes.
-class FreeListSpace : public LargeObjectSpace {
+class FreeListSpace FINAL : public LargeObjectSpace {
  public:
+  static constexpr size_t kAlignment = kPageSize;
+
   virtual ~FreeListSpace();
   static FreeListSpace* Create(const std::string& name, byte* requested_begin, size_t capacity);
-
-  size_t AllocationSize(const mirror::Object* obj) EXCLUSIVE_LOCKS_REQUIRED(lock_);
-  mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated);
-  size_t Free(Thread* self, mirror::Object* obj);
-  bool Contains(const mirror::Object* obj) const;
-  void Walk(DlMallocSpace::WalkCallback callback, void* arg) LOCKS_EXCLUDED(lock_);
-
-  // Address at which the space begins.
-  byte* Begin() const {
-    return begin_;
-  }
-
-  // Address at which the space ends, which may vary as the space is filled.
-  byte* End() const {
-    return end_;
-  }
-
-  // Current size of space
-  size_t Size() const {
-    return End() - Begin();
-  }
-
+  size_t AllocationSize(mirror::Object* obj, size_t* usable_size) OVERRIDE
+      EXCLUSIVE_LOCKS_REQUIRED(lock_);
+  mirror::Object* Alloc(Thread* self, size_t num_bytes, size_t* bytes_allocated,
+                        size_t* usable_size) OVERRIDE;
+  size_t Free(Thread* self, mirror::Object* obj) OVERRIDE;
+  void Walk(DlMallocSpace::WalkCallback callback, void* arg) OVERRIDE LOCKS_EXCLUDED(lock_);
   void Dump(std::ostream& os) const;
 
- private:
-  static const size_t kAlignment = kPageSize;
-
-  class AllocationHeader {
-   public:
-    // Returns the allocation size, includes the header.
-    size_t AllocationSize() const {
-      return alloc_size_;
-    }
-
-    // Updates the allocation size in the header, the allocation size includes the header itself.
-    void SetAllocationSize(size_t size) {
-      DCHECK(IsAligned<kPageSize>(size));
-      alloc_size_ = size;
-    }
-
-    bool IsFree() const {
-      return AllocationSize() == 0;
-    }
-
-    // Returns the previous free allocation header by using the prev_free_ member to figure out
-    // where it is. If prev free is 0 then we just return ourself.
-    AllocationHeader* GetPrevFreeAllocationHeader() {
-      return reinterpret_cast<AllocationHeader*>(reinterpret_cast<uintptr_t>(this) - prev_free_);
-    }
-
-    // Returns the address of the object associated with this allocation header.
-    mirror::Object* GetObjectAddress() {
-      return reinterpret_cast<mirror::Object*>(reinterpret_cast<uintptr_t>(this) + sizeof(*this));
-    }
-
-    // Returns the next allocation header after the object associated with this allocation header.
-    AllocationHeader* GetNextAllocationHeader() {
-      DCHECK_NE(alloc_size_, 0U);
-      return reinterpret_cast<AllocationHeader*>(reinterpret_cast<uintptr_t>(this) + alloc_size_);
-    }
-
-    // Returns how many free bytes there is before the block.
-    size_t GetPrevFree() const {
-      return prev_free_;
-    }
-
-    // Update the size of the free block prior to the allocation.
-    void SetPrevFree(size_t prev_free) {
-      DCHECK(IsAligned<kPageSize>(prev_free));
-      prev_free_ = prev_free;
-    }
-
-    // Finds and returns the next non free allocation header after ourself.
-    // TODO: Optimize, currently O(n) for n free following pages.
-    AllocationHeader* GetNextNonFree();
-
-    // Used to implement best fit object allocation. Each allocation has an AllocationHeader which
-    // contains the size of the previous free block preceding it. Implemented in such a way that we
-    // can also find the iterator for any allocation header pointer.
-    class SortByPrevFree {
-     public:
-      bool operator()(const AllocationHeader* a, const AllocationHeader* b) const {
-        if (a->GetPrevFree() < b->GetPrevFree()) return true;
-        if (a->GetPrevFree() > b->GetPrevFree()) return false;
-        if (a->AllocationSize() < b->AllocationSize()) return true;
-        if (a->AllocationSize() > b->AllocationSize()) return false;
-        return reinterpret_cast<uintptr_t>(a) < reinterpret_cast<uintptr_t>(b);
-      }
-    };
-
-   private:
-    // Contains the size of the previous free block, if 0 then the memory preceding us is an
-    // allocation.
-    size_t prev_free_;
-
-    // Allocation size of this object, 0 means that the allocation header is free memory.
-    size_t alloc_size_;
-
-    friend class FreeListSpace;
-  };
-
+ protected:
   FreeListSpace(const std::string& name, MemMap* mem_map, byte* begin, byte* end);
-
+  size_t GetSlotIndexForAddress(uintptr_t address) const {
+    DCHECK(Contains(reinterpret_cast<mirror::Object*>(address)));
+    return (address - reinterpret_cast<uintptr_t>(Begin())) / kAlignment;
+  }
+  size_t GetSlotIndexForAllocationInfo(const AllocationInfo* info) const;
+  AllocationInfo* GetAllocationInfoForAddress(uintptr_t address);
+  const AllocationInfo* GetAllocationInfoForAddress(uintptr_t address) const;
+  uintptr_t GetAllocationAddressForSlot(size_t slot) const {
+    return reinterpret_cast<uintptr_t>(Begin()) + slot * kAlignment;
+  }
+  uintptr_t GetAddressForAllocationInfo(const AllocationInfo* info) const {
+    return GetAllocationAddressForSlot(GetSlotIndexForAllocationInfo(info));
+  }
   // Removes header from the free blocks set by finding the corresponding iterator and erasing it.
-  void RemoveFreePrev(AllocationHeader* header) EXCLUSIVE_LOCKS_REQUIRED(lock_);
+  void RemoveFreePrev(AllocationInfo* info) EXCLUSIVE_LOCKS_REQUIRED(lock_);
 
-  // Finds the allocation header corresponding to obj.
-  AllocationHeader* GetAllocationHeader(const mirror::Object* obj);
-
-  typedef std::set<AllocationHeader*, AllocationHeader::SortByPrevFree,
-                   accounting::GCAllocator<AllocationHeader*> > FreeBlocks;
-
-  byte* const begin_;
-  byte* const end_;
+  class SortByPrevFree {
+   public:
+    bool operator()(const AllocationInfo* a, const AllocationInfo* b) const;
+  };
+  typedef std::set<AllocationInfo*, SortByPrevFree,
+                   TrackingAllocator<AllocationInfo*, kAllocatorTagLOSFreeList>> FreeBlocks;
 
   // There is not footer for any allocations at the end of the space, so we keep track of how much
   // free space there is at the end manually.
-  UniquePtr<MemMap> mem_map_;
+  std::unique_ptr<MemMap> mem_map_;
+  // Side table for allocation info, one per page.
+  std::unique_ptr<MemMap> allocation_info_map_;
+  AllocationInfo* allocation_info_;
+
   Mutex lock_ DEFAULT_MUTEX_ACQUIRED_AFTER;
+  // Free bytes at the end of the space.
   size_t free_end_ GUARDED_BY(lock_);
   FreeBlocks free_blocks_ GUARDED_BY(lock_);
 };

@@ -20,27 +20,43 @@
 #include "class_linker.h"
 #include "common_throws.h"
 #include "debugger.h"
+#include "gc/space/bump_pointer_space.h"
 #include "gc/space/dlmalloc_space.h"
 #include "gc/space/large_object_space.h"
 #include "gc/space/space-inl.h"
+#include "gc/space/zygote_space.h"
 #include "hprof/hprof.h"
 #include "jni_internal.h"
 #include "mirror/class.h"
+#include "ScopedLocalRef.h"
 #include "ScopedUtfChars.h"
-#include "scoped_thread_state_change.h"
-#include "toStringArray.h"
+#include "scoped_fast_native_object_access.h"
 #include "trace.h"
+#include "well_known_classes.h"
 
 namespace art {
 
 static jobjectArray VMDebug_getVmFeatureList(JNIEnv* env, jclass) {
-  std::vector<std::string> features;
-  features.push_back("method-trace-profiling");
-  features.push_back("method-trace-profiling-streaming");
-  features.push_back("method-sample-profiling");
-  features.push_back("hprof-heap-dump");
-  features.push_back("hprof-heap-dump-streaming");
-  return toStringArray(env, features);
+  static const char* features[] = {
+    "method-trace-profiling",
+    "method-trace-profiling-streaming",
+    "method-sample-profiling",
+    "hprof-heap-dump",
+    "hprof-heap-dump-streaming",
+  };
+  jobjectArray result = env->NewObjectArray(arraysize(features),
+                                            WellKnownClasses::java_lang_String,
+                                            nullptr);
+  if (result != nullptr) {
+    for (size_t i = 0; i < arraysize(features); ++i) {
+      ScopedLocalRef<jstring> jfeature(env, env->NewStringUTF(features[i]));
+      if (jfeature.get() == nullptr) {
+        return nullptr;
+      }
+      env->SetObjectArrayElement(result, i, jfeature.get());
+    }
+  }
+  return result;
 }
 
 static void VMDebug_startAllocCounting(JNIEnv*, jclass) {
@@ -65,7 +81,8 @@ static void VMDebug_startMethodTracingDdmsImpl(JNIEnv*, jclass, jint bufferSize,
 }
 
 static void VMDebug_startMethodTracingFd(JNIEnv* env, jclass, jstring javaTraceFilename,
-                                         jobject javaFd, jint bufferSize, jint flags) {
+                                         jobject javaFd, jint bufferSize, jint flags,
+                                         jboolean samplingEnabled, jint intervalUs) {
   int originalFd = jniGetFDFromFileDescriptor(env, javaFd);
   if (originalFd < 0) {
     return;
@@ -84,16 +101,17 @@ static void VMDebug_startMethodTracingFd(JNIEnv* env, jclass, jstring javaTraceF
   if (traceFilename.c_str() == NULL) {
     return;
   }
-  Trace::Start(traceFilename.c_str(), fd, bufferSize, flags, false, false, 0);
+  Trace::Start(traceFilename.c_str(), fd, bufferSize, flags, false, samplingEnabled, intervalUs);
 }
 
 static void VMDebug_startMethodTracingFilename(JNIEnv* env, jclass, jstring javaTraceFilename,
-                                               jint bufferSize, jint flags) {
+                                               jint bufferSize, jint flags,
+                                               jboolean samplingEnabled, jint intervalUs) {
   ScopedUtfChars traceFilename(env, javaTraceFilename);
   if (traceFilename.c_str() == NULL) {
     return;
   }
-  Trace::Start(traceFilename.c_str(), -1, bufferSize, flags, false, false, 0);
+  Trace::Start(traceFilename.c_str(), -1, bufferSize, flags, false, samplingEnabled, intervalUs);
 }
 
 static jint VMDebug_getMethodTracingMode(JNIEnv*, jclass) {
@@ -149,12 +167,12 @@ static void VMDebug_resetInstructionCount(JNIEnv* env, jclass) {
 }
 
 static void VMDebug_printLoadedClasses(JNIEnv* env, jclass, jint flags) {
-  ScopedObjectAccess soa(env);
+  ScopedFastNativeObjectAccess soa(env);
   return Runtime::Current()->GetClassLinker()->DumpAllClasses(flags);
 }
 
 static jint VMDebug_getLoadedClassCount(JNIEnv* env, jclass) {
-  ScopedObjectAccess soa(env);
+  ScopedFastNativeObjectAccess soa(env);
   return Runtime::Current()->GetClassLinker()->NumLoadedClasses();
 }
 
@@ -229,14 +247,18 @@ static void VMDebug_infopoint(JNIEnv*, jclass, jint id) {
 static jlong VMDebug_countInstancesOfClass(JNIEnv* env, jclass, jclass javaClass,
                                            jboolean countAssignable) {
   ScopedObjectAccess soa(env);
+  gc::Heap* heap = Runtime::Current()->GetHeap();
+  // We only want reachable instances, so do a GC. Heap::VisitObjects visits all of the heap
+  // objects in the all spaces and the allocation stack.
+  heap->CollectGarbage(false);
   mirror::Class* c = soa.Decode<mirror::Class*>(javaClass);
-  if (c == NULL) {
+  if (c == nullptr) {
     return 0;
   }
   std::vector<mirror::Class*> classes;
   classes.push_back(c);
   uint64_t count = 0;
-  Runtime::Current()->GetHeap()->CountInstances(classes, countAssignable, &count);
+  heap->CountInstances(classes, countAssignable, &count);
   return count;
 }
 
@@ -247,7 +269,7 @@ static jlong VMDebug_countInstancesOfClass(JNIEnv* env, jclass, jclass javaClass
 // /proc/<pid>/smaps.
 static void VMDebug_getHeapSpaceStats(JNIEnv* env, jclass, jlongArray data) {
   jlong* arr = reinterpret_cast<jlong*>(env->GetPrimitiveArrayCritical(data, 0));
-  if (arr == NULL || env->GetArrayLength(data) < 9) {
+  if (arr == nullptr || env->GetArrayLength(data) < 9) {
     return;
   }
 
@@ -257,29 +279,27 @@ static void VMDebug_getHeapSpaceStats(JNIEnv* env, jclass, jlongArray data) {
   size_t zygoteUsed = 0;
   size_t largeObjectsSize = 0;
   size_t largeObjectsUsed = 0;
-
   gc::Heap* heap = Runtime::Current()->GetHeap();
-  const std::vector<gc::space::ContinuousSpace*>& continuous_spaces = heap->GetContinuousSpaces();
-  const std::vector<gc::space::DiscontinuousSpace*>& discontinuous_spaces = heap->GetDiscontinuousSpaces();
-  typedef std::vector<gc::space::ContinuousSpace*>::const_iterator It;
-  for (It it = continuous_spaces.begin(), end = continuous_spaces.end(); it != end; ++it) {
-    gc::space::ContinuousSpace* space = *it;
+  for (gc::space::ContinuousSpace* space : heap->GetContinuousSpaces()) {
     if (space->IsImageSpace()) {
       // Currently don't include the image space.
     } else if (space->IsZygoteSpace()) {
-      gc::space::DlMallocSpace* dlmalloc_space = space->AsDlMallocSpace();
-      zygoteSize += dlmalloc_space->GetFootprint();
-      zygoteUsed += dlmalloc_space->GetBytesAllocated();
-    } else {
-      // This is the alloc space.
-      gc::space::DlMallocSpace* dlmalloc_space = space->AsDlMallocSpace();
-      allocSize += dlmalloc_space->GetFootprint();
-      allocUsed += dlmalloc_space->GetBytesAllocated();
+      gc::space::ZygoteSpace* zygote_space = space->AsZygoteSpace();
+      zygoteSize += zygote_space->Size();
+      zygoteUsed += zygote_space->GetBytesAllocated();
+    } else if (space->IsMallocSpace()) {
+      // This is a malloc space.
+      gc::space::MallocSpace* malloc_space = space->AsMallocSpace();
+      allocSize += malloc_space->GetFootprint();
+      allocUsed += malloc_space->GetBytesAllocated();
+    } else if (space->IsBumpPointerSpace()) {
+      ScopedObjectAccess soa(env);
+      gc::space::BumpPointerSpace* bump_pointer_space = space->AsBumpPointerSpace();
+      allocSize += bump_pointer_space->Size();
+      allocUsed += bump_pointer_space->GetBytesAllocated();
     }
   }
-  typedef std::vector<gc::space::DiscontinuousSpace*>::const_iterator It2;
-  for (It2 it = discontinuous_spaces.begin(), end = discontinuous_spaces.end(); it != end; ++it) {
-    gc::space::DiscontinuousSpace* space = *it;
+  for (gc::space::DiscontinuousSpace* space : heap->GetDiscontinuousSpaces()) {
     if (space->IsLargeObjectSpace()) {
       largeObjectsSize += space->AsLargeObjectSpace()->GetBytesAllocated();
       largeObjectsUsed += largeObjectsSize;
@@ -312,27 +332,27 @@ static JNINativeMethod gMethods[] = {
   NATIVE_METHOD(VMDebug, getAllocCount, "(I)I"),
   NATIVE_METHOD(VMDebug, getHeapSpaceStats, "([J)V"),
   NATIVE_METHOD(VMDebug, getInstructionCount, "([I)V"),
-  NATIVE_METHOD(VMDebug, getLoadedClassCount, "()I"),
+  NATIVE_METHOD(VMDebug, getLoadedClassCount, "!()I"),
   NATIVE_METHOD(VMDebug, getVmFeatureList, "()[Ljava/lang/String;"),
   NATIVE_METHOD(VMDebug, infopoint, "(I)V"),
-  NATIVE_METHOD(VMDebug, isDebuggerConnected, "()Z"),
-  NATIVE_METHOD(VMDebug, isDebuggingEnabled, "()Z"),
+  NATIVE_METHOD(VMDebug, isDebuggerConnected, "!()Z"),
+  NATIVE_METHOD(VMDebug, isDebuggingEnabled, "!()Z"),
   NATIVE_METHOD(VMDebug, getMethodTracingMode, "()I"),
-  NATIVE_METHOD(VMDebug, lastDebuggerActivity, "()J"),
-  NATIVE_METHOD(VMDebug, printLoadedClasses, "(I)V"),
+  NATIVE_METHOD(VMDebug, lastDebuggerActivity, "!()J"),
+  NATIVE_METHOD(VMDebug, printLoadedClasses, "!(I)V"),
   NATIVE_METHOD(VMDebug, resetAllocCount, "(I)V"),
   NATIVE_METHOD(VMDebug, resetInstructionCount, "()V"),
   NATIVE_METHOD(VMDebug, startAllocCounting, "()V"),
   NATIVE_METHOD(VMDebug, startEmulatorTracing, "()V"),
   NATIVE_METHOD(VMDebug, startInstructionCounting, "()V"),
   NATIVE_METHOD(VMDebug, startMethodTracingDdmsImpl, "(IIZI)V"),
-  NATIVE_METHOD(VMDebug, startMethodTracingFd, "(Ljava/lang/String;Ljava/io/FileDescriptor;II)V"),
-  NATIVE_METHOD(VMDebug, startMethodTracingFilename, "(Ljava/lang/String;II)V"),
+  NATIVE_METHOD(VMDebug, startMethodTracingFd, "(Ljava/lang/String;Ljava/io/FileDescriptor;IIZI)V"),
+  NATIVE_METHOD(VMDebug, startMethodTracingFilename, "(Ljava/lang/String;IIZI)V"),
   NATIVE_METHOD(VMDebug, stopAllocCounting, "()V"),
   NATIVE_METHOD(VMDebug, stopEmulatorTracing, "()V"),
   NATIVE_METHOD(VMDebug, stopInstructionCounting, "()V"),
   NATIVE_METHOD(VMDebug, stopMethodTracing, "()V"),
-  NATIVE_METHOD(VMDebug, threadCpuTimeNanos, "()J"),
+  NATIVE_METHOD(VMDebug, threadCpuTimeNanos, "!()J"),
 };
 
 void register_dalvik_system_VMDebug(JNIEnv* env) {

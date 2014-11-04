@@ -17,12 +17,12 @@
 #ifndef ART_COMPILER_COMPILED_METHOD_H_
 #define ART_COMPILER_COMPILED_METHOD_H_
 
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "instruction_set.h"
 #include "utils.h"
-#include "UniquePtr.h"
 
 namespace llvm {
   class Function;
@@ -36,7 +36,7 @@ class CompiledCode {
  public:
   // For Quick to supply an code blob
   CompiledCode(CompilerDriver* compiler_driver, InstructionSet instruction_set,
-               const std::vector<uint8_t>& code);
+               const std::vector<uint8_t>& quick_code);
 
   // For Portable to supply an ELF object
   CompiledCode(CompilerDriver* compiler_driver, InstructionSet instruction_set,
@@ -46,15 +46,17 @@ class CompiledCode {
     return instruction_set_;
   }
 
-  const std::vector<uint8_t>& GetCode() const {
-    return *code_;
+  const std::vector<uint8_t>* GetPortableCode() const {
+    return portable_code_;
   }
 
-  void SetCode(const std::vector<uint8_t>& code);
-
-  bool operator==(const CompiledCode& rhs) const {
-    return (code_ == rhs.code_);
+  const std::vector<uint8_t>* GetQuickCode() const {
+    return quick_code_;
   }
+
+  void SetCode(const std::vector<uint8_t>* quick_code, const std::vector<uint8_t>* portable_code);
+
+  bool operator==(const CompiledCode& rhs) const;
 
   // To align an offset from a page-aligned value to make it suitable
   // for code storage. For example on ARM, to ensure that PC relative
@@ -65,6 +67,7 @@ class CompiledCode {
   // returns the difference between the code address and a usable PC.
   // mainly to cope with kThumb2 where the lower bit must be set.
   size_t CodeDelta() const;
+  static size_t CodeDelta(InstructionSet instruction_set);
 
   // Returns a pointer suitable for invoking the code at the argument
   // code_pointer address.  Mainly to cope with kThumb2 where the
@@ -72,19 +75,20 @@ class CompiledCode {
   static const void* CodePointer(const void* code_pointer,
                                  InstructionSet instruction_set);
 
-#if defined(ART_USE_PORTABLE_COMPILER)
   const std::string& GetSymbol() const;
   const std::vector<uint32_t>& GetOatdataOffsetsToCompliledCodeOffset() const;
   void AddOatdataOffsetToCompliledCodeOffset(uint32_t offset);
-#endif
 
  private:
-  CompilerDriver* compiler_driver_;
+  CompilerDriver* const compiler_driver_;
 
   const InstructionSet instruction_set_;
 
-  // Used to store the PIC code for Quick and an ELF image for portable.
-  std::vector<uint8_t>* code_;
+  // The ELF image for portable.
+  std::vector<uint8_t>* portable_code_;
+
+  // Used to store the PIC code for Quick.
+  std::vector<uint8_t>* quick_code_;
 
   // Used for the Portable ELF symbol name.
   const std::string symbol_;
@@ -99,30 +103,31 @@ class CompiledCode {
 class CompiledMethod : public CompiledCode {
  public:
   // Constructs a CompiledMethod for the non-LLVM compilers.
-  CompiledMethod(CompilerDriver& driver,
+  CompiledMethod(CompilerDriver* driver,
                  InstructionSet instruction_set,
-                 const std::vector<uint8_t>& code,
+                 const std::vector<uint8_t>& quick_code,
                  const size_t frame_size_in_bytes,
                  const uint32_t core_spill_mask,
                  const uint32_t fp_spill_mask,
                  const std::vector<uint8_t>& mapping_table,
                  const std::vector<uint8_t>& vmap_table,
-                 const std::vector<uint8_t>& native_gc_map);
+                 const std::vector<uint8_t>& native_gc_map,
+                 const std::vector<uint8_t>* cfi_info);
 
-  // Constructs a CompiledMethod for the JniCompiler.
-  CompiledMethod(CompilerDriver& driver,
+  // Constructs a CompiledMethod for the QuickJniCompiler.
+  CompiledMethod(CompilerDriver* driver,
                  InstructionSet instruction_set,
-                 const std::vector<uint8_t>& code,
+                 const std::vector<uint8_t>& quick_code,
                  const size_t frame_size_in_bytes,
                  const uint32_t core_spill_mask,
                  const uint32_t fp_spill_mask);
 
   // Constructs a CompiledMethod for the Portable compiler.
-  CompiledMethod(CompilerDriver& driver, InstructionSet instruction_set, const std::string& code,
+  CompiledMethod(CompilerDriver* driver, InstructionSet instruction_set, const std::string& code,
                  const std::vector<uint8_t>& gc_map, const std::string& symbol);
 
   // Constructs a CompiledMethod for the Portable JniCompiler.
-  CompiledMethod(CompilerDriver& driver, InstructionSet instruction_set, const std::string& code,
+  CompiledMethod(CompilerDriver* driver, InstructionSet instruction_set, const std::string& code,
                  const std::string& symbol);
 
   ~CompiledMethod() {}
@@ -154,6 +159,10 @@ class CompiledMethod : public CompiledCode {
     return *gc_map_;
   }
 
+  const std::vector<uint8_t>* GetCFIInfo() const {
+    return cfi_info_;
+  }
+
  private:
   // For quick code, the size of the activation used by the code.
   const size_t frame_size_in_bytes_;
@@ -169,6 +178,8 @@ class CompiledMethod : public CompiledCode {
   // For quick code, a map keyed by native PC indices to bitmaps describing what dalvik registers
   // are live. For portable code, the key is a dalvik PC.
   std::vector<uint8_t>* gc_map_;
+  // For quick code, a FDE entry for the debug_frame section.
+  std::vector<uint8_t>* cfi_info_;
 };
 
 }  // namespace art

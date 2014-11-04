@@ -20,11 +20,13 @@
 #include <cerrno>
 #include <cstring>
 #include <iostream>  // NOLINT
+#include <memory>
 #include <sstream>
 #include <signal.h>
+#include <vector>
+
 #include "base/macros.h"
 #include "log_severity.h"
-#include "UniquePtr.h"
 
 #define CHECK(x) \
   if (UNLIKELY(!(x))) \
@@ -64,6 +66,16 @@
     } \
   } while (false)
 
+// CHECK that can be used in a constexpr function. For example,
+//    constexpr int half(int n) {
+//      return
+//          DCHECK_CONSTEXPR(n >= 0, , 0)
+//          CHECK_CONSTEXPR((n & 1) == 0), << "Extra debugging output: n = " << n, 0)
+//          n / 2;
+//    }
+#define CHECK_CONSTEXPR(x, out, dummy) \
+  (UNLIKELY(!(x))) ? (LOG(FATAL) << "Check failed: " << #x out, dummy) :
+
 #ifndef NDEBUG
 
 #define DCHECK(x) CHECK(x)
@@ -75,6 +87,7 @@
 #define DCHECK_GT(x, y) CHECK_GT(x, y)
 #define DCHECK_STREQ(s1, s2) CHECK_STREQ(s1, s2)
 #define DCHECK_STRNE(s1, s2) CHECK_STRNE(s1, s2)
+#define DCHECK_CONSTEXPR(x, out, dummy) CHECK_CONSTEXPR(x, out, dummy)
 
 #else  // NDEBUG
 
@@ -113,6 +126,9 @@
 #define DCHECK_STRNE(str1, str2) \
   while (false) \
     CHECK_STRNE(str1, str2)
+
+#define DCHECK_CONSTEXPR(x, out, dummy) \
+  (false && (x)) ? (dummy) :
 
 #endif
 
@@ -192,7 +208,7 @@ class LogMessage {
     : data_(new LogMessageData(file, line, severity, error)) {
   }
 
-  ~LogMessage() LOCKS_EXCLUDED(Locks::logging_lock_);
+  ~LogMessage();  // TODO: enable LOCKS_EXCLUDED(Locks::logging_lock_).
 
   std::ostream& stream() {
     return data_->buffer;
@@ -201,30 +217,12 @@ class LogMessage {
  private:
   static void LogLine(const LogMessageData& data, const char*);
 
-  const UniquePtr<LogMessageData> data_;
+  const std::unique_ptr<LogMessageData> data_;
 
   friend void HandleUnexpectedSignal(int signal_number, siginfo_t* info, void* raw_context);
   friend class Mutex;
   DISALLOW_COPY_AND_ASSIGN(LogMessage);
 };
-
-// Prints a hex dump in this format:
-//
-// 01234560: 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff  0123456789abcdef
-// 01234568: 00 11 22 33 44 55 66 77 88 99 aa bb cc dd ee ff  0123456789abcdef
-class HexDump {
- public:
-  HexDump(const void* address, size_t byte_count, bool show_actual_addresses = false);
-  void Dump(std::ostream& os) const;
-
- private:
-  const void* address_;
-  size_t byte_count_;
-  bool show_actual_addresses_;
-
-  DISALLOW_COPY_AND_ASSIGN(HexDump);
-};
-std::ostream& operator<<(std::ostream& os, const HexDump& rhs);
 
 // A convenience to allow any class with a "Dump(std::ostream& os)" member function
 // but without an operator<< to be used as if it had an operator<<. Use like this:
@@ -254,27 +252,23 @@ std::ostream& operator<<(std::ostream& os, const Dumpable<T>& rhs) {
 }
 
 template<typename T>
-class MutatorLockedDumpable {
+class ConstDumpable {
  public:
-  explicit MutatorLockedDumpable(T& value)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) : value_(value) {
+  explicit ConstDumpable(const T& value) : value_(value) {
   }
 
-  void Dump(std::ostream& os) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  void Dump(std::ostream& os) const {
     value_.Dump(os);
   }
 
  private:
-  T& value_;
+  const T& value_;
 
-  DISALLOW_COPY_AND_ASSIGN(MutatorLockedDumpable);
+  DISALLOW_COPY_AND_ASSIGN(ConstDumpable);
 };
 
 template<typename T>
-std::ostream& operator<<(std::ostream& os, const MutatorLockedDumpable<T>& rhs)
-// TODO: should be SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) however annotalysis
-//       currently fails for this.
-    NO_THREAD_SAFETY_ANALYSIS {
+std::ostream& operator<<(std::ostream& os, const ConstDumpable<T>& rhs) {
   rhs.Dump(os);
   return os;
 }
@@ -307,19 +301,23 @@ class ToStr {
 // and the "-verbose:" command line argument.
 struct LogVerbosity {
   bool class_linker;  // Enabled with "-verbose:class".
-  bool verifier;
   bool compiler;
-  bool heap;
   bool gc;
+  bool heap;
   bool jdwp;
   bool jni;
   bool monitor;
+  bool profiler;
+  bool signals;
   bool startup;
   bool third_party_jni;  // Enabled with "-verbose:third-party-jni".
   bool threads;
+  bool verifier;
 };
 
 extern LogVerbosity gLogVerbosity;
+
+extern std::vector<std::string> gVerboseMethods;
 
 // Used on fatal exit. Prevents recursive aborts. Allows us to disable
 // some error checking to ensure fatal shutdown makes forward progress.

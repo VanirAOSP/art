@@ -14,34 +14,26 @@
  * limitations under the License.
  */
 
-#include "string.h"
+#include "string-inl.h"
 
+#include "arch/memcmp16.h"
 #include "array.h"
 #include "class-inl.h"
 #include "gc/accounting/card_table-inl.h"
 #include "intern_table.h"
 #include "object-inl.h"
 #include "runtime.h"
-#include "sirt_ref.h"
+#include "handle_scope-inl.h"
 #include "thread.h"
-#include "utf.h"
+#include "utf-inl.h"
 
 namespace art {
 namespace mirror {
 
-const CharArray* String::GetCharArray() const {
-  return GetFieldObject<const CharArray*>(ValueOffset(), false);
-}
+// TODO: get global references for these
+GcRoot<Class> String::java_lang_String_;
 
-void String::ComputeHashCode() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  SetHashCode(ComputeUtf16Hash(GetCharArray(), GetOffset(), GetLength()));
-}
-
-int32_t String::GetUtfLength() const {
-  return CountUtf8Bytes(GetCharArray()->GetData() + GetOffset(), GetLength());
-}
-
-int32_t String::FastIndexOf(int32_t ch, int32_t start) const {
+int32_t String::FastIndexOf(int32_t ch, int32_t start) {
   int32_t count = GetLength();
   if (start < 0) {
     start = 0;
@@ -59,78 +51,43 @@ int32_t String::FastIndexOf(int32_t ch, int32_t start) const {
   return -1;
 }
 
-void String::SetArray(CharArray* new_array) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  DCHECK(new_array != NULL);
-  SetFieldObject(OFFSET_OF_OBJECT_MEMBER(String, array_), new_array, false);
-}
-
-// TODO: get global references for these
-Class* String::java_lang_String_ = NULL;
-
 void String::SetClass(Class* java_lang_String) {
-  CHECK(java_lang_String_ == NULL);
+  CHECK(java_lang_String_.IsNull());
   CHECK(java_lang_String != NULL);
-  java_lang_String_ = java_lang_String;
+  java_lang_String_ = GcRoot<Class>(java_lang_String);
 }
 
 void String::ResetClass() {
-  CHECK(java_lang_String_ != NULL);
-  java_lang_String_ = NULL;
+  CHECK(!java_lang_String_.IsNull());
+  java_lang_String_ = GcRoot<Class>(nullptr);
 }
 
-String* String::Intern() {
-  return Runtime::Current()->GetInternTable()->InternWeak(this);
+int32_t String::ComputeHashCode() {
+  const int32_t hash_code = ComputeUtf16Hash(GetCharArray(), GetOffset(), GetLength());
+  SetHashCode(hash_code);
+  return hash_code;
 }
 
-int32_t String::GetHashCode() {
-  int32_t result = GetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_), false);
-  if (result == 0) {
-    ComputeHashCode();
-  }
-  result = GetField32(OFFSET_OF_OBJECT_MEMBER(String, hash_code_), false);
-  DCHECK(result != 0 || ComputeUtf16Hash(GetCharArray(), GetOffset(), GetLength()) == 0)
-          << ToModifiedUtf8() << " " << result;
-  return result;
-}
-
-int32_t String::GetLength() const {
-  int32_t result = GetField32(OFFSET_OF_OBJECT_MEMBER(String, count_), false);
-  DCHECK(result >= 0 && result <= GetCharArray()->GetLength());
-  return result;
-}
-
-uint16_t String::CharAt(int32_t index) const {
-  // TODO: do we need this? Equals is the only caller, and could
-  // bounds check itself.
-  DCHECK_GE(count_, 0);  // ensures the unsigned comparison is safe.
-  if (UNLIKELY(static_cast<uint32_t>(index) >= static_cast<uint32_t>(count_))) {
-    Thread* self = Thread::Current();
-    ThrowLocation throw_location = self->GetCurrentLocationForThrow();
-    self->ThrowNewExceptionF(throw_location, "Ljava/lang/StringIndexOutOfBoundsException;",
-                             "length=%i; index=%i", count_, index);
-    return 0;
-  }
-  return GetCharArray()->Get(index + GetOffset());
+int32_t String::GetUtfLength() {
+  return CountUtf8Bytes(GetCharArray()->GetData() + GetOffset(), GetLength());
 }
 
 String* String::AllocFromUtf16(Thread* self,
                                int32_t utf16_length,
                                const uint16_t* utf16_data_in,
                                int32_t hash_code) {
-  CHECK(utf16_data_in != NULL || utf16_length == 0);
-  String* string = Alloc(self, GetJavaLangString(), utf16_length);
-  if (string == NULL) {
-    return NULL;
+  CHECK(utf16_data_in != nullptr || utf16_length == 0);
+  String* string = Alloc(self, utf16_length);
+  if (UNLIKELY(string == nullptr)) {
+    return nullptr;
   }
-  // TODO: use 16-bit wide memset variant
   CharArray* array = const_cast<CharArray*>(string->GetCharArray());
-  if (array == NULL) {
-    return NULL;
+  if (UNLIKELY(array == nullptr)) {
+    return nullptr;
   }
-  for (int i = 0; i < utf16_length; i++) {
-    array->Set(i, utf16_data_in[i]);
-  }
+  memcpy(array->GetData(), utf16_data_in, utf16_length * sizeof(uint16_t));
   if (hash_code != 0) {
+    DCHECK_EQ(hash_code, ComputeUtf16Hash(utf16_data_in, utf16_length));
     string->SetHashCode(hash_code);
   } else {
     string->ComputeHashCode();
@@ -139,18 +96,16 @@ String* String::AllocFromUtf16(Thread* self,
 }
 
 String* String::AllocFromModifiedUtf8(Thread* self, const char* utf) {
-  if (utf == NULL) {
-    return NULL;
-  }
+  DCHECK(utf != nullptr);
   size_t char_count = CountModifiedUtf8Chars(utf);
   return AllocFromModifiedUtf8(self, char_count, utf);
 }
 
 String* String::AllocFromModifiedUtf8(Thread* self, int32_t utf16_length,
                                       const char* utf8_data_in) {
-  String* string = Alloc(self, GetJavaLangString(), utf16_length);
-  if (string == NULL) {
-    return NULL;
+  String* string = Alloc(self, utf16_length);
+  if (UNLIKELY(string == nullptr)) {
+    return nullptr;
   }
   uint16_t* utf16_data_out =
       const_cast<uint16_t*>(string->GetCharArray()->GetData());
@@ -159,27 +114,26 @@ String* String::AllocFromModifiedUtf8(Thread* self, int32_t utf16_length,
   return string;
 }
 
-String* String::Alloc(Thread* self, Class* java_lang_String, int32_t utf16_length) {
-  SirtRef<CharArray> array(self, CharArray::Alloc(self, utf16_length));
-  if (array.get() == NULL) {
-    return NULL;
+String* String::Alloc(Thread* self, int32_t utf16_length) {
+  StackHandleScope<1> hs(self);
+  Handle<CharArray> array(hs.NewHandle(CharArray::Alloc(self, utf16_length)));
+  if (UNLIKELY(array.Get() == nullptr)) {
+    return nullptr;
   }
-  return Alloc(self, java_lang_String, array.get());
+  return Alloc(self, array);
 }
 
-String* String::Alloc(Thread* self, Class* java_lang_String, CharArray* array) {
+String* String::Alloc(Thread* self, Handle<CharArray> array) {
   // Hold reference in case AllocObject causes GC.
-  SirtRef<CharArray> array_ref(self, array);
-  String* string = down_cast<String*>(java_lang_String->AllocObject(self));
-  if (string == NULL) {
-    return NULL;
+  String* string = down_cast<String*>(GetJavaLangString()->AllocObject(self));
+  if (LIKELY(string != nullptr)) {
+    string->SetArray(array.Get());
+    string->SetCount(array->GetLength());
   }
-  string->SetArray(array);
-  string->SetCount(array->GetLength());
   return string;
 }
 
-bool String::Equals(const String* that) const {
+bool String::Equals(String* that) {
   if (this == that) {
     // Quick reference equality test
     return true;
@@ -201,7 +155,7 @@ bool String::Equals(const String* that) const {
   }
 }
 
-bool String::Equals(const uint16_t* that_chars, int32_t that_offset, int32_t that_length) const {
+bool String::Equals(const uint16_t* that_chars, int32_t that_offset, int32_t that_length) {
   if (this->GetLength() != that_length) {
     return false;
   } else {
@@ -214,7 +168,7 @@ bool String::Equals(const uint16_t* that_chars, int32_t that_offset, int32_t tha
   }
 }
 
-bool String::Equals(const char* modified_utf8) const {
+bool String::Equals(const char* modified_utf8) {
   for (int32_t i = 0; i < GetLength(); ++i) {
     uint16_t ch = GetUtf16FromUtf8(&modified_utf8);
     if (ch == '\0' || ch != CharAt(i)) {
@@ -224,7 +178,7 @@ bool String::Equals(const char* modified_utf8) const {
   return *modified_utf8 == '\0';
 }
 
-bool String::Equals(const StringPiece& modified_utf8) const {
+bool String::Equals(const StringPiece& modified_utf8) {
   const char* p = modified_utf8.data();
   for (int32_t i = 0; i < GetLength(); ++i) {
     uint16_t ch = GetUtf16FromUtf8(&p);
@@ -236,7 +190,7 @@ bool String::Equals(const StringPiece& modified_utf8) const {
 }
 
 // Create a modified UTF-8 encoded std::string from a java/lang/String object.
-std::string String::ToModifiedUtf8() const {
+std::string String::ToModifiedUtf8() {
   const uint16_t* chars = GetCharArray()->GetData() + GetOffset();
   size_t byte_count = GetUtfLength();
   std::string result(byte_count, static_cast<char>(0));
@@ -244,24 +198,9 @@ std::string String::ToModifiedUtf8() const {
   return result;
 }
 
-#ifdef HAVE__MEMCMP16
-// "count" is in 16-bit units.
-extern "C" uint32_t __memcmp16(const uint16_t* s0, const uint16_t* s1, size_t count);
-#define MemCmp16 __memcmp16
-#else
-static uint32_t MemCmp16(const uint16_t* s0, const uint16_t* s1, size_t count) {
-  for (size_t i = 0; i < count; i++) {
-    if (s0[i] != s1[i]) {
-      return static_cast<int32_t>(s0[i]) - static_cast<int32_t>(s1[i]);
-    }
-  }
-  return 0;
-}
-#endif
-
-int32_t String::CompareTo(String* rhs) const {
+int32_t String::CompareTo(String* rhs) {
   // Quick test for comparison of a string with itself.
-  const String* lhs = this;
+  String* lhs = this;
   if (lhs == rhs) {
     return 0;
   }
@@ -271,17 +210,23 @@ int32_t String::CompareTo(String* rhs) const {
   // *without* sign extension before it subtracts them (which makes some
   // sense since "char" is unsigned).  So what we get is the result of
   // 0x000000e9 - 0x0000ffff, which is 0xffff00ea.
-  int lhsCount = lhs->GetLength();
-  int rhsCount = rhs->GetLength();
-  int countDiff = lhsCount - rhsCount;
-  int minCount = (countDiff < 0) ? lhsCount : rhsCount;
+  int32_t lhsCount = lhs->GetLength();
+  int32_t rhsCount = rhs->GetLength();
+  int32_t countDiff = lhsCount - rhsCount;
+  int32_t minCount = (countDiff < 0) ? lhsCount : rhsCount;
   const uint16_t* lhsChars = lhs->GetCharArray()->GetData() + lhs->GetOffset();
   const uint16_t* rhsChars = rhs->GetCharArray()->GetData() + rhs->GetOffset();
-  int otherRes = MemCmp16(lhsChars, rhsChars, minCount);
+  int32_t otherRes = MemCmp16(lhsChars, rhsChars, minCount);
   if (otherRes != 0) {
     return otherRes;
   }
   return countDiff;
+}
+
+void String::VisitRoots(RootCallback* callback, void* arg) {
+  if (!java_lang_String_.IsNull()) {
+    java_lang_String_.VisitRoot(callback, arg, 0, kRootStickyClass);
+  }
 }
 
 }  // namespace mirror

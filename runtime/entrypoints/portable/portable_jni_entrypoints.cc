@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/object-inl.h"
 #include "thread-inl.h"
@@ -23,7 +23,7 @@ namespace art {
 
 // Called on entry to JNI, transition out of Runnable and release share of mutator_lock_.
 extern "C" uint32_t art_portable_jni_method_start(Thread* self)
-    UNLOCK_FUNCTION(GlobalSynchronizatio::mutator_lock_) {
+    UNLOCK_FUNCTION(Locks::mutator_lock_) {
   JNIEnvExt* env = self->GetJniEnv();
   uint32_t saved_local_ref_cookie = env->local_ref_cookie;
   env->local_ref_cookie = env->locals.GetSegmentState();
@@ -32,12 +32,13 @@ extern "C" uint32_t art_portable_jni_method_start(Thread* self)
 }
 
 extern "C" uint32_t art_portable_jni_method_start_synchronized(jobject to_lock, Thread* self)
-    UNLOCK_FUNCTION(Locks::mutator_lock_) {
+    UNLOCK_FUNCTION(Locks::mutator_lock_) NO_THREAD_SAFETY_ANALYSIS {
   self->DecodeJObject(to_lock)->MonitorEnter(self);
   return art_portable_jni_method_start(self);
 }
 
-static void PopLocalReferences(uint32_t saved_local_ref_cookie, Thread* self) {
+static void PopLocalReferences(uint32_t saved_local_ref_cookie, Thread* self)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   JNIEnvExt* env = self->GetJniEnv();
   env->locals.SetSegmentState(env->local_ref_cookie);
   env->local_ref_cookie = saved_local_ref_cookie;

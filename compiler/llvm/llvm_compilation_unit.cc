@@ -82,7 +82,6 @@
 #include "ir_builder.h"
 #include "os.h"
 #include "runtime_support_builder_arm.h"
-#include "runtime_support_builder_thumb2.h"
 #include "runtime_support_builder_x86.h"
 #include "utils_llvm.h"
 
@@ -118,11 +117,9 @@ LlvmCompilationUnit::LlvmCompilationUnit(const CompilerLLVM* compiler_llvm, size
   default:
     runtime_support_.reset(new RuntimeSupportBuilder(*context_, *module_, *irb_));
     break;
+  case kThumb2:
   case kArm:
     runtime_support_.reset(new RuntimeSupportBuilderARM(*context_, *module_, *irb_));
-    break;
-  case kThumb2:
-    runtime_support_.reset(new RuntimeSupportBuilderThumb2(*context_, *module_, *irb_));
     break;
   case kX86:
     runtime_support_.reset(new RuntimeSupportBuilderX86(*context_, *module_, *irb_));
@@ -146,7 +143,7 @@ InstructionSet LlvmCompilationUnit::GetInstructionSet() const {
 
 static std::string DumpDirectory() {
   if (kIsTargetBuild) {
-    return GetDalvikCacheOrDie(GetAndroidData());
+    return GetDalvikCacheOrDie("llvm-dump");
   }
   return "/tmp";
 }
@@ -154,8 +151,8 @@ static std::string DumpDirectory() {
 void LlvmCompilationUnit::DumpBitcodeToFile() {
   std::string bitcode;
   DumpBitcodeToString(bitcode);
-  std::string filename(StringPrintf("%s/Art%u.bc", DumpDirectory().c_str(), cunit_id_));
-  UniquePtr<File> output(OS::CreateEmptyFile(filename.c_str()));
+  std::string filename(StringPrintf("%s/Art%zu.bc", DumpDirectory().c_str(), cunit_id_));
+  std::unique_ptr<File> output(OS::CreateEmptyFile(filename.c_str()));
   output->WriteFully(bitcode.data(), bitcode.size());
   LOG(INFO) << ".bc file written successfully: " << filename;
 }
@@ -181,8 +178,8 @@ bool LlvmCompilationUnit::Materialize() {
   const bool kDumpELF = false;
   if (kDumpELF) {
     // Dump the ELF image for debugging
-    std::string filename(StringPrintf("%s/Art%u.o", DumpDirectory().c_str(), cunit_id_));
-    UniquePtr<File> output(OS::CreateEmptyFile(filename.c_str()));
+    std::string filename(StringPrintf("%s/Art%zu.o", DumpDirectory().c_str(), cunit_id_));
+    std::unique_ptr<File> output(OS::CreateEmptyFile(filename.c_str()));
     output->WriteFully(elf_object_.data(), elf_object_.size());
     LOG(INFO) << ".o file written successfully: " << filename;
   }
@@ -202,7 +199,8 @@ bool LlvmCompilationUnit::MaterializeToRawOStream(::llvm::raw_ostream& out_strea
   std::string target_triple;
   std::string target_cpu;
   std::string target_attr;
-  CompilerDriver::InstructionSetToLLVMTarget(GetInstructionSet(), target_triple, target_cpu, target_attr);
+  CompilerDriver::InstructionSetToLLVMTarget(GetInstructionSet(), &target_triple, &target_cpu,
+                                             &target_attr);
 
   std::string errmsg;
   const ::llvm::Target* target =
@@ -316,23 +314,8 @@ bool LlvmCompilationUnit::MaterializeToRawOStream(::llvm::raw_ostream& out_strea
 // section if the section alignment is greater than kArchAlignment.
 void LlvmCompilationUnit::CheckCodeAlign(uint32_t align) const {
   InstructionSet insn_set = GetInstructionSet();
-  switch (insn_set) {
-  case kThumb2:
-  case kArm:
-    CHECK_LE(align, static_cast<uint32_t>(kArmAlignment));
-    break;
-
-  case kX86:
-    CHECK_LE(align, static_cast<uint32_t>(kX86Alignment));
-    break;
-
-  case kMips:
-    CHECK_LE(align, static_cast<uint32_t>(kMipsAlignment));
-    break;
-
-  default:
-    LOG(FATAL) << "Unknown instruction set: " << insn_set;
-  }
+  size_t insn_set_align = GetInstructionSetAlignment(insn_set);
+  CHECK_LE(align, static_cast<uint32_t>(insn_set_align));
 }
 
 

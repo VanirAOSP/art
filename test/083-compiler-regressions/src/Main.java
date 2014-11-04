@@ -15,6 +15,7 @@
  */
 
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * Test for Jit regressions.
@@ -29,19 +30,85 @@ public class Main {
     }
 
     public static void main(String args[]) throws Exception {
+        b17630605();
+        b17411468();
         b2296099Test();
         b2302318Test();
         b2487514Test();
         b5884080Test();
+        b13679511Test();
+        b16177324TestWrapper();
+        b16230771TestWrapper();
         largeFrameTest();
         largeFrameTestFloat();
+        mulBy1Test();
+        constantPropagationTest();
         getterSetterTest();
         identityTest();
         wideGetterSetterTest();
         wideIdentityTest();
         returnConstantTest();
+        setterTestWithReturnArgIgnoreReturn();
+        setterTestWithReturnArgUseReturn();
+        wideSetterTestWithReturnArgIgnoreReturn();
+        wideSetterTestWithReturnArgUseReturn();
+        LVNTests.testNPE1();
+        LVNTests.testNPE2();
         ZeroTests.longDivTest();
         ZeroTests.longModTest();
+        MirOpSelectTests.testIfCcz();
+        ManyFloatArgs();
+        atomicLong();
+        LiveFlags.test();
+        minDoubleWith3ConstsTest();
+    }
+
+    public static void b17630605() {
+      // b/17630605 - failure to properly handle min long immediates.
+      long a1 = 40455547223404749L;
+      long a2 = Long.MIN_VALUE;
+      long answer = a1 + a2;
+      if (answer == -9182916489631371059L) {
+          System.out.println("b17630605 passes");
+      } else {
+          System.out.println("b17630605 fails: " + answer);
+      }
+    }
+
+    public static void b17411468() {
+      // b/17411468 - inline Math.round failure.
+      double d1 = 1.0;
+      double d2 = Math.round(d1);
+      if (d1 == d2) {
+        System.out.println("b17411468 passes");
+      } else {
+        System.out.println("b17411468 fails: Math.round(" + d1 + ") returned " + d2);
+      }
+    }
+
+    public static double minDouble(double a, double b, double c) {
+        return Math.min(Math.min(a, b), c);
+    }
+
+    public static void minDoubleWith3ConstsTest() {
+        double result = minDouble(1.2, 2.5, Double.NaN);
+        if (Double.isNaN(result)) {
+            System.out.println("minDoubleWith3ConstsTest passes");
+        } else {
+            System.out.println("minDoubleWith3ConstsTest fails: " + result +
+                               " (expecting NaN)");
+        }
+    }
+
+    public static void atomicLong() {
+        AtomicLong atomicLong = new AtomicLong();
+        atomicLong.addAndGet(3);
+        atomicLong.addAndGet(2);
+        atomicLong.addAndGet(1);
+        long result = atomicLong.get();
+        System.out.println(result == 6L ? "atomicLong passes" :
+          ("atomicLong failes: returns " + result + ", expected 6")
+        );
     }
 
     public static void returnConstantTest() {
@@ -61,19 +128,19 @@ public class Main {
 
     static void wideIdentityTest() {
         Foo foo = new Foo();
-        long i = 1;
+        long i = 0x200000001L;
         i += foo.wideIdent0(i);
         i += foo.wideIdent1(0,i);
         i += foo.wideIdent2(0,0,i);
         i += foo.wideIdent3(0,0,0,i);
         i += foo.wideIdent4(0,0,0,0,i);
         i += foo.wideIdent5(0,0,0,0,0,i);
-        if (i == 64) {
+        if (i == 0x8000000040L) {
             System.out.println("wideIdentityTest passes");
         }
         else {
-            System.out.println("wideIdentityTest fails: " + i +
-                               " (expecting 64)");
+            System.out.println("wideIdentityTest fails: 0x" + Long.toHexString(i) +
+                               " (expecting 0x8000000040)");
         }
     }
 
@@ -90,12 +157,25 @@ public class Main {
         foo.wideSetBar4(0,0,0,sum);
         sum += foo.wideGetBar5(1,2,3,4,5);
         foo.wideSetBar5(0,0,0,0,sum);
-        if (foo.wideGetBar0() == 39488) {
+        long result1 = foo.wideGetBar0();
+        long expected1 = 1234L << 5;
+        sum += foo.wideGetBar0();
+        foo.wideSetBar2i(0,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar3i(0,0,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar4i(0,0,0,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar5i(0,0,0,0,sum);
+        long result2 = foo.wideGetBar0();
+        long expected2 = 1234L << 9;
+        if (result1 == expected1 && result2 == expected2) {
             System.out.println("wideGetterSetterTest passes");
         }
         else {
             System.out.println("wideGetterSetterTest fails: " +
-                                foo.wideGetBar0() + " (expecting 39488)");
+                                "result1: " + result1 + " (expecting " + expected1 + "), " +
+                                "result2: " + result2 + " (expecting " + expected2 + ")");
         }
     }
 
@@ -146,6 +226,615 @@ public class Main {
         }
     }
 
+    static void setterTestWithReturnArgIgnoreReturn() {
+        Foo foo = new Foo();
+        int sum = foo.getBar0();
+        sum += foo.getBar0();
+        foo.setBar1ReturnThis(sum);
+        sum += foo.getBar0();
+        foo.setBar2ReturnThis(1,sum);
+        sum += foo.getBar0();
+        foo.setBar3ReturnThis(1,2,sum);
+        sum += foo.getBar0();
+        foo.setBar4ReturnThis(1,2,3,sum);
+        sum += foo.getBar0();
+        foo.setBar5ReturnThis(1,2,3,4,sum);
+        sum += foo.getBar0();
+        foo.setBar1ReturnBarArg(sum);
+        sum += foo.getBar0();
+        foo.setBar2ReturnBarArg(1,sum);
+        sum += foo.getBar0();
+        foo.setBar3ReturnBarArg(1,2,sum);
+        sum += foo.getBar0();
+        foo.setBar4ReturnBarArg(1,2,3,sum);
+        sum += foo.getBar0();
+        foo.setBar5ReturnBarArg(1,2,3,4,sum);
+        sum += foo.getBar0();
+        foo.setBar2ReturnDummyArg1(1,sum);
+        sum += foo.getBar0();
+        foo.setBar3ReturnDummyArg2(1,2,sum);
+        sum += foo.getBar0();
+        foo.setBar4ReturnDummyArg3(1,2,3,sum);
+        sum += foo.getBar0();
+        foo.setBar5ReturnDummyArg4(1,2,3,4,sum);
+        sum += foo.getBar0();
+        Foo nullFoo = Foo.getNullFoo();
+        try {
+            nullFoo.setBar1ReturnThis(sum);
+        } catch(NullPointerException npe) {
+            sum += 404;
+        }
+        try {
+            nullFoo.setBar2ReturnThis(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 2 * 404;
+        }
+        try {
+            nullFoo.setBar3ReturnThis(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 3 * 404;
+        }
+        try {
+            nullFoo.setBar4ReturnThis(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 4 * 404;
+        }
+        try {
+            nullFoo.setBar5ReturnThis(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 5 * 404;
+        }
+        try {
+            nullFoo.setBar1ReturnBarArg(sum);
+        } catch(NullPointerException npe) {
+            sum += 6 * 404;
+        }
+        try {
+            nullFoo.setBar2ReturnBarArg(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 7 * 404;
+        }
+        try {
+            nullFoo.setBar3ReturnBarArg(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 8 * 404;
+        }
+        try {
+            nullFoo.setBar4ReturnBarArg(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 9 * 404;
+        }
+        try {
+            nullFoo.setBar5ReturnBarArg(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 10 * 404;
+        }
+        try {
+            nullFoo.setBar2ReturnDummyArg1(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 11 * 404;
+        }
+        try {
+            nullFoo.setBar3ReturnDummyArg2(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 12 * 404;
+        }
+        try {
+            nullFoo.setBar4ReturnDummyArg3(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 13 * 404;
+        }
+        try {
+            nullFoo.setBar5ReturnDummyArg4(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 14 * 404;
+        }
+        int expected = (1234 << 15) + 404 * (15 * 14 / 2);
+        if (sum == expected) {
+            System.out.println("setterTestWithReturnArgIgnoreReturn passes");
+        }
+        else {
+            System.out.println("setterTestWithReturnArgIgnoreReturn fails: " + sum +
+                               " (expecting " + expected + ")");
+        }
+    }
+
+    static void setterTestWithReturnArgUseReturn() {
+        Foo foo = new Foo();
+        int sum = foo.getBar0();
+        int sumDummy = 0;
+        sum += foo.getBar0();
+        Foo foo2 = foo.setBar1ReturnThis(sum);
+        sum += foo2.getBar0();
+        foo = foo2.setBar2ReturnThis(1,sum);
+        sum += foo.getBar0();
+        foo2 = foo.setBar3ReturnThis(1,2,sum);
+        sum += foo2.getBar0();
+        foo = foo2.setBar4ReturnThis(1,2,3,sum);
+        sum += foo.getBar0();
+        foo = foo.setBar5ReturnThis(1,2,3,4,sum);
+        sum += foo.getBar0();
+        sum += foo.setBar1ReturnBarArg(sum);
+        sum += foo.getBar0();
+        sum += foo.setBar2ReturnBarArg(1,sum);
+        sum += foo.getBar0();
+        sum += foo.setBar3ReturnBarArg(1,2,sum);
+        sum += foo.getBar0();
+        sum += foo.setBar4ReturnBarArg(1,2,3,sum);
+        sum += foo.getBar0();
+        sum += foo.setBar5ReturnBarArg(1,2,3,4,sum);
+        sum += foo.getBar0();
+        sumDummy += foo.setBar2ReturnDummyArg1(1,sum);
+        sum += foo.getBar0();
+        sumDummy += foo.setBar3ReturnDummyArg2(1,2,sum);
+        sum += foo.getBar0();
+        sumDummy += foo.setBar4ReturnDummyArg3(1,2,3,sum);
+        sum += foo.getBar0();
+        sumDummy += foo.setBar5ReturnDummyArg4(1,2,3,4,sum);
+        sum += foo.getBar0();
+        Foo nullFoo = Foo.getNullFoo();
+        try {
+            foo = nullFoo.setBar1ReturnThis(sum);
+        } catch(NullPointerException npe) {
+            sum += 404;
+        }
+        try {
+            foo = nullFoo.setBar2ReturnThis(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 2 * 404;
+        }
+        try {
+            foo = nullFoo.setBar3ReturnThis(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 3 * 404;
+        }
+        try {
+            foo = nullFoo.setBar4ReturnThis(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 4 * 404;
+        }
+        try {
+            foo = nullFoo.setBar5ReturnThis(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 5 * 404;
+        }
+        try {
+            sum += nullFoo.setBar1ReturnBarArg(sum);
+        } catch(NullPointerException npe) {
+            sum += 6 * 404;
+        }
+        try {
+            sum += nullFoo.setBar2ReturnBarArg(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 7 * 404;
+        }
+        try {
+            sum += nullFoo.setBar3ReturnBarArg(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 8 * 404;
+        }
+        try {
+            sum += nullFoo.setBar4ReturnBarArg(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 9 * 404;
+        }
+        try {
+            sum += nullFoo.setBar5ReturnBarArg(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 10 * 404;
+        }
+        try {
+            sumDummy += nullFoo.setBar2ReturnDummyArg1(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 11 * 404;
+        }
+        try {
+            sumDummy += nullFoo.setBar3ReturnDummyArg2(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 12 * 404;
+        }
+        try {
+            sumDummy += nullFoo.setBar4ReturnDummyArg3(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 13 * 404;
+        }
+        try {
+            sumDummy += nullFoo.setBar5ReturnDummyArg4(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 14 * 404;
+        }
+        int expected = (1234 << 10) * 3 * 3 * 3 * 3 * 3 + 404 * (15 * 14 / 2);
+        int expectedDummy = 5 * 4 / 2;
+        if (sum == expected && sumDummy == expectedDummy) {
+            System.out.println("setterTestWithReturnArgUseReturn passes");
+        }
+        else {
+            System.out.println("setterTestWithReturnArgUseReturn fails: " + sum +
+                               " (expecting " + expected + "), sumDummy = " + sumDummy +
+                               "(expecting " + expectedDummy + ")");
+        }
+    }
+
+    static void wideSetterTestWithReturnArgIgnoreReturn() {
+        Foo foo = new Foo();
+        long sum = foo.wideGetBar0();
+        sum += foo.wideGetBar0();
+        foo.wideSetBar1ReturnThis(sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar2ReturnThis(1,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar3ReturnThis(1,2,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar4ReturnThis(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar5ReturnThis(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar1ReturnBarArg(sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar2ReturnBarArg(1,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar3ReturnBarArg(1,2,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar4ReturnBarArg(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar5ReturnBarArg(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar2iReturnBarArg(1,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar3iReturnBarArg(1,2,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar4iReturnBarArg(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar5iReturnBarArg(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar2ReturnDummyArg1(1,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar3ReturnDummyArg2(1,2,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar4ReturnDummyArg3(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar5ReturnDummyArg4(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar2iReturnDummyArg1(1,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar3iReturnDummyArg2(1,2,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar4iReturnDummyArg3(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        foo.wideSetBar5iReturnDummyArg4(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        Foo nullFoo = Foo.getNullFoo();
+        try {
+            nullFoo.wideSetBar1ReturnThis(sum);
+        } catch(NullPointerException npe) {
+            sum += 404;
+        }
+        try {
+            nullFoo.wideSetBar2ReturnThis(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 2 * 404;
+        }
+        try {
+            nullFoo.wideSetBar3ReturnThis(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 3 * 404;
+        }
+        try {
+            nullFoo.wideSetBar4ReturnThis(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 4 * 404;
+        }
+        try {
+            nullFoo.wideSetBar5ReturnThis(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 5 * 404;
+        }
+        try {
+            nullFoo.wideSetBar1ReturnBarArg(sum);
+        } catch(NullPointerException npe) {
+            sum += 6 * 404;
+        }
+        try {
+            nullFoo.wideSetBar2ReturnBarArg(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 7 * 404;
+        }
+        try {
+            nullFoo.wideSetBar3ReturnBarArg(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 8 * 404;
+        }
+        try {
+            nullFoo.wideSetBar4ReturnBarArg(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 9 * 404;
+        }
+        try {
+            nullFoo.wideSetBar5ReturnBarArg(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 10 * 404;
+        }
+        try {
+            nullFoo.wideSetBar2iReturnBarArg(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 11 * 404;
+        }
+        try {
+            nullFoo.wideSetBar3iReturnBarArg(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 12 * 404;
+        }
+        try {
+            nullFoo.wideSetBar4iReturnBarArg(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 13 * 404;
+        }
+        try {
+            nullFoo.wideSetBar5iReturnBarArg(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 14 * 404;
+        }
+        try {
+            nullFoo.wideSetBar2ReturnDummyArg1(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 15 * 404;
+        }
+        try {
+            nullFoo.wideSetBar3ReturnDummyArg2(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 16 * 404;
+        }
+        try {
+            nullFoo.wideSetBar4ReturnDummyArg3(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 17 * 404;
+        }
+        try {
+            nullFoo.wideSetBar5ReturnDummyArg4(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 18 * 404;
+        }
+        try {
+            nullFoo.wideSetBar2iReturnDummyArg1(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 19 * 404;
+        }
+        try {
+            nullFoo.wideSetBar3iReturnDummyArg2(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 20 * 404;
+        }
+        try {
+            nullFoo.wideSetBar4iReturnDummyArg3(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 21 * 404;
+        }
+        try {
+            nullFoo.wideSetBar5iReturnDummyArg4(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 22 * 404;
+        }
+        long expected = (1234L << 23) + 404 * (23 * 22 / 2);
+        if (sum == expected) {
+            System.out.println("wideSetterTestWithReturnArgIgnoreReturn passes");
+        }
+        else {
+            System.out.println("wideSetterTestWithReturnArgIgnoreReturn fails: " + sum +
+                               " (expecting " + expected + ")");
+        }
+    }
+
+    static void wideSetterTestWithReturnArgUseReturn() {
+        Foo foo = new Foo();
+        long sum = foo.wideGetBar0();
+        long sumDummy = 0;
+        sum += foo.wideGetBar0();
+        Foo foo2 = foo.wideSetBar1ReturnThis(sum);
+        sum += foo2.wideGetBar0();
+        foo = foo2.wideSetBar2ReturnThis(1,sum);
+        sum += foo.wideGetBar0();
+        foo2 = foo.wideSetBar3ReturnThis(1,2,sum);
+        sum += foo2.wideGetBar0();
+        foo = foo2.wideSetBar4ReturnThis(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        foo = foo.wideSetBar5ReturnThis(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar1ReturnBarArg(sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar2ReturnBarArg(1,sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar3ReturnBarArg(1,2,sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar4ReturnBarArg(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar5ReturnBarArg(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar2iReturnBarArg(1,sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar3iReturnBarArg(1,2,sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar4iReturnBarArg(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        sum += foo.wideSetBar5iReturnBarArg(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        sumDummy += foo.wideSetBar2ReturnDummyArg1(1,sum);
+        sum += foo.wideGetBar0();
+        sumDummy += foo.wideSetBar3ReturnDummyArg2(1,2,sum);
+        sum += foo.wideGetBar0();
+        sumDummy += foo.wideSetBar4ReturnDummyArg3(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        sumDummy += foo.wideSetBar5ReturnDummyArg4(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        sumDummy += foo.wideSetBar2iReturnDummyArg1(1,sum);
+        sum += foo.wideGetBar0();
+        sumDummy += foo.wideSetBar3iReturnDummyArg2(1,2,sum);
+        sum += foo.wideGetBar0();
+        sumDummy += foo.wideSetBar4iReturnDummyArg3(1,2,3,sum);
+        sum += foo.wideGetBar0();
+        sumDummy += foo.wideSetBar5iReturnDummyArg4(1,2,3,4,sum);
+        sum += foo.wideGetBar0();
+        Foo nullFoo = Foo.getNullFoo();
+        try {
+            foo = nullFoo.wideSetBar1ReturnThis(sum);
+        } catch(NullPointerException npe) {
+            sum += 404;
+        }
+        try {
+            foo = nullFoo.wideSetBar2ReturnThis(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 2 * 404;
+        }
+        try {
+            foo = nullFoo.wideSetBar3ReturnThis(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 3 * 404;
+        }
+        try {
+            foo = nullFoo.wideSetBar4ReturnThis(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 4 * 404;
+        }
+        try {
+            foo = nullFoo.wideSetBar5ReturnThis(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 5 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar1ReturnBarArg(sum);
+        } catch(NullPointerException npe) {
+            sum += 6 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar2ReturnBarArg(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 7 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar3ReturnBarArg(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 8 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar4ReturnBarArg(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 9 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar5ReturnBarArg(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 10 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar2iReturnBarArg(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 11 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar3iReturnBarArg(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 12 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar4iReturnBarArg(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 13 * 404;
+        }
+        try {
+            sum += nullFoo.wideSetBar5iReturnBarArg(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 14 * 404;
+        }
+        try {
+            sumDummy += nullFoo.wideSetBar2ReturnDummyArg1(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 15 * 404;
+        }
+        try {
+            sumDummy += nullFoo.wideSetBar3ReturnDummyArg2(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 16 * 404;
+        }
+        try {
+            sumDummy += nullFoo.wideSetBar4ReturnDummyArg3(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 17 * 404;
+        }
+        try {
+            sumDummy += nullFoo.wideSetBar5ReturnDummyArg4(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 18 * 404;
+        }
+        try {
+            sumDummy += nullFoo.wideSetBar2iReturnDummyArg1(1, sum);
+        } catch(NullPointerException npe) {
+            sum += 19 * 404;
+        }
+        try {
+            sumDummy += nullFoo.wideSetBar3iReturnDummyArg2(1, 2, sum);
+        } catch(NullPointerException npe) {
+            sum += 20 * 404;
+        }
+        try {
+            sumDummy += nullFoo.wideSetBar4iReturnDummyArg3(1, 2, 3, sum);
+        } catch(NullPointerException npe) {
+            sum += 21 * 404;
+        }
+        try {
+            sumDummy += nullFoo.wideSetBar5iReturnDummyArg4(1, 2, 3, 4, sum);
+        } catch(NullPointerException npe) {
+            sum += 22 * 404;
+        }
+        long expected = (1234L << 14) * 3 * 3 * 3 * 3 * 3 * 3 * 3 * 3 * 3  + 404 * (23 * 22 / 2);
+        long expectedDummy = 2 * (5 * 4 / 2);
+        if (sum == expected && sumDummy == expectedDummy) {
+            System.out.println("wideSetterTestWithReturnArgUseReturn passes");
+        }
+        else {
+            System.out.println("wideSetterTestWithReturnArgUseReturn fails: " + sum +
+                               " (expecting " + expected + "), sumDummy = " + sumDummy +
+                               "(expecting " + expectedDummy + ")");
+        }
+    }
+
+    static void mulBy1Test() {
+        long res;
+        long j = 1;
+        res = 1 * j + j;
+        if (res == 2L) {
+            System.out.println("mulBy1Test passes");
+        }
+        else {
+            System.out.println("mulBy1Test fails: " + res +
+                               " (expecting 2)");
+        }
+    }
+
+    static void constantPropagationTest() {
+        int i = 1;
+        int t = 1;
+        float z = 1F;
+        long h = 1L;
+        int g[] = new int[1];
+        int w = 1;
+        long f = 0;
+
+        for (int a = 1; a < 100; a++) {
+            try {
+                i = (int)(z);
+                h >>= (0 % t);
+            }
+            finally {
+                w = (int)(2 * (f * 6));
+            }
+        }
+
+        if (w == 0 && h == 1 && g[0] == 0) {
+            System.out.println("constantPropagationTest passes");
+        } else {
+            System.out.println("constantPropagationTest fails");
+        }
+    }
+
     static void b2296099Test() throws Exception {
        int x = -1190771042;
        int dist = 360530809;
@@ -172,7 +861,7 @@ public class Main {
     }
 
     static void b2302318Test() {
-        System.gc();
+        Runtime.getRuntime().gc();
 
         SpinThread slow = new SpinThread(Thread.MIN_PRIORITY);
         SpinThread fast1 = new SpinThread(Thread.NORM_PRIORITY);
@@ -188,7 +877,7 @@ public class Main {
         try {
             Thread.sleep(3000);
         } catch (InterruptedException ie) {/*ignore */}
-        System.gc();
+        Runtime.getRuntime().gc();
 
         System.out.println("b2302318 passes");
     }
@@ -246,6 +935,358 @@ public class Main {
         }
     }
 
+    static void b13679511Test() {
+       System.out.println("b13679511Test starting");
+       int[] nn = { 1, 2, 3, 4 };
+       for (int i : nn) {
+           System.out.println(i);
+       }
+       int len = nn.length;
+       System.out.println(nn.length);
+       System.out.println(nn.length % 3);
+       System.out.println(len % 3);
+       System.out.println(4 % 3);
+       System.out.println((nn.length % 3) != 1);
+       System.out.println("b13679511Test finishing");
+    }
+
+    static void b16177324TestWrapper() {
+      try {
+        b16177324Test();
+      } catch (NullPointerException expected) {
+        System.out.println("b16177324TestWrapper caught NPE as expected.");
+      }
+    }
+
+    static void b16177324Test() {
+      // We need this to be a single BasicBlock. Putting it into a try block would cause it to
+      // be split at each insn that can throw. So we do the try-catch in a wrapper function.
+      int v1 = B16177324Values.values[0];        // Null-check on array element access.
+      int v2 = B16177324ValuesKiller.values[0];  // clinit<>() sets B16177324Values.values to null.
+      int v3 = B16177324Values.values[0];        // Should throw NPE.
+      // If the null-check for v3 was eliminated we should fail with SIGSEGV.
+      System.out.println("Unexpectedly retrieved all values: " + v1 + ", " + v2 + ", " + v3);
+    }
+
+    static void b16230771TestWrapper() {
+      try {
+        b16230771Test();
+      } catch (NullPointerException expected) {
+        System.out.println("b16230771TestWrapper caught NPE as expected.");
+      }
+    }
+
+    static void b16230771Test() {
+      Integer[] array = { null };
+      for (Integer i : array) {
+        try {
+          int value = i;  // Null check on unboxing should fail.
+          System.out.println("Unexpectedly retrieved value " + value);
+        } catch (NullPointerException e) {
+          int value = i;  // Null check on unboxing should fail.
+          // The bug was a missing null check, so this would actually cause SIGSEGV.
+          System.out.println("Unexpectedly retrieved value " + value + " in NPE catch handler");
+        }
+      }
+    }
+
+    static double TooManyArgs(
+          long l00,
+          long l01,
+          long l02,
+          long l03,
+          long l04,
+          long l05,
+          long l06,
+          long l07,
+          long l08,
+          long l09,
+          long l10,
+          long l11,
+          long l12,
+          long l13,
+          long l14,
+          long l15,
+          long l16,
+          long l17,
+          long l18,
+          long l19,
+          long l20,
+          long l21,
+          long l22,
+          long l23,
+          long l24,
+          long l25,
+          long l26,
+          long l27,
+          long l28,
+          long l29,
+          long l30,
+          long l31,
+          long l32,
+          long l33,
+          long l34,
+          long l35,
+          long l36,
+          long l37,
+          long l38,
+          long l39,
+          long l40,
+          long l41,
+          long l42,
+          long l43,
+          long l44,
+          long l45,
+          long l46,
+          long l47,
+          long l48,
+          long l49,
+          long ll00,
+          long ll01,
+          long ll02,
+          long ll03,
+          long ll04,
+          long ll05,
+          long ll06,
+          long ll07,
+          long ll08,
+          long ll09,
+          long ll10,
+          long ll11,
+          long ll12,
+          long ll13,
+          long ll14,
+          long ll15,
+          long ll16,
+          long ll17,
+          long ll18,
+          long ll19,
+          double d01,
+          double d02,
+          double d03,
+          double d04,
+          double d05,
+          double d06,
+          double d07,
+          double d08,
+          double d09,
+          double d10,
+          double d11,
+          double d12,
+          double d13,
+          double d14,
+          double d15,
+          double d16,
+          double d17,
+          double d18,
+          double d19,
+          double d20,
+          double d21,
+          double d22,
+          double d23,
+          double d24,
+          double d25,
+          double d26,
+          double d27,
+          double d28,
+          double d29,
+          double d30,
+          double d31,
+          double d32,
+          double d33,
+          double d34,
+          double d35,
+          double d36,
+          double d37,
+          double d38,
+          double d39,
+          double d40,
+          double d41,
+          double d42,
+          double d43,
+          double d44,
+          double d45,
+          double d46,
+          double d47,
+          double d48,
+          double d49) {
+        double res = 0.0;
+        double t01 = d49;
+        double t02 = 02.0 + t01;
+        double t03 = 03.0 + t02;
+        double t04 = 04.0 + t03;
+        double t05 = 05.0 + t04;
+        double t06 = 06.0 + t05;
+        double t07 = 07.0 + t06;
+        double t08 = 08.0 + t07;
+        double t09 = 09.0 + t08;
+        double t10 = 10.0 + t09;
+        double t11 = 11.0 + t10;
+        double t12 = 12.0 + t11;
+        double t13 = 13.0 + t12;
+        double t14 = 14.0 + t13;
+        double t15 = 15.0 + t14;
+        double t16 = 16.0 + t15;
+        double t17 = 17.0 + t16;
+        double t18 = 18.0 + t17;
+        double t19 = 19.0 + t18;
+        double t20 = 20.0 + t19;
+        double t21 = 21.0 + t20;
+        double t22 = 22.0 + t21;
+        double t23 = 23.0 + t22;
+        double t24 = 24.0 + t23;
+        double t25 = 25.0 + t24;
+        double t26 = 26.0 + t25;
+        double t27 = 27.0 + t26;
+        double t28 = 28.0 + t27;
+        double t29 = 29.0 + t28;
+        double t30 = 30.0 + t29;
+        double t31 = 31.0 + t30;
+        double t32 = 32.0 + t31;
+        double t33 = 33.0 + t32;
+        double t34 = 34.0 + t33;
+        double t35 = 35.0 + t34;
+        double t36 = 36.0 + t35;
+        double t37 = 37.0 + t36;
+        double t38 = 38.0 + t37;
+        double t39 = 39.0 + t38;
+        double t40 = 40.0 + t39;
+        double tt02 = 02.0 + t40;
+        double tt03 = 03.0 + tt02;
+        double tt04 = 04.0 + tt03;
+        double tt05 = 05.0 + tt04;
+        double tt06 = 06.0 + tt05;
+        double tt07 = 07.0 + tt06;
+        double tt08 = 08.0 + tt07;
+        double tt09 = 09.0 + tt08;
+        double tt10 = 10.0 + tt09;
+        double tt11 = 11.0 + tt10;
+        double tt12 = 12.0 + tt11;
+        double tt13 = 13.0 + tt12;
+        double tt14 = 14.0 + tt13;
+        double tt15 = 15.0 + tt14;
+        double tt16 = 16.0 + tt15;
+        double tt17 = 17.0 + tt16;
+        double tt18 = 18.0 + tt17;
+        double tt19 = 19.0 + tt18;
+        double tt20 = 20.0 + tt19;
+        double tt21 = 21.0 + tt20;
+        double tt22 = 22.0 + tt21;
+        double tt23 = 23.0 + tt22;
+        double tt24 = 24.0 + tt23;
+        double tt25 = 25.0 + tt24;
+        double tt26 = 26.0 + tt25;
+        double tt27 = 27.0 + tt26;
+        double tt28 = 28.0 + tt27;
+        double tt29 = 29.0 + tt28;
+        double tt30 = 30.0 + tt29;
+        double tt31 = 31.0 + tt30;
+        double tt32 = 32.0 + tt31;
+        double tt33 = 33.0 + tt32;
+        double tt34 = 34.0 + tt33;
+        double tt35 = 35.0 + tt34;
+        double tt36 = 36.0 + tt35;
+        double tt37 = 37.0 + tt36;
+        double tt38 = 38.0 + tt37;
+        double tt39 = 39.0 + tt38;
+        double tt40 = 40.0 + tt39;
+        double ttt02 = 02.0 + tt40;
+        double ttt03 = 03.0 + ttt02;
+        double ttt04 = 04.0 + ttt03;
+        double ttt05 = 05.0 + ttt04;
+        double ttt06 = 06.0 + ttt05;
+        double ttt07 = 07.0 + ttt06;
+        double ttt08 = 08.0 + ttt07;
+        double ttt09 = 09.0 + ttt08;
+        double ttt10 = 10.0 + ttt09;
+        double ttt11 = 11.0 + ttt10;
+        double ttt12 = 12.0 + ttt11;
+        double ttt13 = 13.0 + ttt12;
+        double ttt14 = 14.0 + ttt13;
+        double ttt15 = 15.0 + ttt14;
+        double ttt16 = 16.0 + ttt15;
+        double ttt17 = 17.0 + ttt16;
+        double ttt18 = 18.0 + ttt17;
+        double ttt19 = 19.0 + ttt18;
+        double ttt20 = 20.0 + ttt19;
+        double ttt21 = 21.0 + ttt20;
+        double ttt22 = 22.0 + ttt21;
+        double ttt23 = 23.0 + ttt22;
+        double ttt24 = 24.0 + ttt23;
+        double ttt25 = 25.0 + ttt24;
+        double ttt26 = 26.0 + ttt25;
+        double ttt27 = 27.0 + ttt26;
+        double ttt28 = 28.0 + ttt27;
+        double ttt29 = 29.0 + ttt28;
+        double ttt30 = 30.0 + ttt29;
+        double ttt31 = 31.0 + ttt30;
+      // Repeatedly use some doubles from the middle of the pack to trigger promotion from frame-passed args.
+      for (int i = 0; i < 100; i++) {
+         res += d40;
+         res += d41;
+         res += d42;
+         res += d43;
+         res += d44;
+         res += d45;
+         res += d46;
+         res += d47;
+         res += d48;
+      }
+      for (int i = 0; i < 100; i++) {
+         res += d40;
+         res += d41;
+         res += d42;
+         res += d43;
+         res += d44;
+         res += d45;
+         res += d46;
+         res += d47;
+         res += d48;
+      }
+      for (int i = 0; i < 100; i++) {
+         res += d40;
+         res += d41;
+         res += d42;
+         res += d43;
+         res += d44;
+         res += d45;
+         res += d46;
+         res += d47;
+         res += d48;
+      }
+      for (int i = 0; i < 100; i++) {
+         res += d40;
+         res += d41;
+         res += d42;
+         res += d43;
+         res += d44;
+         res += d45;
+         res += d46;
+         res += d47;
+         res += d48;
+      }
+      return res + tt40;
+   }
+
+    public static void ManyFloatArgs() {
+        double res = TooManyArgs(
+                                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                                 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                                 13.0, 14.0, 15.0, 16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0,
+                                 24.0, 25.0, 26.0, 27.0, 28.0, 29.0, 30.0, 31.0, 32.0, 33.0, 34.0,
+                                 35.0, 36.0, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49);
+       if ((long)res == 160087) {
+           System.out.println("ManyFloatArgs passes");
+       } else {
+           System.out.println("ManyFloatArgs fails, expected 160087, got: " + res);
+       }
+    }
     static long largeFrame() {
         int i0 = 0;
         long l0 = 0;
@@ -8287,6 +9328,12 @@ class Foo {
     private int bar = 1234;
     private long lbar = 1234;
 
+    public static Foo getNullFoo() {
+      // Make this a bit complicated so that it's not inlined.
+      Foo foo = new Foo();
+      return (barBar(foo) != 0) ? null : foo;
+    }
+
     // Looks similar to a direct method, make sure we're null checking
     static int barBar(Foo foo) {
         return foo.bar;
@@ -8374,6 +9421,18 @@ class Foo {
     public void wideSetBar5(long a1, long a2, long a3, long a4, long a5) {
         lbar = a5;
     }
+    public void wideSetBar2i(int a1, long a2) {
+      lbar = a2;
+    }
+    public void wideSetBar3i(int a1, int a2, long a3) {
+        lbar = a3;
+    }
+    public void wideSetBar4i(int a1, int a2, int a3, long a4) {
+        lbar = a4;
+    }
+    public void wideSetBar5i(int a1, int a2, int a3, int a4, long a5) {
+        lbar = a5;
+    }
     public long wideGetBar0() {
         return lbar;
     }
@@ -8415,6 +9474,368 @@ class Foo {
 
     public long wideIdent5(int a6, int a5, int a4, int a3, int a2, long a1) {
         return a1;
-  }
+    }
+    public Foo setBar1ReturnThis(int a1) {
+        bar = a1;
+        return this;
+    }
+    public Foo setBar2ReturnThis(int a1, int a2) {
+        bar = a2;
+        return this;
+    }
+    public Foo setBar3ReturnThis(int a1, int a2, int a3) {
+        bar = a3;
+        return this;
+    }
+    public Foo setBar4ReturnThis(int a1, int a2, int a3, int a4) {
+        bar = a4;
+        return this;
+    }
+    public Foo setBar5ReturnThis(int a1, int a2, int a3, int a4, int a5) {
+        bar = a5;
+        return this;
+    }
+    public Foo wideSetBar1ReturnThis(long a1) {
+        lbar = a1;
+        return this;
+    }
+    public Foo wideSetBar2ReturnThis(long a1, long a2) {
+        lbar = a2;
+        return this;
+    }
+    public Foo wideSetBar3ReturnThis(long a1, long a2, long a3) {
+        lbar = a3;
+        return this;
+    }
+    public Foo wideSetBar4ReturnThis(long a1, long a2, long a3, long a4) {
+        lbar = a4;
+        return this;
+    }
+    public Foo wideSetBar5ReturnThis(long a1, long a2, long a3, long a4, long a5) {
+        lbar = a5;
+        return this;
+    }
+    public Foo wideSetBar2iReturnThis(int a1, long a2) {
+        lbar = a2;
+        return this;
+    }
+    public Foo wideSetBar3iReturnThis(int a1, int a2, long a3) {
+        lbar = a3;
+        return this;
+    }
+    public Foo wideSetBar4iReturnThis(int a1, int a2, int a3, long a4) {
+        lbar = a4;
+        return this;
+    }
+    public Foo wideSetBar5iReturnThis(int a1, int a2, int a3, int a4, long a5) {
+        lbar = a5;
+        return this;
+    }
+    public int setBar1ReturnBarArg(int a1) {
+        bar = a1;
+        return a1;
+    }
+    public int setBar2ReturnBarArg(int a1, int a2) {
+        bar = a2;
+        return a2;
+    }
+    public int setBar3ReturnBarArg(int a1, int a2, int a3) {
+        bar = a3;
+        return a3;
+    }
+    public int setBar4ReturnBarArg(int a1, int a2, int a3, int a4) {
+        bar = a4;
+        return a4;
+    }
+    public int setBar5ReturnBarArg(int a1, int a2, int a3, int a4, int a5) {
+        bar = a5;
+        return a5;
+    }
+    public long wideSetBar1ReturnBarArg(long a1) {
+        lbar = a1;
+        return a1;
+    }
+    public long wideSetBar2ReturnBarArg(long a1, long a2) {
+        lbar = a2;
+        return a2;
+    }
+    public long wideSetBar3ReturnBarArg(long a1, long a2, long a3) {
+        lbar = a3;
+        return a3;
+    }
+    public long wideSetBar4ReturnBarArg(long a1, long a2, long a3, long a4) {
+        lbar = a4;
+        return a4;
+    }
+    public long wideSetBar5ReturnBarArg(long a1, long a2, long a3, long a4, long a5) {
+        lbar = a5;
+        return a5;
+    }
+    public long wideSetBar2iReturnBarArg(int a1, long a2) {
+        lbar = a2;
+        return a2;
+    }
+    public long wideSetBar3iReturnBarArg(int a1, int a2, long a3) {
+        lbar = a3;
+        return a3;
+    }
+    public long wideSetBar4iReturnBarArg(int a1, int a2, int a3, long a4) {
+        lbar = a4;
+        return a4;
+    }
+    public long wideSetBar5iReturnBarArg(int a1, int a2, int a3, int a4, long a5) {
+        lbar = a5;
+        return a5;
+    }
+    public int setBar2ReturnDummyArg1(int a1, int a2) {
+        bar = a2;
+        return a1;
+    }
+    public int setBar3ReturnDummyArg2(int a1, int a2, int a3) {
+        bar = a3;
+        return a2;
+    }
+    public int setBar4ReturnDummyArg3(int a1, int a2, int a3, int a4) {
+        bar = a4;
+        return a3;
+    }
+    public int setBar5ReturnDummyArg4(int a1, int a2, int a3, int a4, int a5) {
+        bar = a5;
+        return a4;
+    }
+    public long wideSetBar2ReturnDummyArg1(long a1, long a2) {
+        lbar = a2;
+        return a1;
+    }
+    public long wideSetBar3ReturnDummyArg2(long a1, long a2, long a3) {
+        lbar = a3;
+        return a2;
+    }
+    public long wideSetBar4ReturnDummyArg3(long a1, long a2, long a3, long a4) {
+        lbar = a4;
+        return a3;
+    }
+    public long wideSetBar5ReturnDummyArg4(long a1, long a2, long a3, long a4, long a5) {
+        lbar = a5;
+        return a4;
+    }
+    public int wideSetBar2iReturnDummyArg1(int a1, long a2) {
+        lbar = a2;
+        return a1;
+    }
+    public int wideSetBar3iReturnDummyArg2(int a1, int a2, long a3) {
+        lbar = a3;
+        return a2;
+    }
+    public int wideSetBar4iReturnDummyArg3(int a1, int a2, int a3, long a4) {
+        lbar = a4;
+        return a3;
+    }
+    public int wideSetBar5iReturnDummyArg4(int a1, int a2, int a3, int a4, long a5) {
+        lbar = a5;
+        return a4;
+    }
+}
 
+class LVNTests {
+    private LVNTests link = null;
+    private int value = 0;
+
+    private void setLink(LVNTests l) {
+        link = l;
+    }
+
+    private static void causeNPE1(LVNTests lhs, LVNTests rhs) {
+        LVNTests link1 = lhs.link;
+        rhs.link = null;
+        LVNTests link2 = lhs.link;
+        int value1 = link1.value;
+        int value2 = link2.value;
+        System.out.println("LVNTests.testNPE1 fails with " + value1 + " and " + value2);
+    }
+
+    public static void testNPE1() {
+        LVNTests t = new LVNTests();
+        t.link = new LVNTests();
+        try {
+          causeNPE1(t, t);
+        } catch (NullPointerException e) {
+          System.out.println("LVNTests.testNPE1 passes");
+        }
+    }
+
+    private static void causeNPE2(LVNTests lhs, LVNTests rhs) {
+      LVNTests link1 = lhs.link;
+      rhs.setLink(null);
+      LVNTests link2 = lhs.link;
+      int value1 = link1.value;
+      int value2 = link2.value;
+      System.out.println("LVNTests.testNPE2 fails with " + value1 + " and " + value2);
+    }
+
+    public static void testNPE2() {
+        LVNTests t = new LVNTests();
+        t.link = new LVNTests();
+        try {
+          causeNPE2(t, t);
+        } catch (NullPointerException e) {
+          System.out.println("LVNTests.testNPE2 passes");
+        }
+    }
+}
+
+class MirOpSelectTests {
+    private static int ifEqzThen0Else1(int i) { return (i == 0) ? 0 : 1; }
+    private static int ifEqzThen0Else8(int i) { return (i == 0) ? 0 : 8; }
+    private static int ifEqzThen1Else5(int i) { return (i == 0) ? 1 : 5; }
+    private static int ifEqzThenMinus1Else3(int i) { return (i == 0) ? -1 : 3; }
+    private static int ifEqzThen11Else23(int i) { return (i == 0) ? 11 : 23; }
+    private static int ifEqzThen54321Else87654321(int i) { return (i == 0) ? 54321 : 87654321; }
+    private static int ifNezThen0Else1(int i) { return (i != 0) ? 0 : 1; }
+    private static int ifNezThen0Else8(int i) { return (i != 0) ? 0 : 8; }
+    private static int ifNezThen1Else5(int i) { return (i != 0) ? 1 : 5; }
+    private static int ifNezThenMinus1Else3(int i) { return (i != 0) ? -1 : 3; }
+    private static int ifNezThen11Else23(int i) { return (i != 0) ? 11 : 23; }
+    private static int ifNezThen54321Else87654321(int i) { return (i != 0) ? 54321 : 87654321; }
+    private static int ifLtzThen3Else5(int i) { return (i < 0) ? 3 : 5; }
+    private static int ifGezThen7Else4(int i) { return (i >= 0) ? 7 : 4; }
+    private static int ifGtzThen2Else9(int i) { return (i > 0) ? 2 : 9; }
+    private static int ifLezThen8Else0(int i) { return (i <= 0) ? 8 : 0; }
+    private static int ifGtzThen8Else9(int i) { return (i > 0) ? 8 : 9; }
+
+    private static int ifEqz(int src, int thn, int els) { return (src == 0) ? thn : els; }
+    private static int ifNez(int src, int thn, int els) { return (src != 0) ? thn : els; }
+    private static int ifLtz(int src, int thn, int els) { return (src < 0) ? thn : els; }
+    private static int ifGez(int src, int thn, int els) { return (src >= 0) ? thn : els; }
+    private static int ifGtz(int src, int thn, int els) { return (src > 0) ? thn : els; }
+    private static int ifLez(int src, int thn, int els) { return (src <= 0) ? thn : els; }
+
+    public static void testIfCcz() {
+        int[] results = new int[] {
+            ifEqzThen0Else1(-1), 1,
+            ifEqzThen0Else1(0), 0,
+            ifEqzThen0Else1(1), 1,
+            ifEqzThen0Else8(-1), 8,
+            ifEqzThen0Else8(0), 0,
+            ifEqzThen0Else8(1), 8,
+            ifEqzThen1Else5(-1), 5,
+            ifEqzThen1Else5(0), 1,
+            ifEqzThen1Else5(1), 5,
+            ifEqzThenMinus1Else3(-1), 3,
+            ifEqzThenMinus1Else3(0), -1,
+            ifEqzThenMinus1Else3(1), 3,
+            ifEqzThen11Else23(-1), 23,
+            ifEqzThen11Else23(0), 11,
+            ifEqzThen11Else23(1), 23,
+            ifEqzThen54321Else87654321(-1), 87654321,
+            ifEqzThen54321Else87654321(0), 54321,
+            ifEqzThen54321Else87654321(1), 87654321,
+            ifNezThen0Else1(-1), 0,
+            ifNezThen0Else1(0), 1,
+            ifNezThen0Else1(1), 0,
+            ifNezThen0Else8(-1), 0,
+            ifNezThen0Else8(0), 8,
+            ifNezThen0Else8(1), 0,
+            ifNezThen1Else5(-1), 1,
+            ifNezThen1Else5(0), 5,
+            ifNezThen1Else5(1), 1,
+            ifNezThenMinus1Else3(-1), -1,
+            ifNezThenMinus1Else3(0), 3,
+            ifNezThenMinus1Else3(1), -1,
+            ifNezThen11Else23(-1), 11,
+            ifNezThen11Else23(0), 23,
+            ifNezThen11Else23(1), 11,
+            ifNezThen54321Else87654321(-1), 54321,
+            ifNezThen54321Else87654321(0), 87654321,
+            ifNezThen54321Else87654321(1), 54321,
+            ifLtzThen3Else5(-1), 3,
+            ifLtzThen3Else5(0), 5,
+            ifLtzThen3Else5(1), 5,
+            ifGezThen7Else4(-1), 4,
+            ifGezThen7Else4(0), 7,
+            ifGezThen7Else4(1), 7,
+            ifGtzThen2Else9(-1), 9,
+            ifGtzThen2Else9(0), 9,
+            ifGtzThen2Else9(1), 2,
+            ifLezThen8Else0(-1), 8,
+            ifLezThen8Else0(0), 8,
+            ifLezThen8Else0(1), 0,
+            ifEqz(-1, 101, 201), 201,
+            ifEqz(0, 102, 202), 102,
+            ifEqz(1, 103, 203), 203,
+            ifNez(-1, 104, 204), 104,
+            ifNez(0, 105, 205), 205,
+            ifNez(1, 106, 206), 106,
+            ifLtz(-1, 107, 207), 107,
+            ifLtz(0, 108, 208), 208,
+            ifLtz(1, 109, 209), 209,
+            ifGez(-1, 110, 210), 210,
+            ifGez(0, 111, 211), 111,
+            ifGez(1, 112, 212), 112,
+            ifGtz(-1, 113, 213), 213,
+            ifGtz(0, 114, 214), 214,
+            ifGtz(1, 115, 215), 115,
+            ifLez(-1, 116, 216), 116,
+            ifLez(0, 117, 217), 117,
+            ifLez(1, 118, 218), 218,
+            ifGtzThen8Else9(0), 9,
+            ifGtzThen8Else9(1), 8
+        };
+
+        boolean success = true;
+        StringBuilder fails = new StringBuilder();
+        for (int i = 0; i != results.length; i += 2) {
+            if (results[i] != results[i + 1]) {
+                success = false;
+                fails.append("\n  #" + (i / 2) + ": " + results[i] + " != " + results[i + 1]);
+            }
+        }
+        if (success) {
+            System.out.println("testIfCcz passes");
+        } else {
+            System.out.println("testIfCcz fails for" + fails.toString());
+        }
+    }
+}
+
+class LiveFlags {
+  private static void show_results(double a[], double b[], int trip) {
+    if ((a[0]+a[1]+b[0]+b[1]) == 0) {
+      System.out.println("LiveFlags passes trip " + trip);
+    } else {
+      System.out.println("LiveFlags fails trip " + trip);
+      System.out.println("a[0] = " + a[0] + " a[1] = " + a[1]);
+      System.out.println("b[0] = " + b[0] + " b[1] = " + b[1]);
+    }
+  }
+  static void test()
+  {
+    final double A[] = new double[2];
+    final double B[] = new double[2];
+    final double C[] = new double[2];
+    B[0] = B[1] = 0.0;
+    A[0] = A[1] = 0.0;
+    C[0] = C[1] = 0.0;
+    for (int i = 3; i >= 1; i--) {
+      if ( (i & 1) == 0) {
+        continue;
+      }
+      if ( (i & 2) != 0 ) {
+        B[1] = -B[1];
+      }
+      show_results(A, B, i);
+      A[0] = C[0]; A[1] = C[1];
+    }
+  }
+}
+
+class B16177324Values {
+  public static int values[] = { 42 };
+}
+
+class B16177324ValuesKiller {
+  public static int values[] = { 1234 };
+  static {
+    B16177324Values.values = null;
+  }
 }

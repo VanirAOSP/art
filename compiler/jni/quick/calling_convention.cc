@@ -18,16 +18,13 @@
 
 #include "base/logging.h"
 #include "jni/quick/arm/calling_convention_arm.h"
+#include "jni/quick/arm64/calling_convention_arm64.h"
 #include "jni/quick/mips/calling_convention_mips.h"
 #include "jni/quick/x86/calling_convention_x86.h"
+#include "jni/quick/x86_64/calling_convention_x86_64.h"
 #include "utils.h"
 
 namespace art {
-
-// Offset of Method within the frame
-FrameOffset CallingConvention::MethodStackOffset() {
-  return displacement_;
-}
 
 // Managed runtime calling convention
 
@@ -37,10 +34,14 @@ ManagedRuntimeCallingConvention* ManagedRuntimeCallingConvention::Create(
     case kArm:
     case kThumb2:
       return new arm::ArmManagedRuntimeCallingConvention(is_static, is_synchronized, shorty);
+    case kArm64:
+      return new arm64::Arm64ManagedRuntimeCallingConvention(is_static, is_synchronized, shorty);
     case kMips:
       return new mips::MipsManagedRuntimeCallingConvention(is_static, is_synchronized, shorty);
     case kX86:
       return new x86::X86ManagedRuntimeCallingConvention(is_static, is_synchronized, shorty);
+    case kX86_64:
+      return new x86_64::X86_64ManagedRuntimeCallingConvention(is_static, is_synchronized, shorty);
     default:
       LOG(FATAL) << "Unknown InstructionSet: " << instruction_set;
       return NULL;
@@ -57,6 +58,9 @@ void ManagedRuntimeCallingConvention::Next() {
       IsParamALongOrDouble(itr_args_)) {
     itr_longs_and_doubles_++;
     itr_slots_++;
+  }
+  if (IsParamAFloatOrDouble(itr_args_)) {
+    itr_float_and_doubles_++;
   }
   if (IsCurrentParamAReference()) {
     itr_refs_++;
@@ -82,6 +86,18 @@ bool ManagedRuntimeCallingConvention::IsCurrentParamAReference() {
   return IsParamAReference(itr_args_);
 }
 
+bool ManagedRuntimeCallingConvention::IsCurrentParamAFloatOrDouble() {
+  return IsParamAFloatOrDouble(itr_args_);
+}
+
+bool ManagedRuntimeCallingConvention::IsCurrentParamADouble() {
+  return IsParamADouble(itr_args_);
+}
+
+bool ManagedRuntimeCallingConvention::IsCurrentParamALong() {
+  return IsParamALong(itr_args_);
+}
+
 // JNI calling convention
 
 JniCallingConvention* JniCallingConvention::Create(bool is_static, bool is_synchronized,
@@ -91,10 +107,14 @@ JniCallingConvention* JniCallingConvention::Create(bool is_static, bool is_synch
     case kArm:
     case kThumb2:
       return new arm::ArmJniCallingConvention(is_static, is_synchronized, shorty);
+    case kArm64:
+      return new arm64::Arm64JniCallingConvention(is_static, is_synchronized, shorty);
     case kMips:
       return new mips::MipsJniCallingConvention(is_static, is_synchronized, shorty);
     case kX86:
       return new x86::X86JniCallingConvention(is_static, is_synchronized, shorty);
+    case kX86_64:
+      return new x86_64::X86_64JniCallingConvention(is_static, is_synchronized, shorty);
     default:
       LOG(FATAL) << "Unknown InstructionSet: " << instruction_set;
       return NULL;
@@ -106,9 +126,8 @@ size_t JniCallingConvention::ReferenceCount() const {
 }
 
 FrameOffset JniCallingConvention::SavedLocalReferenceCookieOffset() const {
-  size_t start_of_sirt = SirtLinkOffset().Int32Value() +  kPointerSize;
-  size_t references_size = kPointerSize * ReferenceCount();  // size excluding header
-  return FrameOffset(start_of_sirt + references_size);
+  size_t references_size = handle_scope_pointer_size_ * ReferenceCount();  // size excluding header
+  return FrameOffset(HandleerencesOffset().Int32Value() + references_size);
 }
 
 FrameOffset JniCallingConvention::ReturnValueSaveLocation() const {
@@ -134,6 +153,9 @@ void JniCallingConvention::Next() {
       itr_slots_++;
     }
   }
+  if (IsCurrentParamAFloatOrDouble()) {
+    itr_float_and_doubles_++;
+  }
   if (IsCurrentParamAReference()) {
     itr_refs_++;
   }
@@ -154,21 +176,62 @@ bool JniCallingConvention::IsCurrentParamAReference() {
   }
 }
 
-// Return position of SIRT entry holding reference at the current iterator
+bool JniCallingConvention::IsCurrentParamJniEnv() {
+  return (itr_args_ == kJniEnv);
+}
+
+bool JniCallingConvention::IsCurrentParamAFloatOrDouble() {
+  switch (itr_args_) {
+    case kJniEnv:
+      return false;  // JNIEnv*
+    case kObjectOrClass:
+      return false;   // jobject or jclass
+    default: {
+      int arg_pos = itr_args_ - NumberOfExtraArgumentsForJni();
+      return IsParamAFloatOrDouble(arg_pos);
+    }
+  }
+}
+
+bool JniCallingConvention::IsCurrentParamADouble() {
+  switch (itr_args_) {
+    case kJniEnv:
+      return false;  // JNIEnv*
+    case kObjectOrClass:
+      return false;   // jobject or jclass
+    default: {
+      int arg_pos = itr_args_ - NumberOfExtraArgumentsForJni();
+      return IsParamADouble(arg_pos);
+    }
+  }
+}
+
+bool JniCallingConvention::IsCurrentParamALong() {
+  switch (itr_args_) {
+    case kJniEnv:
+      return false;  // JNIEnv*
+    case kObjectOrClass:
+      return false;   // jobject or jclass
+    default: {
+      int arg_pos = itr_args_ - NumberOfExtraArgumentsForJni();
+      return IsParamALong(arg_pos);
+    }
+  }
+}
+
+// Return position of handle scope entry holding reference at the current iterator
 // position
-FrameOffset JniCallingConvention::CurrentParamSirtEntryOffset() {
+FrameOffset JniCallingConvention::CurrentParamHandleScopeEntryOffset() {
   CHECK(IsCurrentParamAReference());
-  CHECK_GT(SirtLinkOffset(), SirtNumRefsOffset());
-  // Address of 1st SIRT entry
-  int result = SirtLinkOffset().Int32Value() + kPointerSize;
-  result += itr_refs_ * kPointerSize;
-  CHECK_GT(result, SirtLinkOffset().Int32Value());
+  CHECK_LT(HandleScopeLinkOffset(), HandleScopeNumRefsOffset());
+  int result = HandleerencesOffset().Int32Value() + itr_refs_ * handle_scope_pointer_size_;
+  CHECK_GT(result, HandleScopeNumRefsOffset().Int32Value());
   return FrameOffset(result);
 }
 
 size_t JniCallingConvention::CurrentParamSize() {
   if (itr_args_ <= kObjectOrClass) {
-    return kPointerSize;  // JNIEnv or jobject/jclass
+    return frame_pointer_size_;  // JNIEnv or jobject/jclass
   } else {
     int arg_pos = itr_args_ - NumberOfExtraArgumentsForJni();
     return ParamSize(arg_pos);

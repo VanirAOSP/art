@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 
-include art/build/Android.common.mk
+include art/build/Android.common_build.mk
 
 ART_HOST_EXECUTABLES ?=
 ART_TARGET_EXECUTABLES ?=
@@ -30,6 +30,7 @@ endif
 # $(4): extra include directories
 # $(5): target or host
 # $(6): ndebug or debug
+# $(7): value for LOCAL_MULTILIB (empty means default)
 define build-art-executable
   ifneq ($(5),target)
     ifneq ($(5),host)
@@ -48,17 +49,14 @@ define build-art-executable
   art_c_includes := $(4)
   art_target_or_host := $(5)
   art_ndebug_or_debug := $(6)
+  art_multilib := $(7)
 
   include $(CLEAR_VARS)
-  ifeq ($$(art_target_or_host),target)
-    include external/stlport/libstlport.mk
-  endif
-
   LOCAL_CPP_EXTENSION := $(ART_CPP_EXTENSION)
   LOCAL_MODULE_TAGS := optional
   LOCAL_SRC_FILES := $$(art_source)
   LOCAL_C_INCLUDES += $(ART_C_INCLUDES) art/runtime $$(art_c_includes)
-  LOCAL_SHARED_LIBRARIES += $$(art_shared_libraries) # libnativehelper
+  LOCAL_SHARED_LIBRARIES += $$(art_shared_libraries)
 
   ifeq ($$(art_ndebug_or_debug),ndebug)
     LOCAL_MODULE := $$(art_executable)
@@ -68,13 +66,8 @@ define build-art-executable
 
   LOCAL_CFLAGS := $(ART_EXECUTABLES_CFLAGS)
   ifeq ($$(art_target_or_host),target)
-    LOCAL_CLANG := $(ART_TARGET_CLANG)
-    LOCAL_CFLAGS += $(ART_TARGET_CFLAGS)
-    ifeq ($$(art_ndebug_or_debug),debug)
-      LOCAL_CFLAGS += $(ART_TARGET_DEBUG_CFLAGS)
-    else
-      LOCAL_CFLAGS += $(ART_TARGET_NON_DEBUG_CFLAGS)
-    endif
+  	$(call set-target-local-clang-vars)
+  	$(call set-target-local-cflags-vars,$(6))
   else # host
     LOCAL_CLANG := $(ART_HOST_CLANG)
     LOCAL_CFLAGS += $(ART_HOST_CFLAGS)
@@ -83,6 +76,7 @@ define build-art-executable
     else
       LOCAL_CFLAGS += $(ART_HOST_NON_DEBUG_CFLAGS)
     endif
+    LOCAL_LDLIBS += -lpthread
   endif
 
   ifeq ($$(art_ndebug_or_debug),ndebug)
@@ -91,13 +85,20 @@ define build-art-executable
     LOCAL_SHARED_LIBRARIES += libartd
   endif
 
-  LOCAL_ADDITIONAL_DEPENDENCIES := art/build/Android.common.mk
+  LOCAL_ADDITIONAL_DEPENDENCIES := art/build/Android.common_build.mk
   LOCAL_ADDITIONAL_DEPENDENCIES += art/build/Android.executable.mk
 
+  ifeq ($$(art_target_or_host),target)
+    LOCAL_MODULE_TARGET_ARCH := $(ART_SUPPORTED_ARCH)
+  endif
+  LOCAL_MULTILIB := $$(art_multilib)
+
+  include external/libcxx/libcxx.mk
   ifeq ($$(art_target_or_host),target)
     include $(BUILD_EXECUTABLE)
     ART_TARGET_EXECUTABLES := $(ART_TARGET_EXECUTABLES) $(TARGET_OUT_EXECUTABLES)/$$(LOCAL_MODULE)
   else # host
+    LOCAL_IS_HOST_MODULE := true
     include $(BUILD_HOST_EXECUTABLE)
     ART_HOST_EXECUTABLES := $(ART_HOST_EXECUTABLES) $(HOST_OUT_EXECUTABLES)/$$(LOCAL_MODULE)
   endif

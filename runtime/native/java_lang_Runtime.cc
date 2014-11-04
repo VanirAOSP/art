@@ -19,11 +19,13 @@
 #include <unistd.h>
 
 #include "gc/heap.h"
+#include "handle_scope-inl.h"
 #include "jni_internal.h"
 #include "mirror/class_loader.h"
 #include "runtime.h"
 #include "scoped_thread_state_change.h"
 #include "ScopedUtfChars.h"
+#include "verify_object-inl.h"
 
 namespace art {
 
@@ -36,12 +38,12 @@ static void Runtime_gc(JNIEnv*, jclass) {
 }
 
 static void Runtime_nativeExit(JNIEnv*, jclass, jint status) {
+  LOG(INFO) << "System.exit called, status: " << status;
   Runtime::Current()->CallExitHook(status);
   exit(status);
 }
 
 static jstring Runtime_nativeLoad(JNIEnv* env, jclass, jstring javaFilename, jobject javaLoader, jstring javaLdLibraryPath) {
-  ScopedObjectAccess soa(env);
   ScopedUtfChars filename(env, javaFilename);
   if (filename.c_str() == NULL) {
     return NULL;
@@ -62,12 +64,17 @@ static jstring Runtime_nativeLoad(JNIEnv* env, jclass, jstring javaFilename, job
     }
   }
 
-  mirror::ClassLoader* classLoader = soa.Decode<mirror::ClassLoader*>(javaLoader);
   std::string detail;
-  JavaVMExt* vm = Runtime::Current()->GetJavaVM();
-  bool success = vm->LoadNativeLibrary(filename.c_str(), classLoader, detail);
-  if (success) {
-    return NULL;
+  {
+    ScopedObjectAccess soa(env);
+    StackHandleScope<1> hs(soa.Self());
+    Handle<mirror::ClassLoader> classLoader(
+        hs.NewHandle(soa.Decode<mirror::ClassLoader*>(javaLoader)));
+    JavaVMExt* vm = Runtime::Current()->GetJavaVM();
+    bool success = vm->LoadNativeLibrary(filename.c_str(), classLoader, &detail);
+    if (success) {
+      return nullptr;
+    }
   }
 
   // Don't let a pending exception from JNI_OnLoad cause a CheckJNI issue with NewStringUTF.
@@ -88,12 +95,12 @@ static jlong Runtime_freeMemory(JNIEnv*, jclass) {
 }
 
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(Runtime, freeMemory, "()J"),
+  NATIVE_METHOD(Runtime, freeMemory, "!()J"),
   NATIVE_METHOD(Runtime, gc, "()V"),
-  NATIVE_METHOD(Runtime, maxMemory, "()J"),
+  NATIVE_METHOD(Runtime, maxMemory, "!()J"),
   NATIVE_METHOD(Runtime, nativeExit, "(I)V"),
   NATIVE_METHOD(Runtime, nativeLoad, "(Ljava/lang/String;Ljava/lang/ClassLoader;Ljava/lang/String;)Ljava/lang/String;"),
-  NATIVE_METHOD(Runtime, totalMemory, "()J"),
+  NATIVE_METHOD(Runtime, totalMemory, "!()J"),
 };
 
 void register_java_lang_Runtime(JNIEnv* env) {

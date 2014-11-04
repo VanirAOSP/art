@@ -52,7 +52,6 @@
 #include "mirror/class.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
-#include "object_utils.h"
 #include "os.h"
 #include "safe_map.h"
 #include "scoped_thread_state_change.h"
@@ -152,7 +151,8 @@ enum HprofHeapTag {
 enum HprofHeapId {
   HPROF_HEAP_DEFAULT = 0,
   HPROF_HEAP_ZYGOTE = 'Z',
-  HPROF_HEAP_APP = 'A'
+  HPROF_HEAP_APP = 'A',
+  HPROF_HEAP_IMAGE = 'I',
 };
 
 enum HprofBasicType {
@@ -167,14 +167,8 @@ enum HprofBasicType {
   hprof_basic_long = 11,
 };
 
-typedef uint32_t HprofId;
-typedef HprofId HprofStringId;
-typedef HprofId HprofObjectId;
-typedef HprofId HprofClassObjectId;
-typedef std::set<mirror::Class*> ClassSet;
-typedef std::set<mirror::Class*>::iterator ClassSetIterator;
-typedef SafeMap<std::string, size_t> StringMap;
-typedef SafeMap<std::string, size_t>::iterator StringMapIterator;
+typedef uint32_t HprofStringId;
+typedef uint32_t HprofClassObjectId;
 
 // Represents a top-level hprof record, whose serialized format is:
 // U1  TAG: denoting the type of the record
@@ -183,11 +177,8 @@ typedef SafeMap<std::string, size_t>::iterator StringMapIterator;
 // U1* BODY: as many bytes as specified in the above uint32_t field
 class HprofRecord {
  public:
-  HprofRecord() {
-    dirty_ = false;
-    alloc_length_ = 128;
+  HprofRecord() : alloc_length_(128), fp_(nullptr), tag_(0), time_(0), length_(0), dirty_(false) {
     body_ = reinterpret_cast<unsigned char*>(malloc(alloc_length_));
-    fp_ = NULL;
   }
 
   ~HprofRecord() {
@@ -233,7 +224,7 @@ class HprofRecord {
 
   int AddU1(uint8_t value) {
     int err = GuaranteeRecordAppend(1);
-    if (err != 0) {
+    if (UNLIKELY(err != 0)) {
       return err;
     }
 
@@ -253,13 +244,30 @@ class HprofRecord {
     return AddU8List(&value, 1);
   }
 
-  int AddId(HprofObjectId value) {
-    return AddU4((uint32_t) value);
+  int AddObjectId(const mirror::Object* value) {
+    return AddU4(PointerToLowMemUInt32(value));
+  }
+
+  // The ID for the synthetic object generated to account for class static overhead.
+  int AddClassStaticsId(const mirror::Class* value) {
+    return AddU4(1 | PointerToLowMemUInt32(value));
+  }
+
+  int AddJniGlobalRefId(jobject value) {
+    return AddU4(PointerToLowMemUInt32(value));
+  }
+
+  int AddClassId(HprofClassObjectId value) {
+    return AddU4(value);
+  }
+
+  int AddStringId(HprofStringId value) {
+    return AddU4(value);
   }
 
   int AddU1List(const uint8_t* values, size_t numValues) {
     int err = GuaranteeRecordAppend(numValues);
-    if (err != 0) {
+    if (UNLIKELY(err != 0)) {
       return err;
     }
 
@@ -270,7 +278,7 @@ class HprofRecord {
 
   int AddU2List(const uint16_t* values, size_t numValues) {
     int err = GuaranteeRecordAppend(numValues * 2);
-    if (err != 0) {
+    if (UNLIKELY(err != 0)) {
       return err;
     }
 
@@ -285,7 +293,7 @@ class HprofRecord {
 
   int AddU4List(const uint32_t* values, size_t numValues) {
     int err = GuaranteeRecordAppend(numValues * 4);
-    if (err != 0) {
+    if (UNLIKELY(err != 0)) {
       return err;
     }
 
@@ -317,8 +325,16 @@ class HprofRecord {
     return 0;
   }
 
-  int AddIdList(const HprofObjectId* values, size_t numValues) {
-    return AddU4List((const uint32_t*) values, numValues);
+  int AddIdList(mirror::ObjectArray<mirror::Object>* values)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    int32_t length = values->GetLength();
+    for (int32_t i = 0; i < length; ++i) {
+      int err = AddObjectId(values->GetWithoutChecks(i));
+      if (UNLIKELY(err != 0)) {
+        return err;
+      }
+    }
+    return 0;
   }
 
   int AddUtf8String(const char* str) {
@@ -412,15 +428,11 @@ class Hprof {
       LOCKS_EXCLUDED(Locks::heap_bitmap_lock_) {
     // Walk the roots and the heap.
     current_record_.StartNewRecord(body_fp_, HPROF_TAG_HEAP_DUMP_SEGMENT, HPROF_TIME);
-    Runtime::Current()->VisitRoots(RootVisitor, this, false, false);
+    Runtime::Current()->VisitRoots(RootVisitor, this);
     Thread* self = Thread::Current();
     {
-      WriterMutexLock mu(self, *Locks::heap_bitmap_lock_);
-      Runtime::Current()->GetHeap()->FlushAllocStack();
-    }
-    {
       ReaderMutexLock mu(self, *Locks::heap_bitmap_lock_);
-      Runtime::Current()->GetHeap()->GetLiveBitmap()->Walk(HeapBitmapCallback, this);
+      Runtime::Current()->GetHeap()->VisitObjects(VisitObjectCallback, this);
     }
     current_record_.StartNewRecord(body_fp_, HPROF_TAG_HEAP_DUMP_END, HPROF_TIME);
     current_record_.Flush();
@@ -463,7 +475,7 @@ class Hprof {
         }
       }
 
-      UniquePtr<File> file(new File(out_fd, filename_));
+      std::unique_ptr<File> file(new File(out_fd, filename_));
       okay = file->WriteFully(header_data_ptr_, header_data_size_) &&
           file->WriteFully(body_data_ptr_, body_data_size_);
       if (!okay) {
@@ -484,22 +496,23 @@ class Hprof {
   }
 
  private:
-  static void RootVisitor(const mirror::Object* obj, void* arg)
+  static void RootVisitor(mirror::Object** obj, void* arg, uint32_t thread_id, RootType root_type)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    CHECK(arg != NULL);
-    Hprof* hprof = reinterpret_cast<Hprof*>(arg);
-    hprof->VisitRoot(obj);
+    DCHECK(arg != nullptr);
+    DCHECK(obj != nullptr);
+    DCHECK(*obj != nullptr);
+    reinterpret_cast<Hprof*>(arg)->VisitRoot(*obj, thread_id, root_type);
   }
 
-  static void HeapBitmapCallback(mirror::Object* obj, void* arg)
+  static void VisitObjectCallback(mirror::Object* obj, void* arg)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    CHECK(obj != NULL);
-    CHECK(arg != NULL);
-    Hprof* hprof = reinterpret_cast<Hprof*>(arg);
-    hprof->DumpHeapObject(obj);
+    DCHECK(obj != NULL);
+    DCHECK(arg != NULL);
+    reinterpret_cast<Hprof*>(arg)->DumpHeapObject(obj);
   }
 
-  void VisitRoot(const mirror::Object* obj) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  void VisitRoot(const mirror::Object* obj, uint32_t thread_id, RootType type)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   int DumpHeapObject(mirror::Object* obj) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
@@ -510,12 +523,11 @@ class Hprof {
     HprofRecord* rec = &current_record_;
     uint32_t nextSerialNumber = 1;
 
-    for (ClassSetIterator it = classes_.begin(); it != classes_.end(); ++it) {
-      const mirror::Class* c = *it;
-      CHECK(c != NULL);
+    for (mirror::Class* c : classes_) {
+      CHECK(c != nullptr);
 
       int err = current_record_.StartNewRecord(header_fp_, HPROF_TAG_LOAD_CLASS, HPROF_TIME);
-      if (err != 0) {
+      if (UNLIKELY(err != 0)) {
         return err;
       }
 
@@ -525,9 +537,9 @@ class Hprof {
       // U4: stack trace serial number
       // ID: class name string ID
       rec->AddU4(nextSerialNumber++);
-      rec->AddId((HprofClassObjectId) c);
+      rec->AddObjectId(c);
       rec->AddU4(HPROF_NULL_STACK_TRACE);
-      rec->AddId(LookupClassNameId(c));
+      rec->AddStringId(LookupClassNameId(c));
     }
 
     return 0;
@@ -536,9 +548,9 @@ class Hprof {
   int WriteStringTable() {
     HprofRecord* rec = &current_record_;
 
-    for (StringMapIterator it = strings_.begin(); it != strings_.end(); ++it) {
-      const std::string& string = (*it).first;
-      size_t id = (*it).second;
+    for (std::pair<std::string, HprofStringId> p : strings_) {
+      const std::string& string = p.first;
+      size_t id = p.second;
 
       int err = current_record_.StartNewRecord(header_fp_, HPROF_TAG_STRING, HPROF_TIME);
       if (err != 0) {
@@ -573,24 +585,26 @@ class Hprof {
 
   int MarkRootObject(const mirror::Object* obj, jobject jniObj);
 
-  HprofClassObjectId LookupClassId(mirror::Class* c)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    if (c == NULL) {
-      // c is the superclass of java.lang.Object or a primitive
-      return (HprofClassObjectId)0;
+  HprofClassObjectId LookupClassId(mirror::Class* c) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    if (c == nullptr) {
+      // c is the superclass of java.lang.Object or a primitive.
+      return 0;
     }
 
-    std::pair<ClassSetIterator, bool> result = classes_.insert(c);
-    const mirror::Class* present = *result.first;
+    {
+      auto result = classes_.insert(c);
+      const mirror::Class* present = *result.first;
+      CHECK_EQ(present, c);
+    }
 
     // Make sure that we've assigned a string ID for this class' name
     LookupClassNameId(c);
 
-    CHECK_EQ(present, c);
-    return (HprofStringId) present;
+    HprofClassObjectId result = PointerToLowMemUInt32(c);
+    return result;
   }
 
-  HprofStringId LookupStringId(mirror::String* string) {
+  HprofStringId LookupStringId(mirror::String* string) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     return LookupStringId(string->ToModifiedUtf8());
   }
 
@@ -599,7 +613,7 @@ class Hprof {
   }
 
   HprofStringId LookupStringId(const std::string& string) {
-    StringMapIterator it = strings_.find(string);
+    auto it = strings_.find(string);
     if (it != strings_.end()) {
       return it->second;
     }
@@ -608,8 +622,7 @@ class Hprof {
     return id;
   }
 
-  HprofStringId LookupClassNameId(const mirror::Class* c)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  HprofStringId LookupClassNameId(mirror::Class* c) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     return LookupStringId(PrettyDescriptor(c));
   }
 
@@ -621,8 +634,12 @@ class Hprof {
     // U1: NUL-terminated magic string.
     fwrite(magic, 1, sizeof(magic), header_fp_);
 
-    // U4: size of identifiers.  We're using addresses as IDs, so make sure a pointer fits.
-    U4_TO_BUF_BE(buf, 0, sizeof(void*));
+    // U4: size of identifiers.  We're using addresses as IDs and our heap references are stored
+    // as uint32_t.
+    // Note of warning: hprof-conv hard-codes the size of identifiers to 4.
+    COMPILE_ASSERT(sizeof(mirror::HeapReference<mirror::Object>) == sizeof(uint32_t),
+      UnexpectedHeapReferenceSize);
+    U4_TO_BUF_BE(buf, 0, sizeof(uint32_t));
     fwrite(buf, 1, sizeof(uint32_t), header_fp_);
 
     // The current time, in milliseconds since 0:00 GMT, 1/1/70.
@@ -675,9 +692,9 @@ class Hprof {
   char* body_data_ptr_;
   size_t body_data_size_;
 
-  ClassSet classes_;
-  size_t next_string_id_;
-  StringMap strings_;
+  std::set<mirror::Class*> classes_;
+  HprofStringId next_string_id_;
+  SafeMap<std::string, HprofStringId> strings_;
 
   DISALLOW_COPY_AND_ASSIGN(Hprof);
 };
@@ -685,11 +702,8 @@ class Hprof {
 #define OBJECTS_PER_SEGMENT     ((size_t)128)
 #define BYTES_PER_SEGMENT       ((size_t)4096)
 
-// The static field-name for the synthetic object generated to account
-// for class static overhead.
+// The static field-name for the synthetic object generated to account for class static overhead.
 #define STATIC_OVERHEAD_NAME    "$staticOverhead"
-// The ID for the synthetic object generated to account for class static overhead.
-#define CLASS_STATICS_ID(c) ((HprofObjectId)(((uint32_t)(c)) | 1))
 
 static HprofBasicType SignatureToBasicTypeAndSize(const char* sig, size_t* sizeOut) {
   char c = sig[0];
@@ -765,15 +779,15 @@ int Hprof::MarkRootObject(const mirror::Object* obj, jobject jniObj) {
   case HPROF_ROOT_DEBUGGER:
   case HPROF_ROOT_VM_INTERNAL:
     rec->AddU1(heapTag);
-    rec->AddId((HprofObjectId)obj);
+    rec->AddObjectId(obj);
     break;
 
   // ID: object ID
   // ID: JNI global ref ID
   case HPROF_ROOT_JNI_GLOBAL:
     rec->AddU1(heapTag);
-    rec->AddId((HprofObjectId)obj);
-    rec->AddId((HprofId)jniObj);
+    rec->AddObjectId(obj);
+    rec->AddJniGlobalRefId(jniObj);
     break;
 
   // ID: object ID
@@ -783,7 +797,7 @@ int Hprof::MarkRootObject(const mirror::Object* obj, jobject jniObj) {
   case HPROF_ROOT_JNI_MONITOR:
   case HPROF_ROOT_JAVA_FRAME:
     rec->AddU1(heapTag);
-    rec->AddId((HprofObjectId)obj);
+    rec->AddObjectId(obj);
     rec->AddU4(gc_thread_serial_number_);
     rec->AddU4((uint32_t)-1);
     break;
@@ -793,7 +807,7 @@ int Hprof::MarkRootObject(const mirror::Object* obj, jobject jniObj) {
   case HPROF_ROOT_NATIVE_STACK:
   case HPROF_ROOT_THREAD_BLOCK:
     rec->AddU1(heapTag);
-    rec->AddId((HprofObjectId)obj);
+    rec->AddObjectId(obj);
     rec->AddU4(gc_thread_serial_number_);
     break;
 
@@ -802,7 +816,7 @@ int Hprof::MarkRootObject(const mirror::Object* obj, jobject jniObj) {
   // U4: stack trace serial number
   case HPROF_ROOT_THREAD_OBJECT:
     rec->AddU1(heapTag);
-    rec->AddId((HprofObjectId)obj);
+    rec->AddObjectId(obj);
     rec->AddU4(gc_thread_serial_number_);
     rec->AddU4((uint32_t)-1);    // xxx
     break;
@@ -833,25 +847,36 @@ static int StackTraceSerialNumber(const mirror::Object* /*obj*/) {
 
 int Hprof::DumpHeapObject(mirror::Object* obj) {
   HprofRecord* rec = &current_record_;
-  HprofHeapId desiredHeap = false ? HPROF_HEAP_ZYGOTE : HPROF_HEAP_APP;  // TODO: zygote objects?
-
+  gc::space::ContinuousSpace* space =
+      Runtime::Current()->GetHeap()->FindContinuousSpaceFromObject(obj, true);
+  HprofHeapId heap_type = HPROF_HEAP_APP;
+  if (space != nullptr) {
+    if (space->IsZygoteSpace()) {
+      heap_type = HPROF_HEAP_ZYGOTE;
+    } else if (space->IsImageSpace()) {
+      heap_type = HPROF_HEAP_IMAGE;
+    }
+  }
   if (objects_in_segment_ >= OBJECTS_PER_SEGMENT || rec->Size() >= BYTES_PER_SEGMENT) {
     StartNewHeapDumpSegment();
   }
 
-  if (desiredHeap != current_heap_) {
+  if (heap_type != current_heap_) {
     HprofStringId nameId;
 
     // This object is in a different heap than the current one.
     // Emit a HEAP_DUMP_INFO tag to change heaps.
     rec->AddU1(HPROF_HEAP_DUMP_INFO);
-    rec->AddU4((uint32_t)desiredHeap);   // uint32_t: heap id
-    switch (desiredHeap) {
+    rec->AddU4(static_cast<uint32_t>(heap_type));   // uint32_t: heap type
+    switch (heap_type) {
     case HPROF_HEAP_APP:
       nameId = LookupStringId("app");
       break;
     case HPROF_HEAP_ZYGOTE:
       nameId = LookupStringId("zygote");
+      break;
+    case HPROF_HEAP_IMAGE:
+      nameId = LookupStringId("image");
       break;
     default:
       // Internal error
@@ -859,8 +884,8 @@ int Hprof::DumpHeapObject(mirror::Object* obj) {
       nameId = LookupStringId("<ILLEGAL>");
       break;
     }
-    rec->AddId(nameId);
-    current_heap_ = desiredHeap;
+    rec->AddStringId(nameId);
+    current_heap_ = heap_type;
   }
 
   mirror::Class* c = obj->GetClass();
@@ -875,11 +900,11 @@ int Hprof::DumpHeapObject(mirror::Object* obj) {
       // obj is a ClassObject.
       size_t sFieldCount = thisClass->NumStaticFields();
       if (sFieldCount != 0) {
-        int byteLength = sFieldCount*sizeof(JValue);  // TODO bogus; fields are packed
+        int byteLength = sFieldCount * sizeof(JValue);  // TODO bogus; fields are packed
         // Create a byte array to reflect the allocation of the
         // StaticField array at the end of this class.
         rec->AddU1(HPROF_PRIMITIVE_ARRAY_DUMP);
-        rec->AddId(CLASS_STATICS_ID(obj));
+        rec->AddClassStaticsId(thisClass);
         rec->AddU4(StackTraceSerialNumber(obj));
         rec->AddU4(byteLength);
         rec->AddU1(hprof_basic_byte);
@@ -889,14 +914,14 @@ int Hprof::DumpHeapObject(mirror::Object* obj) {
       }
 
       rec->AddU1(HPROF_CLASS_DUMP);
-      rec->AddId(LookupClassId(thisClass));
+      rec->AddClassId(LookupClassId(thisClass));
       rec->AddU4(StackTraceSerialNumber(thisClass));
-      rec->AddId(LookupClassId(thisClass->GetSuperClass()));
-      rec->AddId((HprofObjectId)thisClass->GetClassLoader());
-      rec->AddId((HprofObjectId)0);    // no signer
-      rec->AddId((HprofObjectId)0);    // no prot domain
-      rec->AddId((HprofId)0);           // reserved
-      rec->AddId((HprofId)0);           // reserved
+      rec->AddClassId(LookupClassId(thisClass->GetSuperClass()));
+      rec->AddObjectId(thisClass->GetClassLoader());
+      rec->AddObjectId(nullptr);    // no signer
+      rec->AddObjectId(nullptr);    // no prot domain
+      rec->AddObjectId(nullptr);    // reserved
+      rec->AddObjectId(nullptr);    // reserved
       if (thisClass->IsClassClass()) {
         // ClassObjects have their static fields appended, so aren't all the same size.
         // But they're at least this size.
@@ -909,24 +934,21 @@ int Hprof::DumpHeapObject(mirror::Object* obj) {
 
       rec->AddU2(0);  // empty const pool
 
-      FieldHelper fh;
-
       // Static fields
       if (sFieldCount == 0) {
         rec->AddU2((uint16_t)0);
       } else {
         rec->AddU2((uint16_t)(sFieldCount+1));
-        rec->AddId(LookupStringId(STATIC_OVERHEAD_NAME));
+        rec->AddStringId(LookupStringId(STATIC_OVERHEAD_NAME));
         rec->AddU1(hprof_basic_object);
-        rec->AddId(CLASS_STATICS_ID(obj));
+        rec->AddClassStaticsId(thisClass);
 
         for (size_t i = 0; i < sFieldCount; ++i) {
           mirror::ArtField* f = thisClass->GetStaticField(i);
-          fh.ChangeField(f);
 
           size_t size;
-          HprofBasicType t = SignatureToBasicTypeAndSize(fh.GetTypeDescriptor(), &size);
-          rec->AddId(LookupStringId(fh.GetName()));
+          HprofBasicType t = SignatureToBasicTypeAndSize(f->GetTypeDescriptor(), &size);
+          rec->AddStringId(LookupStringId(f->GetName()));
           rec->AddU1(t);
           if (size == 1) {
             rec->AddU1(static_cast<uint8_t>(f->Get32(thisClass)));
@@ -947,26 +969,25 @@ int Hprof::DumpHeapObject(mirror::Object* obj) {
       rec->AddU2((uint16_t)iFieldCount);
       for (int i = 0; i < iFieldCount; ++i) {
         mirror::ArtField* f = thisClass->GetInstanceField(i);
-        fh.ChangeField(f);
-        HprofBasicType t = SignatureToBasicTypeAndSize(fh.GetTypeDescriptor(), NULL);
-        rec->AddId(LookupStringId(fh.GetName()));
+        HprofBasicType t = SignatureToBasicTypeAndSize(f->GetTypeDescriptor(), NULL);
+        rec->AddStringId(LookupStringId(f->GetName()));
         rec->AddU1(t);
       }
     } else if (c->IsArrayClass()) {
-      const mirror::Array* aobj = obj->AsArray();
+      mirror::Array* aobj = obj->AsArray();
       uint32_t length = aobj->GetLength();
 
       if (obj->IsObjectArray()) {
         // obj is an object array.
         rec->AddU1(HPROF_OBJECT_ARRAY_DUMP);
 
-        rec->AddId((HprofObjectId)obj);
+        rec->AddObjectId(obj);
         rec->AddU4(StackTraceSerialNumber(obj));
         rec->AddU4(length);
-        rec->AddId(LookupClassId(c));
+        rec->AddClassId(LookupClassId(c));
 
         // Dump the elements, which are always objects or NULL.
-        rec->AddIdList((const HprofObjectId*)aobj->GetRawData(sizeof(mirror::Object*)), length);
+        rec->AddIdList(aobj->AsObjectArray<mirror::Object>());
       } else {
         size_t size;
         HprofBasicType t = PrimitiveToBasicTypeAndSize(c->GetComponentType()->GetPrimitiveType(), &size);
@@ -974,28 +995,28 @@ int Hprof::DumpHeapObject(mirror::Object* obj) {
         // obj is a primitive array.
         rec->AddU1(HPROF_PRIMITIVE_ARRAY_DUMP);
 
-        rec->AddId((HprofObjectId)obj);
+        rec->AddObjectId(obj);
         rec->AddU4(StackTraceSerialNumber(obj));
         rec->AddU4(length);
         rec->AddU1(t);
 
         // Dump the raw, packed element values.
         if (size == 1) {
-          rec->AddU1List((const uint8_t*)aobj->GetRawData(sizeof(uint8_t)), length);
+          rec->AddU1List((const uint8_t*)aobj->GetRawData(sizeof(uint8_t), 0), length);
         } else if (size == 2) {
-          rec->AddU2List((const uint16_t*)aobj->GetRawData(sizeof(uint16_t)), length);
+          rec->AddU2List((const uint16_t*)aobj->GetRawData(sizeof(uint16_t), 0), length);
         } else if (size == 4) {
-          rec->AddU4List((const uint32_t*)aobj->GetRawData(sizeof(uint32_t)), length);
+          rec->AddU4List((const uint32_t*)aobj->GetRawData(sizeof(uint32_t), 0), length);
         } else if (size == 8) {
-          rec->AddU8List((const uint64_t*)aobj->GetRawData(sizeof(uint64_t)), length);
+          rec->AddU8List((const uint64_t*)aobj->GetRawData(sizeof(uint64_t), 0), length);
         }
       }
     } else {
       // obj is an instance object.
       rec->AddU1(HPROF_INSTANCE_DUMP);
-      rec->AddId((HprofObjectId)obj);
+      rec->AddObjectId(obj);
       rec->AddU4(StackTraceSerialNumber(obj));
-      rec->AddId(LookupClassId(c));
+      rec->AddClassId(LookupClassId(c));
 
       // Reserve some space for the length of the instance data, which we won't
       // know until we're done writing it.
@@ -1004,25 +1025,22 @@ int Hprof::DumpHeapObject(mirror::Object* obj) {
 
       // Write the instance data;  fields for this class, followed by super class fields,
       // and so on. Don't write the klass or monitor fields of Object.class.
-      const mirror::Class* sclass = c;
-      FieldHelper fh;
+      mirror::Class* sclass = c;
       while (!sclass->IsObjectClass()) {
         int ifieldCount = sclass->NumInstanceFields();
         for (int i = 0; i < ifieldCount; ++i) {
           mirror::ArtField* f = sclass->GetInstanceField(i);
-          fh.ChangeField(f);
           size_t size;
-          SignatureToBasicTypeAndSize(fh.GetTypeDescriptor(), &size);
+          SignatureToBasicTypeAndSize(f->GetTypeDescriptor(), &size);
           if (size == 1) {
             rec->AddU1(f->Get32(obj));
           } else if (size == 2) {
             rec->AddU2(f->Get32(obj));
           } else if (size == 4) {
             rec->AddU4(f->Get32(obj));
-          } else if (size == 8) {
-            rec->AddU8(f->Get64(obj));
           } else {
-            CHECK(false);
+            CHECK_EQ(size, 8U);
+            rec->AddU8(f->Get64(obj));
           }
         }
 
@@ -1038,10 +1056,7 @@ int Hprof::DumpHeapObject(mirror::Object* obj) {
   return 0;
 }
 
-void Hprof::VisitRoot(const mirror::Object* obj) {
-  uint32_t threadId = 0;  // TODO
-  /*RootType*/ size_t type = 0;  // TODO
-
+void Hprof::VisitRoot(const mirror::Object* obj, uint32_t thread_id, RootType type) {
   static const HprofHeapTag xlate[] = {
     HPROF_ROOT_UNKNOWN,
     HPROF_ROOT_JNI_GLOBAL,
@@ -1059,13 +1074,12 @@ void Hprof::VisitRoot(const mirror::Object* obj) {
     HPROF_ROOT_VM_INTERNAL,
     HPROF_ROOT_JNI_MONITOR,
   };
-
   CHECK_LT(type, sizeof(xlate) / sizeof(HprofHeapTag));
   if (obj == NULL) {
     return;
   }
   gc_scan_state_ = xlate[type];
-  gc_thread_serial_number_ = threadId;
+  gc_thread_serial_number_ = thread_id;
   MarkRootObject(obj, 0);
   gc_scan_state_ = 0;
   gc_thread_serial_number_ = 0;

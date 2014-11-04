@@ -14,66 +14,64 @@
  * limitations under the License.
  */
 
-#include "base/logging.h"
-#include "dex_file-inl.h"
-#include "heap_bitmap.h"
-#include "mirror/art_field-inl.h"
-#include "mirror/class-inl.h"
-#include "mirror/object-inl.h"
-#include "mirror/object_array-inl.h"
-#include "object_utils.h"
 #include "space_bitmap-inl.h"
-#include "UniquePtr.h"
-#include "utils.h"
+
+#include "base/stringprintf.h"
+#include "mem_map.h"
+#include "mirror/object-inl.h"
+#include "mirror/class.h"
+#include "mirror/art_field.h"
+#include "mirror/object_array.h"
 
 namespace art {
 namespace gc {
 namespace accounting {
 
-std::string SpaceBitmap::GetName() const {
-  return name_;
+template<size_t kAlignment>
+size_t SpaceBitmap<kAlignment>::ComputeBitmapSize(uint64_t capacity) {
+  const uint64_t kBytesCoveredPerWord = kAlignment * kBitsPerWord;
+  return (RoundUp(capacity, kBytesCoveredPerWord) / kBytesCoveredPerWord) * kWordSize;
 }
 
-void SpaceBitmap::SetName(const std::string& name) {
-  name_ = name;
-}
-
-std::string SpaceBitmap::Dump() const {
-  return StringPrintf("%s: %p-%p", name_.c_str(),
-                      reinterpret_cast<void*>(HeapBegin()),
-                      reinterpret_cast<void*>(HeapLimit()));
-}
-
-void SpaceSetMap::Walk(SpaceBitmap::Callback* callback, void* arg) {
-  for (const mirror::Object* obj : contained_) {
-    callback(const_cast<mirror::Object*>(obj), arg);
-  }
-}
-
-SpaceBitmap* SpaceBitmap::CreateFromMemMap(const std::string& name, MemMap* mem_map,
-                                           byte* heap_begin, size_t heap_capacity) {
+template<size_t kAlignment>
+SpaceBitmap<kAlignment>* SpaceBitmap<kAlignment>::CreateFromMemMap(
+    const std::string& name, MemMap* mem_map, byte* heap_begin, size_t heap_capacity) {
   CHECK(mem_map != nullptr);
-  word* bitmap_begin = reinterpret_cast<word*>(mem_map->Begin());
-  size_t bitmap_size = OffsetToIndex(RoundUp(heap_capacity, kAlignment * kBitsPerWord)) * kWordSize;
+  uword* bitmap_begin = reinterpret_cast<uword*>(mem_map->Begin());
+  const size_t bitmap_size = ComputeBitmapSize(heap_capacity);
   return new SpaceBitmap(name, mem_map, bitmap_begin, bitmap_size, heap_begin);
 }
 
-SpaceBitmap* SpaceBitmap::Create(const std::string& name, byte* heap_begin, size_t heap_capacity) {
-  CHECK(heap_begin != NULL);
+template<size_t kAlignment>
+SpaceBitmap<kAlignment>::SpaceBitmap(const std::string& name, MemMap* mem_map, uword* bitmap_begin,
+                                     size_t bitmap_size, const void* heap_begin)
+    : mem_map_(mem_map), bitmap_begin_(bitmap_begin), bitmap_size_(bitmap_size),
+      heap_begin_(reinterpret_cast<uintptr_t>(heap_begin)),
+      name_(name) {
+  CHECK(bitmap_begin_ != nullptr);
+  CHECK_NE(bitmap_size, 0U);
+}
+
+template<size_t kAlignment>
+SpaceBitmap<kAlignment>::~SpaceBitmap() {}
+
+template<size_t kAlignment>
+SpaceBitmap<kAlignment>* SpaceBitmap<kAlignment>::Create(
+    const std::string& name, byte* heap_begin, size_t heap_capacity) {
   // Round up since heap_capacity is not necessarily a multiple of kAlignment * kBitsPerWord.
-  size_t bitmap_size = OffsetToIndex(RoundUp(heap_capacity, kAlignment * kBitsPerWord)) * kWordSize;
-  UniquePtr<MemMap> mem_map(MemMap::MapAnonymous(name.c_str(), NULL, bitmap_size, PROT_READ | PROT_WRITE));
-  if (mem_map.get() == NULL) {
-    LOG(ERROR) << "Failed to allocate bitmap " << name;
-    return NULL;
+  const size_t bitmap_size = ComputeBitmapSize(heap_capacity);
+  std::string error_msg;
+  std::unique_ptr<MemMap> mem_map(MemMap::MapAnonymous(name.c_str(), nullptr, bitmap_size,
+                                                       PROT_READ | PROT_WRITE, false, &error_msg));
+  if (UNLIKELY(mem_map.get() == nullptr)) {
+    LOG(ERROR) << "Failed to allocate bitmap " << name << ": " << error_msg;
+    return nullptr;
   }
   return CreateFromMemMap(name, mem_map.release(), heap_begin, heap_capacity);
 }
 
-// Clean up any resources associated with the bitmap.
-SpaceBitmap::~SpaceBitmap() {}
-
-void SpaceBitmap::SetHeapLimit(uintptr_t new_end) {
+template<size_t kAlignment>
+void SpaceBitmap<kAlignment>::SetHeapLimit(uintptr_t new_end) {
   DCHECK(IsAligned<kBitsPerWord * kAlignment>(new_end));
   size_t new_size = OffsetToIndex(new_end - heap_begin_) * kWordSize;
   if (new_size < bitmap_size_) {
@@ -83,54 +81,53 @@ void SpaceBitmap::SetHeapLimit(uintptr_t new_end) {
   // should be marked.
 }
 
-void SpaceBitmap::Clear() {
-  if (bitmap_begin_ != NULL) {
-    // This returns the memory to the system.  Successive page faults will return zeroed memory.
-    int result = madvise(bitmap_begin_, bitmap_size_, MADV_DONTNEED);
-    if (result == -1) {
-      PLOG(FATAL) << "madvise failed";
-    }
+template<size_t kAlignment>
+std::string SpaceBitmap<kAlignment>::Dump() const {
+  return StringPrintf("%s: %p-%p", name_.c_str(), reinterpret_cast<void*>(HeapBegin()),
+                      reinterpret_cast<void*>(HeapLimit()));
+}
+
+template<size_t kAlignment>
+void SpaceBitmap<kAlignment>::Clear() {
+  if (bitmap_begin_ != nullptr) {
+    mem_map_->MadviseDontNeedAndZero();
   }
 }
 
-void SpaceBitmap::CopyFrom(SpaceBitmap* source_bitmap) {
+template<size_t kAlignment>
+void SpaceBitmap<kAlignment>::CopyFrom(SpaceBitmap* source_bitmap) {
   DCHECK_EQ(Size(), source_bitmap->Size());
   std::copy(source_bitmap->Begin(), source_bitmap->Begin() + source_bitmap->Size() / kWordSize, Begin());
 }
 
-// Visits set bits in address order.  The callback is not permitted to
-// change the bitmap bits or max during the traversal.
-void SpaceBitmap::Walk(SpaceBitmap::Callback* callback, void* arg) {
+template<size_t kAlignment>
+void SpaceBitmap<kAlignment>::Walk(ObjectCallback* callback, void* arg) {
   CHECK(bitmap_begin_ != NULL);
   CHECK(callback != NULL);
 
   uintptr_t end = OffsetToIndex(HeapLimit() - heap_begin_ - 1);
-  word* bitmap_begin = bitmap_begin_;
+  uword* bitmap_begin = bitmap_begin_;
   for (uintptr_t i = 0; i <= end; ++i) {
-    word w = bitmap_begin[i];
+    uword w = bitmap_begin[i];
     if (w != 0) {
       uintptr_t ptr_base = IndexToOffset(i) + heap_begin_;
       do {
-        const size_t shift = CLZ(w);
+        const size_t shift = CTZ(w);
         mirror::Object* obj = reinterpret_cast<mirror::Object*>(ptr_base + shift * kAlignment);
         (*callback)(obj, arg);
-        w ^= static_cast<size_t>(kWordHighBitMask) >> shift;
+        w ^= (static_cast<uword>(1)) << shift;
       } while (w != 0);
     }
   }
 }
 
-// Walk through the bitmaps in increasing address order, and find the
-// object pointers that correspond to garbage objects.  Call
-// <callback> zero or more times with lists of these object pointers.
-//
-// The callback is not permitted to increase the max of either bitmap.
-void SpaceBitmap::SweepWalk(const SpaceBitmap& live_bitmap,
-                           const SpaceBitmap& mark_bitmap,
-                           uintptr_t sweep_begin, uintptr_t sweep_end,
-                           SpaceBitmap::SweepCallback* callback, void* arg) {
-  CHECK(live_bitmap.bitmap_begin_ != NULL);
-  CHECK(mark_bitmap.bitmap_begin_ != NULL);
+template<size_t kAlignment>
+void SpaceBitmap<kAlignment>::SweepWalk(const SpaceBitmap<kAlignment>& live_bitmap,
+                                        const SpaceBitmap<kAlignment>& mark_bitmap,
+                                        uintptr_t sweep_begin, uintptr_t sweep_end,
+                                        SpaceBitmap::SweepCallback* callback, void* arg) {
+  CHECK(live_bitmap.bitmap_begin_ != nullptr);
+  CHECK(mark_bitmap.bitmap_begin_ != nullptr);
   CHECK_EQ(live_bitmap.heap_begin_, mark_bitmap.heap_begin_);
   CHECK_EQ(live_bitmap.bitmap_size_, mark_bitmap.bitmap_size_);
   CHECK(callback != NULL);
@@ -142,21 +139,29 @@ void SpaceBitmap::SweepWalk(const SpaceBitmap& live_bitmap,
   }
 
   // TODO: rewrite the callbacks to accept a std::vector<mirror::Object*> rather than a mirror::Object**?
-  const size_t buffer_size = kWordSize * kBitsPerWord;
+  constexpr size_t buffer_size = kWordSize * kBitsPerWord;
+#ifdef __LP64__
+  // Heap-allocate for smaller stack frame.
+  std::unique_ptr<mirror::Object*[]> pointer_buf_ptr(new mirror::Object*[buffer_size]);
+  mirror::Object** pointer_buf = pointer_buf_ptr.get();
+#else
+  // Stack-allocate buffer as it's small enough.
   mirror::Object* pointer_buf[buffer_size];
+#endif
   mirror::Object** pb = &pointer_buf[0];
+
   size_t start = OffsetToIndex(sweep_begin - live_bitmap.heap_begin_);
   size_t end = OffsetToIndex(sweep_end - live_bitmap.heap_begin_ - 1);
   CHECK_LT(end, live_bitmap.Size() / kWordSize);
-  word* live = live_bitmap.bitmap_begin_;
-  word* mark = mark_bitmap.bitmap_begin_;
+  uword* live = live_bitmap.bitmap_begin_;
+  uword* mark = mark_bitmap.bitmap_begin_;
   for (size_t i = start; i <= end; i++) {
-    word garbage = live[i] & ~mark[i];
+    uword garbage = live[i] & ~mark[i];
     if (UNLIKELY(garbage != 0)) {
       uintptr_t ptr_base = IndexToOffset(i) + live_bitmap.heap_begin_;
       do {
-        const size_t shift = CLZ(garbage);
-        garbage ^= static_cast<size_t>(kWordHighBitMask) >> shift;
+        const size_t shift = CTZ(garbage);
+        garbage ^= (static_cast<uword>(1)) << shift;
         *pb++ = reinterpret_cast<mirror::Object*>(ptr_base + shift * kAlignment);
       } while (garbage != 0);
       // Make sure that there are always enough slots available for an
@@ -172,13 +177,10 @@ void SpaceBitmap::SweepWalk(const SpaceBitmap& live_bitmap,
   }
 }
 
-static void WalkFieldsInOrder(SpaceBitmap* visited, SpaceBitmap::Callback* callback, mirror::Object* obj,
-                              void* arg);
-
-// Walk instance fields of the given Class. Separate function to allow recursion on the super
-// class.
-static void WalkInstanceFields(SpaceBitmap* visited, SpaceBitmap::Callback* callback, mirror::Object* obj,
-                               mirror::Class* klass, void* arg)
+template<size_t kAlignment>
+void SpaceBitmap<kAlignment>::WalkInstanceFields(SpaceBitmap<kAlignment>* visited,
+                                                 ObjectCallback* callback, mirror::Object* obj,
+                                                 mirror::Class* klass, void* arg)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   // Visit fields of parent classes first.
   mirror::Class* super = klass->GetSuperClass();
@@ -190,21 +192,20 @@ static void WalkInstanceFields(SpaceBitmap* visited, SpaceBitmap::Callback* call
   if (fields != NULL) {
     for (int32_t i = 0; i < fields->GetLength(); i++) {
       mirror::ArtField* field = fields->Get(i);
-      FieldHelper fh(field);
-      if (!fh.IsPrimitiveType()) {
+      if (!field->IsPrimitiveType()) {
         mirror::Object* value = field->GetObj(obj);
         if (value != NULL) {
-          WalkFieldsInOrder(visited, callback, value,  arg);
+          WalkFieldsInOrder(visited, callback, value, arg);
         }
       }
     }
   }
 }
 
-// For an unvisited object, visit it then all its children found via fields.
-static void WalkFieldsInOrder(SpaceBitmap* visited, SpaceBitmap::Callback* callback, mirror::Object* obj,
-                              void* arg)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+template<size_t kAlignment>
+void SpaceBitmap<kAlignment>::WalkFieldsInOrder(SpaceBitmap<kAlignment>* visited,
+                                                ObjectCallback* callback, mirror::Object* obj,
+                                                void* arg) {
   if (visited->Test(obj)) {
     return;
   }
@@ -220,8 +221,7 @@ static void WalkFieldsInOrder(SpaceBitmap* visited, SpaceBitmap::Callback* callb
     if (fields != NULL) {
       for (int32_t i = 0; i < fields->GetLength(); i++) {
         mirror::ArtField* field = fields->Get(i);
-        FieldHelper fh(field);
-        if (!fh.IsPrimitiveType()) {
+        if (!field->IsPrimitiveType()) {
           mirror::Object* value = field->GetObj(NULL);
           if (value != NULL) {
             WalkFieldsInOrder(visited, callback, value, arg);
@@ -242,48 +242,31 @@ static void WalkFieldsInOrder(SpaceBitmap* visited, SpaceBitmap::Callback* callb
   }
 }
 
-// Visits set bits with an in order traversal.  The callback is not permitted to change the bitmap
-// bits or max during the traversal.
-void SpaceBitmap::InOrderWalk(SpaceBitmap::Callback* callback, void* arg) {
-  UniquePtr<SpaceBitmap> visited(Create("bitmap for in-order walk",
-                                       reinterpret_cast<byte*>(heap_begin_),
-                                       IndexToOffset(bitmap_size_ / kWordSize)));
-  CHECK(bitmap_begin_ != NULL);
-  CHECK(callback != NULL);
+template<size_t kAlignment>
+void SpaceBitmap<kAlignment>::InOrderWalk(ObjectCallback* callback, void* arg) {
+  std::unique_ptr<SpaceBitmap<kAlignment>> visited(
+      Create("bitmap for in-order walk", reinterpret_cast<byte*>(heap_begin_),
+             IndexToOffset(bitmap_size_ / kWordSize)));
+  CHECK(bitmap_begin_ != nullptr);
+  CHECK(callback != nullptr);
   uintptr_t end = Size() / kWordSize;
   for (uintptr_t i = 0; i < end; ++i) {
-    word w = bitmap_begin_[i];
+    // Need uint for unsigned shift.
+    uword w = bitmap_begin_[i];
     if (UNLIKELY(w != 0)) {
       uintptr_t ptr_base = IndexToOffset(i) + heap_begin_;
       while (w != 0) {
-        const size_t shift = CLZ(w);
+        const size_t shift = CTZ(w);
         mirror::Object* obj = reinterpret_cast<mirror::Object*>(ptr_base + shift * kAlignment);
         WalkFieldsInOrder(visited.get(), callback, obj, arg);
-        w ^= static_cast<size_t>(kWordHighBitMask) >> shift;
+        w ^= (static_cast<uword>(1)) << shift;
       }
     }
   }
 }
 
-std::string SpaceSetMap::GetName() const {
-  return name_;
-}
-
-void SpaceSetMap::SetName(const std::string& name) {
-  name_ = name;
-}
-
-void SpaceSetMap::CopyFrom(const SpaceSetMap& space_set) {
-  contained_ = space_set.contained_;
-}
-
-std::ostream& operator << (std::ostream& stream, const SpaceBitmap& bitmap) {
-  return stream
-    << bitmap.GetName() << "["
-    << "begin=" << reinterpret_cast<const void*>(bitmap.HeapBegin())
-    << ",end=" << reinterpret_cast<const void*>(bitmap.HeapLimit())
-    << "]";
-}
+template class SpaceBitmap<kObjectAlignment>;
+template class SpaceBitmap<kPageSize>;
 
 }  // namespace accounting
 }  // namespace gc

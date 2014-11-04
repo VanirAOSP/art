@@ -18,12 +18,10 @@
 #define ART_RUNTIME_BASE_UNIX_FILE_RANDOM_ACCESS_FILE_TEST_H_
 
 #include <errno.h>
-
+#include <memory>
 #include <string>
 
-#include "common_test.h"
-#include "gtest/gtest.h"
-#include "UniquePtr.h"
+#include "common_runtime_test.h"
 
 namespace unix_file {
 
@@ -37,7 +35,11 @@ class RandomAccessFileTest : public testing::Test {
   virtual RandomAccessFile* MakeTestFile() = 0;
 
   virtual void SetUp() {
-    art::CommonTest::SetEnvironmentVariables(android_data_);
+    art::CommonRuntimeTest::SetUpAndroidData(android_data_);
+  }
+
+  virtual void TearDown() {
+    art::CommonRuntimeTest::TearDownAndroidData(android_data_, true);
   }
 
   std::string GetTmpPath(const std::string& name) {
@@ -63,7 +65,7 @@ class RandomAccessFileTest : public testing::Test {
 
   void TestRead() {
     char buf[256];
-    UniquePtr<RandomAccessFile> file(MakeTestFile());
+    std::unique_ptr<RandomAccessFile> file(MakeTestFile());
 
     // Reading from the start of an empty file gets you zero bytes, however many
     // you ask for.
@@ -71,33 +73,33 @@ class RandomAccessFileTest : public testing::Test {
     ASSERT_EQ(0, file->Read(buf, 123, 0));
 
     const std::string content("hello");
-    ASSERT_EQ(content.size(), file->Write(content.data(), content.size(), 0));
+    ASSERT_EQ(content.size(), static_cast<uint64_t>(file->Write(content.data(), content.size(), 0)));
 
     TestReadContent(content, file.get());
   }
 
   void TestReadContent(const std::string& content, RandomAccessFile* file) {
     const int buf_size = content.size() + 10;
-    UniquePtr<char> buf(new char[buf_size]);
+    std::unique_ptr<char> buf(new char[buf_size]);
     // Can't read from a negative offset.
     ASSERT_EQ(-EINVAL, file->Read(buf.get(), 0, -123));
 
     // Reading too much gets us just what's in the file.
-    ASSERT_EQ(content.size(), file->Read(buf.get(), buf_size, 0));
+    ASSERT_EQ(content.size(), static_cast<uint64_t>(file->Read(buf.get(), buf_size, 0)));
     ASSERT_EQ(std::string(buf.get(), content.size()), content);
 
     // We only get as much as we ask for.
     const size_t short_request = 2;
     ASSERT_LT(short_request, content.size());
-    ASSERT_EQ(short_request, file->Read(buf.get(), short_request, 0));
+    ASSERT_EQ(short_request, static_cast<uint64_t>(file->Read(buf.get(), short_request, 0)));
     ASSERT_EQ(std::string(buf.get(), short_request),
               content.substr(0, short_request));
 
     // We don't have to start at the beginning.
     const int non_zero_offset = 2;
     ASSERT_GT(non_zero_offset, 0);
-    ASSERT_EQ(short_request,
-              file->Read(buf.get(), short_request, non_zero_offset));
+    ASSERT_EQ(short_request, static_cast<uint64_t>(file->Read(buf.get(), short_request,
+                                                              non_zero_offset)));
     ASSERT_EQ(std::string(buf.get(), short_request),
               content.substr(non_zero_offset, short_request));
 
@@ -108,9 +110,9 @@ class RandomAccessFileTest : public testing::Test {
 
   void TestSetLength() {
     const std::string content("hello");
-    UniquePtr<RandomAccessFile> file(MakeTestFile());
-    ASSERT_EQ(content.size(), file->Write(content.data(), content.size(), 0));
-    ASSERT_EQ(content.size(), file->GetLength());
+    std::unique_ptr<RandomAccessFile> file(MakeTestFile());
+    ASSERT_EQ(content.size(), static_cast<uint64_t>(file->Write(content.data(), content.size(), 0)));
+    ASSERT_EQ(content.size(), static_cast<uint64_t>(file->GetLength()));
 
     // Can't give a file a negative length.
     ASSERT_EQ(-EINVAL, file->SetLength(-123));
@@ -133,7 +135,7 @@ class RandomAccessFileTest : public testing::Test {
 
   void TestWrite() {
     const std::string content("hello");
-    UniquePtr<RandomAccessFile> file(MakeTestFile());
+    std::unique_ptr<RandomAccessFile> file(MakeTestFile());
 
     // Can't write to a negative offset.
     ASSERT_EQ(-EINVAL, file->Write(content.data(), 0, -123));
@@ -143,20 +145,20 @@ class RandomAccessFileTest : public testing::Test {
     ASSERT_EQ(0, file->GetLength());
 
     // We can write data.
-    ASSERT_EQ(content.size(), file->Write(content.data(), content.size(), 0));
-    ASSERT_EQ(content.size(), file->GetLength());
+    ASSERT_EQ(content.size(), static_cast<uint64_t>(file->Write(content.data(), content.size(), 0)));
+    ASSERT_EQ(content.size(), static_cast<uint64_t>(file->GetLength()));
     std::string new_content;
     ASSERT_TRUE(ReadString(file.get(), &new_content));
     ASSERT_EQ(new_content, content);
 
     // We can read it back.
     char buf[256];
-    ASSERT_EQ(content.size(), file->Read(buf, sizeof(buf), 0));
+    ASSERT_EQ(content.size(), static_cast<uint64_t>(file->Read(buf, sizeof(buf), 0)));
     ASSERT_EQ(std::string(buf, content.size()), content);
 
     // We can append data past the end.
-    ASSERT_EQ(content.size(),
-    file->Write(content.data(), content.size(), file->GetLength() + 1));
+    ASSERT_EQ(content.size(), static_cast<uint64_t>(file->Write(content.data(), content.size(),
+                                                                file->GetLength() + 1)));
     int64_t new_length = 2*content.size() + 1;
     ASSERT_EQ(file->GetLength(), new_length);
     ASSERT_TRUE(ReadString(file.get(), &new_content));

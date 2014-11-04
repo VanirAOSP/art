@@ -69,17 +69,29 @@ int FdFile::Close() {
 }
 
 int FdFile::Flush() {
+#ifdef __linux__
   int rc = TEMP_FAILURE_RETRY(fdatasync(fd_));
+#else
+  int rc = TEMP_FAILURE_RETRY(fsync(fd_));
+#endif
   return (rc == -1) ? -errno : rc;
 }
 
 int64_t FdFile::Read(char* buf, int64_t byte_count, int64_t offset) const {
+#ifdef __linux__
   int rc = TEMP_FAILURE_RETRY(pread64(fd_, buf, byte_count, offset));
+#else
+  int rc = TEMP_FAILURE_RETRY(pread(fd_, buf, byte_count, offset));
+#endif
   return (rc == -1) ? -errno : rc;
 }
 
 int FdFile::SetLength(int64_t new_length) {
+#ifdef __linux__
   int rc = TEMP_FAILURE_RETRY(ftruncate64(fd_, new_length));
+#else
+  int rc = TEMP_FAILURE_RETRY(ftruncate(fd_, new_length));
+#endif
   return (rc == -1) ? -errno : rc;
 }
 
@@ -90,7 +102,11 @@ int64_t FdFile::GetLength() const {
 }
 
 int64_t FdFile::Write(const char* buf, int64_t byte_count, int64_t offset) {
+#ifdef __linux__
   int rc = TEMP_FAILURE_RETRY(pwrite64(fd_, buf, byte_count, offset));
+#else
+  int rc = TEMP_FAILURE_RETRY(pwrite(fd_, buf, byte_count, offset));
+#endif
   return (rc == -1) ? -errno : rc;
 }
 
@@ -102,15 +118,13 @@ bool FdFile::IsOpened() const {
   return fd_ >= 0;
 }
 
-std::string FdFile::GetPath() const {
-  return file_path_;
-}
-
-bool FdFile::ReadFully(void* buffer, int64_t byte_count) {
+bool FdFile::ReadFully(void* buffer, size_t byte_count) {
   char* ptr = static_cast<char*>(buffer);
   while (byte_count > 0) {
-    int bytes_read = TEMP_FAILURE_RETRY(read(fd_, ptr, byte_count));
+    ssize_t bytes_read = TEMP_FAILURE_RETRY(read(fd_, ptr, byte_count));
     if (bytes_read <= 0) {
+      // 0: end of file
+      // -1: error
       return false;
     }
     byte_count -= bytes_read;  // Reduce the number of remaining bytes.
@@ -119,15 +133,15 @@ bool FdFile::ReadFully(void* buffer, int64_t byte_count) {
   return true;
 }
 
-bool FdFile::WriteFully(const void* buffer, int64_t byte_count) {
+bool FdFile::WriteFully(const void* buffer, size_t byte_count) {
   const char* ptr = static_cast<const char*>(buffer);
   while (byte_count > 0) {
-    int bytes_read = TEMP_FAILURE_RETRY(write(fd_, ptr, byte_count));
-    if (bytes_read < 0) {
+    ssize_t bytes_written = TEMP_FAILURE_RETRY(write(fd_, ptr, byte_count));
+    if (bytes_written == -1) {
       return false;
     }
-    byte_count -= bytes_read;  // Reduce the number of remaining bytes.
-    ptr += bytes_read;  // Move the buffer forward.
+    byte_count -= bytes_written;  // Reduce the number of remaining bytes.
+    ptr += bytes_written;  // Move the buffer forward.
   }
   return true;
 }

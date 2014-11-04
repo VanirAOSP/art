@@ -16,10 +16,360 @@
 
 #include "dex/compiler_internals.h"
 #include "dex/dataflow_iterator-inl.h"
+#include "dex/quick/dex_file_method_inliner.h"
 #include "mir_to_lir-inl.h"
-#include "object_utils.h"
+#include "thread-inl.h"
 
 namespace art {
+
+RegisterClass Mir2Lir::ShortyToRegClass(char shorty_type) {
+  RegisterClass res;
+  switch (shorty_type) {
+    case 'L':
+      res = kRefReg;
+      break;
+    case 'F':
+      // Expected fallthrough.
+    case 'D':
+      res = kFPReg;
+      break;
+    default:
+      res = kCoreReg;
+  }
+  return res;
+}
+
+RegisterClass Mir2Lir::LocToRegClass(RegLocation loc) {
+  RegisterClass res;
+  if (loc.fp) {
+    DCHECK(!loc.ref) << "At most, one of ref/fp may be set";
+    res = kFPReg;
+  } else if (loc.ref) {
+    res = kRefReg;
+  } else {
+    res = kCoreReg;
+  }
+  return res;
+}
+
+void Mir2Lir::LockArg(int in_position, bool wide) {
+  RegStorage reg_arg_low = GetArgMappingToPhysicalReg(in_position);
+  RegStorage reg_arg_high = wide ? GetArgMappingToPhysicalReg(in_position + 1) :
+      RegStorage::InvalidReg();
+
+  if (reg_arg_low.Valid()) {
+    LockTemp(reg_arg_low);
+  }
+  if (reg_arg_high.Valid() && reg_arg_low.NotExactlyEquals(reg_arg_high)) {
+    LockTemp(reg_arg_high);
+  }
+}
+
+// TODO: simplify when 32-bit targets go hard-float.
+RegStorage Mir2Lir::LoadArg(int in_position, RegisterClass reg_class, bool wide) {
+  ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+  int offset = StackVisitor::GetOutVROffset(in_position, cu_->instruction_set);
+
+  if (cu_->instruction_set == kX86) {
+    /*
+     * When doing a call for x86, it moves the stack pointer in order to push return.
+     * Thus, we add another 4 bytes to figure out the out of caller (in of callee).
+     */
+    offset += sizeof(uint32_t);
+  }
+
+  if (cu_->instruction_set == kX86_64) {
+    /*
+     * When doing a call for x86, it moves the stack pointer in order to push return.
+     * Thus, we add another 8 bytes to figure out the out of caller (in of callee).
+     */
+    offset += sizeof(uint64_t);
+  }
+
+  if (cu_->target64) {
+    RegStorage reg_arg = GetArgMappingToPhysicalReg(in_position);
+    if (!reg_arg.Valid()) {
+      RegStorage new_reg =
+          wide ?  AllocTypedTempWide(false, reg_class) : AllocTypedTemp(false, reg_class);
+      LoadBaseDisp(TargetPtrReg(kSp), offset, new_reg, wide ? k64 : k32, kNotVolatile);
+      return new_reg;
+    } else {
+      // Check if we need to copy the arg to a different reg_class.
+      if (!RegClassMatches(reg_class, reg_arg)) {
+        if (wide) {
+          RegStorage new_reg = AllocTypedTempWide(false, reg_class);
+          OpRegCopyWide(new_reg, reg_arg);
+          reg_arg = new_reg;
+        } else {
+          RegStorage new_reg = AllocTypedTemp(false, reg_class);
+          OpRegCopy(new_reg, reg_arg);
+          reg_arg = new_reg;
+        }
+      }
+    }
+    return reg_arg;
+  }
+
+  RegStorage reg_arg_low = GetArgMappingToPhysicalReg(in_position);
+  RegStorage reg_arg_high = wide ? GetArgMappingToPhysicalReg(in_position + 1) :
+      RegStorage::InvalidReg();
+
+  // If the VR is wide and there is no register for high part, we need to load it.
+  if (wide && !reg_arg_high.Valid()) {
+    // If the low part is not in a reg, we allocate a pair. Otherwise, we just load to high reg.
+    if (!reg_arg_low.Valid()) {
+      RegStorage new_regs = AllocTypedTempWide(false, reg_class);
+      LoadBaseDisp(TargetPtrReg(kSp), offset, new_regs, k64, kNotVolatile);
+      return new_regs;  // The reg_class is OK, we can return.
+    } else {
+      // Assume that no ABI allows splitting a wide fp reg between a narrow fp reg and memory,
+      // i.e. the low part is in a core reg. Load the second part in a core reg as well for now.
+      DCHECK(!reg_arg_low.IsFloat());
+      reg_arg_high = AllocTemp();
+      int offset_high = offset + sizeof(uint32_t);
+      Load32Disp(TargetPtrReg(kSp), offset_high, reg_arg_high);
+      // Continue below to check the reg_class.
+    }
+  }
+
+  // If the low part is not in a register yet, we need to load it.
+  if (!reg_arg_low.Valid()) {
+    // Assume that if the low part of a wide arg is passed in memory, so is the high part,
+    // thus we don't get here for wide args as it's handled above. Big-endian ABIs could
+    // conceivably break this assumption but Android supports only little-endian architectures.
+    DCHECK(!wide);
+    reg_arg_low = AllocTypedTemp(false, reg_class);
+    Load32Disp(TargetPtrReg(kSp), offset, reg_arg_low);
+    return reg_arg_low;  // The reg_class is OK, we can return.
+  }
+
+  RegStorage reg_arg = wide ? RegStorage::MakeRegPair(reg_arg_low, reg_arg_high) : reg_arg_low;
+  // Check if we need to copy the arg to a different reg_class.
+  if (!RegClassMatches(reg_class, reg_arg)) {
+    if (wide) {
+      RegStorage new_regs = AllocTypedTempWide(false, reg_class);
+      OpRegCopyWide(new_regs, reg_arg);
+      reg_arg = new_regs;
+    } else {
+      RegStorage new_reg = AllocTypedTemp(false, reg_class);
+      OpRegCopy(new_reg, reg_arg);
+      reg_arg = new_reg;
+    }
+  }
+  return reg_arg;
+}
+
+// TODO: simpilfy when 32-bit targets go hard float.
+void Mir2Lir::LoadArgDirect(int in_position, RegLocation rl_dest) {
+  ScopedMemRefType mem_ref_type(this, ResourceMask::kDalvikReg);
+  int offset = StackVisitor::GetOutVROffset(in_position, cu_->instruction_set);
+  if (cu_->instruction_set == kX86) {
+    /*
+     * When doing a call for x86, it moves the stack pointer in order to push return.
+     * Thus, we add another 4 bytes to figure out the out of caller (in of callee).
+     */
+    offset += sizeof(uint32_t);
+  }
+
+  if (cu_->instruction_set == kX86_64) {
+    /*
+     * When doing a call for x86, it moves the stack pointer in order to push return.
+     * Thus, we add another 8 bytes to figure out the out of caller (in of callee).
+     */
+    offset += sizeof(uint64_t);
+  }
+
+  if (!rl_dest.wide) {
+    RegStorage reg = GetArgMappingToPhysicalReg(in_position);
+    if (reg.Valid()) {
+      OpRegCopy(rl_dest.reg, reg);
+    } else {
+      Load32Disp(TargetPtrReg(kSp), offset, rl_dest.reg);
+    }
+  } else {
+    if (cu_->target64) {
+      RegStorage reg = GetArgMappingToPhysicalReg(in_position);
+      if (reg.Valid()) {
+        OpRegCopy(rl_dest.reg, reg);
+      } else {
+        LoadBaseDisp(TargetPtrReg(kSp), offset, rl_dest.reg, k64, kNotVolatile);
+      }
+      return;
+    }
+
+    RegStorage reg_arg_low = GetArgMappingToPhysicalReg(in_position);
+    RegStorage reg_arg_high = GetArgMappingToPhysicalReg(in_position + 1);
+
+    if (reg_arg_low.Valid() && reg_arg_high.Valid()) {
+      OpRegCopyWide(rl_dest.reg, RegStorage::MakeRegPair(reg_arg_low, reg_arg_high));
+    } else if (reg_arg_low.Valid() && !reg_arg_high.Valid()) {
+      OpRegCopy(rl_dest.reg, reg_arg_low);
+      int offset_high = offset + sizeof(uint32_t);
+      Load32Disp(TargetPtrReg(kSp), offset_high, rl_dest.reg.GetHigh());
+    } else if (!reg_arg_low.Valid() && reg_arg_high.Valid()) {
+      OpRegCopy(rl_dest.reg.GetHigh(), reg_arg_high);
+      Load32Disp(TargetPtrReg(kSp), offset, rl_dest.reg.GetLow());
+    } else {
+      LoadBaseDisp(TargetPtrReg(kSp), offset, rl_dest.reg, k64, kNotVolatile);
+    }
+  }
+}
+
+bool Mir2Lir::GenSpecialIGet(MIR* mir, const InlineMethod& special) {
+  // FastInstance() already checked by DexFileMethodInliner.
+  const InlineIGetIPutData& data = special.d.ifield_data;
+  if (data.method_is_static != 0u || data.object_arg != 0u) {
+    // The object is not "this" and has to be null-checked.
+    return false;
+  }
+
+  bool wide = (data.op_variant == InlineMethodAnalyser::IGetVariant(Instruction::IGET_WIDE));
+  bool ref = (data.op_variant == InlineMethodAnalyser::IGetVariant(Instruction::IGET_OBJECT));
+  OpSize size = LoadStoreOpSize(wide, ref);
+
+  // Point of no return - no aborts after this
+  GenPrintLabel(mir);
+  LockArg(data.object_arg);
+  RegStorage reg_obj = LoadArg(data.object_arg, kRefReg);
+  RegisterClass reg_class = RegClassForFieldLoadStore(size, data.is_volatile);
+  RegisterClass ret_reg_class = ShortyToRegClass(cu_->shorty[0]);
+  RegLocation rl_dest = wide ? GetReturnWide(ret_reg_class) : GetReturn(ret_reg_class);
+  RegStorage r_result = rl_dest.reg;
+  if (!RegClassMatches(reg_class, r_result)) {
+    r_result = wide ? AllocTypedTempWide(rl_dest.fp, reg_class)
+                    : AllocTypedTemp(rl_dest.fp, reg_class);
+  }
+  if (ref) {
+    LoadRefDisp(reg_obj, data.field_offset, r_result, data.is_volatile ? kVolatile : kNotVolatile);
+  } else {
+    LoadBaseDisp(reg_obj, data.field_offset, r_result, size, data.is_volatile ? kVolatile :
+        kNotVolatile);
+  }
+  if (r_result.NotExactlyEquals(rl_dest.reg)) {
+    if (wide) {
+      OpRegCopyWide(rl_dest.reg, r_result);
+    } else {
+      OpRegCopy(rl_dest.reg, r_result);
+    }
+  }
+  return true;
+}
+
+bool Mir2Lir::GenSpecialIPut(MIR* mir, const InlineMethod& special) {
+  // FastInstance() already checked by DexFileMethodInliner.
+  const InlineIGetIPutData& data = special.d.ifield_data;
+  if (data.method_is_static != 0u || data.object_arg != 0u) {
+    // The object is not "this" and has to be null-checked.
+    return false;
+  }
+  if (data.return_arg_plus1 != 0u) {
+    // The setter returns a method argument which we don't support here.
+    return false;
+  }
+
+  bool wide = (data.op_variant == InlineMethodAnalyser::IPutVariant(Instruction::IPUT_WIDE));
+  bool ref = (data.op_variant == InlineMethodAnalyser::IGetVariant(Instruction::IGET_OBJECT));
+  OpSize size = LoadStoreOpSize(wide, ref);
+
+  // Point of no return - no aborts after this
+  GenPrintLabel(mir);
+  LockArg(data.object_arg);
+  LockArg(data.src_arg, wide);
+  RegStorage reg_obj = LoadArg(data.object_arg, kRefReg);
+  RegisterClass reg_class = RegClassForFieldLoadStore(size, data.is_volatile);
+  RegStorage reg_src = LoadArg(data.src_arg, reg_class, wide);
+  if (ref) {
+    StoreRefDisp(reg_obj, data.field_offset, reg_src, data.is_volatile ? kVolatile : kNotVolatile);
+  } else {
+    StoreBaseDisp(reg_obj, data.field_offset, reg_src, size, data.is_volatile ? kVolatile :
+        kNotVolatile);
+  }
+  if (ref) {
+    MarkGCCard(reg_src, reg_obj);
+  }
+  return true;
+}
+
+bool Mir2Lir::GenSpecialIdentity(MIR* mir, const InlineMethod& special) {
+  const InlineReturnArgData& data = special.d.return_data;
+  bool wide = (data.is_wide != 0u);
+
+  // Point of no return - no aborts after this
+  GenPrintLabel(mir);
+  LockArg(data.arg, wide);
+  RegisterClass reg_class = ShortyToRegClass(cu_->shorty[0]);
+  RegLocation rl_dest = wide ? GetReturnWide(reg_class) : GetReturn(reg_class);
+  LoadArgDirect(data.arg, rl_dest);
+  return true;
+}
+
+/*
+ * Special-case code generation for simple non-throwing leaf methods.
+ */
+bool Mir2Lir::GenSpecialCase(BasicBlock* bb, MIR* mir, const InlineMethod& special) {
+  DCHECK(special.flags & kInlineSpecial);
+  current_dalvik_offset_ = mir->offset;
+  MIR* return_mir = nullptr;
+  bool successful = false;
+
+  switch (special.opcode) {
+    case kInlineOpNop:
+      successful = true;
+      DCHECK_EQ(mir->dalvikInsn.opcode, Instruction::RETURN_VOID);
+      return_mir = mir;
+      break;
+    case kInlineOpNonWideConst: {
+      successful = true;
+      RegLocation rl_dest = GetReturn(ShortyToRegClass(cu_->shorty[0]));
+      GenPrintLabel(mir);
+      LoadConstant(rl_dest.reg, static_cast<int>(special.d.data));
+      return_mir = bb->GetNextUnconditionalMir(mir_graph_, mir);
+      break;
+    }
+    case kInlineOpReturnArg:
+      successful = GenSpecialIdentity(mir, special);
+      return_mir = mir;
+      break;
+    case kInlineOpIGet:
+      successful = GenSpecialIGet(mir, special);
+      return_mir = bb->GetNextUnconditionalMir(mir_graph_, mir);
+      break;
+    case kInlineOpIPut:
+      successful = GenSpecialIPut(mir, special);
+      return_mir = bb->GetNextUnconditionalMir(mir_graph_, mir);
+      break;
+    default:
+      break;
+  }
+
+  if (successful) {
+    if (kIsDebugBuild) {
+      // Clear unreachable catch entries.
+      mir_graph_->catches_.clear();
+    }
+
+    // Handle verbosity for return MIR.
+    if (return_mir != nullptr) {
+      current_dalvik_offset_ = return_mir->offset;
+      // Not handling special identity case because it already generated code as part
+      // of the return. The label should have been added before any code was generated.
+      if (special.opcode != kInlineOpReturnArg) {
+        GenPrintLabel(return_mir);
+      }
+    }
+    GenSpecialExitSequence();
+
+    core_spill_mask_ = 0;
+    num_core_spills_ = 0;
+    fp_spill_mask_ = 0;
+    num_fp_spills_ = 0;
+    frame_size_ = 0;
+    core_vmap_table_.clear();
+    fp_vmap_table_.clear();
+  }
+
+  return successful;
+}
 
 /*
  * Target-independent code generation.  Use only high-level
@@ -34,11 +384,13 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
   int opt_flags = mir->optimization_flags;
   uint32_t vB = mir->dalvikInsn.vB;
   uint32_t vC = mir->dalvikInsn.vC;
+  DCHECK(CheckCorePoolSanity()) << PrettyMethod(cu_->method_idx, *cu_->dex_file) << " @ 0x:"
+                                << std::hex << current_dalvik_offset_;
 
   // Prep Src and Dest locations.
   int next_sreg = 0;
   int next_loc = 0;
-  int attrs = mir_graph_->oat_data_flow_attributes_[opcode];
+  uint64_t attrs = MIRGraph::GetDataFlowAttributes(opcode);
   rl_src[0] = rl_src[1] = rl_src[2] = mir_graph_->GetBadLoc();
   if (attrs & DF_UA) {
     if (attrs & DF_A_WIDE) {
@@ -86,37 +438,43 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
                                                           cu_->class_def_idx)) {
         GenMemBarrier(kStoreStore);
       }
-      if (!mir_graph_->MethodIsLeaf()) {
+      if (!kLeafOptimization || !mir_graph_->MethodIsLeaf()) {
         GenSuspendTest(opt_flags);
       }
       break;
 
-    case Instruction::RETURN:
     case Instruction::RETURN_OBJECT:
-      if (!mir_graph_->MethodIsLeaf()) {
+      DCHECK(rl_src[0].ref);
+      // Intentional fallthrough.
+    case Instruction::RETURN:
+      if (!kLeafOptimization || !mir_graph_->MethodIsLeaf()) {
         GenSuspendTest(opt_flags);
       }
-      StoreValue(GetReturn(cu_->shorty[0] == 'F'), rl_src[0]);
+      DCHECK_EQ(LocToRegClass(rl_src[0]), ShortyToRegClass(cu_->shorty[0]));
+      StoreValue(GetReturn(LocToRegClass(rl_src[0])), rl_src[0]);
       break;
 
     case Instruction::RETURN_WIDE:
-      if (!mir_graph_->MethodIsLeaf()) {
+      if (!kLeafOptimization || !mir_graph_->MethodIsLeaf()) {
         GenSuspendTest(opt_flags);
       }
-      StoreValueWide(GetReturnWide(cu_->shorty[0] == 'D'), rl_src[0]);
+      DCHECK_EQ(LocToRegClass(rl_src[0]), ShortyToRegClass(cu_->shorty[0]));
+      StoreValueWide(GetReturnWide(LocToRegClass(rl_src[0])), rl_src[0]);
       break;
 
     case Instruction::MOVE_RESULT_WIDE:
-      if (opt_flags & MIR_INLINED)
+      if ((opt_flags & MIR_INLINED) != 0) {
         break;  // Nop - combined w/ previous invoke.
-      StoreValueWide(rl_dest, GetReturnWide(rl_dest.fp));
+      }
+      StoreValueWide(rl_dest, GetReturnWide(LocToRegClass(rl_dest)));
       break;
 
     case Instruction::MOVE_RESULT:
     case Instruction::MOVE_RESULT_OBJECT:
-      if (opt_flags & MIR_INLINED)
+      if ((opt_flags & MIR_INLINED) != 0) {
         break;  // Nop - combined w/ previous invoke.
-      StoreValue(rl_dest, GetReturn(rl_dest.fp));
+      }
+      StoreValue(rl_dest, GetReturn(LocToRegClass(rl_dest)));
       break;
 
     case Instruction::MOVE:
@@ -137,41 +495,25 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::CONST:
     case Instruction::CONST_4:
     case Instruction::CONST_16:
-      rl_result = EvalLoc(rl_dest, kAnyReg, true);
-      LoadConstantNoClobber(rl_result.low_reg, vB);
-      StoreValue(rl_dest, rl_result);
-      if (vB == 0) {
-        Workaround7250540(rl_dest, rl_result.low_reg);
-      }
+      GenConst(rl_dest, vB);
       break;
 
     case Instruction::CONST_HIGH16:
-      rl_result = EvalLoc(rl_dest, kAnyReg, true);
-      LoadConstantNoClobber(rl_result.low_reg, vB << 16);
-      StoreValue(rl_dest, rl_result);
-      if (vB == 0) {
-        Workaround7250540(rl_dest, rl_result.low_reg);
-      }
+      GenConst(rl_dest, vB << 16);
       break;
 
     case Instruction::CONST_WIDE_16:
     case Instruction::CONST_WIDE_32:
-      rl_result = EvalLoc(rl_dest, kAnyReg, true);
-      LoadConstantWide(rl_result.low_reg, rl_result.high_reg,
-                           static_cast<int64_t>(static_cast<int32_t>(vB)));
-      StoreValueWide(rl_dest, rl_result);
+      GenConstWide(rl_dest, static_cast<int64_t>(static_cast<int32_t>(vB)));
       break;
 
     case Instruction::CONST_WIDE:
-      rl_result = EvalLoc(rl_dest, kAnyReg, true);
-      LoadConstantWide(rl_result.low_reg, rl_result.high_reg, mir->dalvikInsn.vB_wide);
-      StoreValueWide(rl_dest, rl_result);
+      GenConstWide(rl_dest, mir->dalvikInsn.vB_wide);
       break;
 
     case Instruction::CONST_WIDE_HIGH16:
       rl_result = EvalLoc(rl_dest, kAnyReg, true);
-      LoadConstantWide(rl_result.low_reg, rl_result.high_reg,
-                           static_cast<int64_t>(vB) << 48);
+      LoadConstantWide(rl_result.reg, static_cast<int64_t>(vB) << 48);
       StoreValueWide(rl_dest, rl_result);
       break;
 
@@ -202,10 +544,11 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::ARRAY_LENGTH:
       int len_offset;
       len_offset = mirror::Array::LengthOffset().Int32Value();
-      rl_src[0] = LoadValue(rl_src[0], kCoreReg);
-      GenNullCheck(rl_src[0].s_reg_low, rl_src[0].low_reg, opt_flags);
+      rl_src[0] = LoadValue(rl_src[0], kRefReg);
+      GenNullCheck(rl_src[0].reg, opt_flags);
       rl_result = EvalLoc(rl_dest, kCoreReg, true);
-      LoadWordDisp(rl_src[0].low_reg, len_offset, rl_result.low_reg);
+      Load32Disp(rl_src[0].reg, len_offset, rl_result.reg);
+      MarkPossibleNullPointerException(opt_flags);
       StoreValue(rl_dest, rl_result);
       break;
 
@@ -239,10 +582,11 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::GOTO:
     case Instruction::GOTO_16:
     case Instruction::GOTO_32:
-      if (mir_graph_->IsBackedge(bb, bb->taken)) {
-        GenSuspendTestAndBranch(opt_flags, &label_list[bb->taken->id]);
+      if (mir_graph_->IsBackedge(bb, bb->taken) &&
+          (kLeafOptimization || !mir_graph_->HasSuspendTestBetween(bb, bb->taken))) {
+        GenSuspendTestAndBranch(opt_flags, &label_list[bb->taken]);
       } else {
-        OpUnconditionalBranch(&label_list[bb->taken->id]);
+        OpUnconditionalBranch(&label_list[bb->taken]);
       }
       break;
 
@@ -271,23 +615,25 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::IF_GE:
     case Instruction::IF_GT:
     case Instruction::IF_LE: {
-      LIR* taken = &label_list[bb->taken->id];
-      LIR* fall_through = &label_list[bb->fall_through->id];
+      LIR* taken = &label_list[bb->taken];
+      LIR* fall_through = &label_list[bb->fall_through];
       // Result known at compile time?
       if (rl_src[0].is_const && rl_src[1].is_const) {
         bool is_taken = EvaluateBranch(opcode, mir_graph_->ConstantValue(rl_src[0].orig_sreg),
                                        mir_graph_->ConstantValue(rl_src[1].orig_sreg));
-        BasicBlock* target = is_taken ? bb->taken : bb->fall_through;
-        if (mir_graph_->IsBackedge(bb, target)) {
+        BasicBlockId target_id = is_taken ? bb->taken : bb->fall_through;
+        if (mir_graph_->IsBackedge(bb, target_id) &&
+            (kLeafOptimization || !mir_graph_->HasSuspendTestBetween(bb, target_id))) {
           GenSuspendTest(opt_flags);
         }
-        OpUnconditionalBranch(&label_list[target->id]);
+        OpUnconditionalBranch(&label_list[target_id]);
       } else {
-        if (mir_graph_->IsBackwardsBranch(bb)) {
+        if (mir_graph_->IsBackwardsBranch(bb) &&
+            (kLeafOptimization || !mir_graph_->HasSuspendTestBetween(bb, bb->taken) ||
+             !mir_graph_->HasSuspendTestBetween(bb, bb->fall_through))) {
           GenSuspendTest(opt_flags);
         }
-        GenCompareAndBranch(opcode, rl_src[0], rl_src[1], taken,
-                                fall_through);
+        GenCompareAndBranch(opcode, rl_src[0], rl_src[1], taken, fall_through);
       }
       break;
       }
@@ -298,18 +644,21 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::IF_GEZ:
     case Instruction::IF_GTZ:
     case Instruction::IF_LEZ: {
-      LIR* taken = &label_list[bb->taken->id];
-      LIR* fall_through = &label_list[bb->fall_through->id];
+      LIR* taken = &label_list[bb->taken];
+      LIR* fall_through = &label_list[bb->fall_through];
       // Result known at compile time?
       if (rl_src[0].is_const) {
         bool is_taken = EvaluateBranch(opcode, mir_graph_->ConstantValue(rl_src[0].orig_sreg), 0);
-        BasicBlock* target = is_taken ? bb->taken : bb->fall_through;
-        if (mir_graph_->IsBackedge(bb, target)) {
+        BasicBlockId target_id = is_taken ? bb->taken : bb->fall_through;
+        if (mir_graph_->IsBackedge(bb, target_id) &&
+            (kLeafOptimization || !mir_graph_->HasSuspendTestBetween(bb, target_id))) {
           GenSuspendTest(opt_flags);
         }
-        OpUnconditionalBranch(&label_list[target->id]);
+        OpUnconditionalBranch(&label_list[target_id]);
       } else {
-        if (mir_graph_->IsBackwardsBranch(bb)) {
+        if (mir_graph_->IsBackwardsBranch(bb) &&
+            (kLeafOptimization || !mir_graph_->HasSuspendTestBetween(bb, bb->taken) ||
+             !mir_graph_->HasSuspendTestBetween(bb, bb->fall_through))) {
           GenSuspendTest(opt_flags);
         }
         GenCompareZeroAndBranch(opcode, rl_src[0], taken, fall_through);
@@ -318,11 +667,13 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
       }
 
     case Instruction::AGET_WIDE:
-      GenArrayGet(opt_flags, kLong, rl_src[0], rl_src[1], rl_dest, 3);
+      GenArrayGet(opt_flags, k64, rl_src[0], rl_src[1], rl_dest, 3);
+      break;
+    case Instruction::AGET_OBJECT:
+      GenArrayGet(opt_flags, kReference, rl_src[0], rl_src[1], rl_dest, 2);
       break;
     case Instruction::AGET:
-    case Instruction::AGET_OBJECT:
-      GenArrayGet(opt_flags, kWord, rl_src[0], rl_src[1], rl_dest, 2);
+      GenArrayGet(opt_flags, k32, rl_src[0], rl_src[1], rl_dest, 2);
       break;
     case Instruction::AGET_BOOLEAN:
       GenArrayGet(opt_flags, kUnsignedByte, rl_src[0], rl_src[1], rl_dest, 0);
@@ -337,91 +688,104 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
       GenArrayGet(opt_flags, kSignedHalf, rl_src[0], rl_src[1], rl_dest, 1);
       break;
     case Instruction::APUT_WIDE:
-      GenArrayPut(opt_flags, kLong, rl_src[1], rl_src[2], rl_src[0], 3);
+      GenArrayPut(opt_flags, k64, rl_src[1], rl_src[2], rl_src[0], 3, false);
       break;
     case Instruction::APUT:
-      GenArrayPut(opt_flags, kWord, rl_src[1], rl_src[2], rl_src[0], 2);
+      GenArrayPut(opt_flags, k32, rl_src[1], rl_src[2], rl_src[0], 2, false);
       break;
-    case Instruction::APUT_OBJECT:
-      GenArrayObjPut(opt_flags, rl_src[1], rl_src[2], rl_src[0], 2);
+    case Instruction::APUT_OBJECT: {
+      bool is_null = mir_graph_->IsConstantNullRef(rl_src[0]);
+      bool is_safe = is_null;  // Always safe to store null.
+      if (!is_safe) {
+        // Check safety from verifier type information.
+        const DexCompilationUnit* unit = mir_graph_->GetCurrentDexCompilationUnit();
+        is_safe = cu_->compiler_driver->IsSafeCast(unit, mir->offset);
+      }
+      if (is_null || is_safe) {
+        // Store of constant null doesn't require an assignability test and can be generated inline
+        // without fixed register usage or a card mark.
+        GenArrayPut(opt_flags, kReference, rl_src[1], rl_src[2], rl_src[0], 2, !is_null);
+      } else {
+        GenArrayObjPut(opt_flags, rl_src[1], rl_src[2], rl_src[0]);
+      }
       break;
+    }
     case Instruction::APUT_SHORT:
     case Instruction::APUT_CHAR:
-      GenArrayPut(opt_flags, kUnsignedHalf, rl_src[1], rl_src[2], rl_src[0], 1);
+      GenArrayPut(opt_flags, kUnsignedHalf, rl_src[1], rl_src[2], rl_src[0], 1, false);
       break;
     case Instruction::APUT_BYTE:
     case Instruction::APUT_BOOLEAN:
-      GenArrayPut(opt_flags, kUnsignedByte, rl_src[1], rl_src[2],
-            rl_src[0], 0);
+      GenArrayPut(opt_flags, kUnsignedByte, rl_src[1], rl_src[2], rl_src[0], 0, false);
       break;
 
     case Instruction::IGET_OBJECT:
-      GenIGet(vC, opt_flags, kWord, rl_dest, rl_src[0], false, true);
+      GenIGet(mir, opt_flags, kReference, rl_dest, rl_src[0], false, true);
       break;
 
     case Instruction::IGET_WIDE:
-      GenIGet(vC, opt_flags, kLong, rl_dest, rl_src[0], true, false);
+      GenIGet(mir, opt_flags, k64, rl_dest, rl_src[0], true, false);
       break;
 
     case Instruction::IGET:
-      GenIGet(vC, opt_flags, kWord, rl_dest, rl_src[0], false, false);
+      GenIGet(mir, opt_flags, k32, rl_dest, rl_src[0], false, false);
       break;
 
     case Instruction::IGET_CHAR:
-      GenIGet(vC, opt_flags, kUnsignedHalf, rl_dest, rl_src[0], false, false);
+      GenIGet(mir, opt_flags, kUnsignedHalf, rl_dest, rl_src[0], false, false);
       break;
 
     case Instruction::IGET_SHORT:
-      GenIGet(vC, opt_flags, kSignedHalf, rl_dest, rl_src[0], false, false);
+      GenIGet(mir, opt_flags, kSignedHalf, rl_dest, rl_src[0], false, false);
       break;
 
     case Instruction::IGET_BOOLEAN:
     case Instruction::IGET_BYTE:
-      GenIGet(vC, opt_flags, kUnsignedByte, rl_dest, rl_src[0], false, false);
+      GenIGet(mir, opt_flags, kUnsignedByte, rl_dest, rl_src[0], false, false);
       break;
 
     case Instruction::IPUT_WIDE:
-      GenIPut(vC, opt_flags, kLong, rl_src[0], rl_src[1], true, false);
+      GenIPut(mir, opt_flags, k64, rl_src[0], rl_src[1], true, false);
       break;
 
     case Instruction::IPUT_OBJECT:
-      GenIPut(vC, opt_flags, kWord, rl_src[0], rl_src[1], false, true);
+      GenIPut(mir, opt_flags, kReference, rl_src[0], rl_src[1], false, true);
       break;
 
     case Instruction::IPUT:
-      GenIPut(vC, opt_flags, kWord, rl_src[0], rl_src[1], false, false);
+      GenIPut(mir, opt_flags, k32, rl_src[0], rl_src[1], false, false);
       break;
 
     case Instruction::IPUT_BOOLEAN:
     case Instruction::IPUT_BYTE:
-      GenIPut(vC, opt_flags, kUnsignedByte, rl_src[0], rl_src[1], false, false);
+      GenIPut(mir, opt_flags, kUnsignedByte, rl_src[0], rl_src[1], false, false);
       break;
 
     case Instruction::IPUT_CHAR:
-      GenIPut(vC, opt_flags, kUnsignedHalf, rl_src[0], rl_src[1], false, false);
+      GenIPut(mir, opt_flags, kUnsignedHalf, rl_src[0], rl_src[1], false, false);
       break;
 
     case Instruction::IPUT_SHORT:
-      GenIPut(vC, opt_flags, kSignedHalf, rl_src[0], rl_src[1], false, false);
+      GenIPut(mir, opt_flags, kSignedHalf, rl_src[0], rl_src[1], false, false);
       break;
 
     case Instruction::SGET_OBJECT:
-      GenSget(vB, rl_dest, false, true);
+      GenSget(mir, rl_dest, false, true);
       break;
     case Instruction::SGET:
     case Instruction::SGET_BOOLEAN:
     case Instruction::SGET_BYTE:
     case Instruction::SGET_CHAR:
     case Instruction::SGET_SHORT:
-      GenSget(vB, rl_dest, false, false);
+      GenSget(mir, rl_dest, false, false);
       break;
 
     case Instruction::SGET_WIDE:
-      GenSget(vB, rl_dest, true, false);
+      GenSget(mir, rl_dest, true, false);
       break;
 
     case Instruction::SPUT_OBJECT:
-      GenSput(vB, rl_src[0], false, true);
+      GenSput(mir, rl_src[0], false, true);
       break;
 
     case Instruction::SPUT:
@@ -429,46 +793,78 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::SPUT_BYTE:
     case Instruction::SPUT_CHAR:
     case Instruction::SPUT_SHORT:
-      GenSput(vB, rl_src[0], false, false);
+      GenSput(mir, rl_src[0], false, false);
       break;
 
     case Instruction::SPUT_WIDE:
-      GenSput(vB, rl_src[0], true, false);
+      GenSput(mir, rl_src[0], true, false);
       break;
 
     case Instruction::INVOKE_STATIC_RANGE:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kStatic, true));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        // If the invocation is not inlined, we can assume there is already a
+        // suspend check at the return site
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
     case Instruction::INVOKE_STATIC:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kStatic, false));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
 
     case Instruction::INVOKE_DIRECT:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kDirect, false));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
     case Instruction::INVOKE_DIRECT_RANGE:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kDirect, true));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
 
     case Instruction::INVOKE_VIRTUAL:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kVirtual, false));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
     case Instruction::INVOKE_VIRTUAL_RANGE:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kVirtual, true));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
 
     case Instruction::INVOKE_SUPER:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kSuper, false));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
     case Instruction::INVOKE_SUPER_RANGE:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kSuper, true));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
 
     case Instruction::INVOKE_INTERFACE:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kInterface, false));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
     case Instruction::INVOKE_INTERFACE_RANGE:
       GenInvoke(mir_graph_->NewMemCallInfo(bb, mir, kInterface, true));
+      if (!kLeafOptimization && (opt_flags & MIR_INLINED) == 0) {
+        mir_graph_->AppendGenSuspendTestList(bb);
+      }
       break;
 
     case Instruction::NEG_INT:
@@ -495,7 +891,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
 
     case Instruction::LONG_TO_INT:
       rl_src[0] = UpdateLocWide(rl_src[0]);
-      rl_src[0] = WideToNarrow(rl_src[0]);
+      rl_src[0] = NarrowRegLoc(rl_src[0]);
       StoreValue(rl_dest, rl_src[0]);
       break;
 
@@ -530,11 +926,11 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::XOR_INT:
     case Instruction::XOR_INT_2ADDR:
       if (rl_src[0].is_const &&
-          InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src[0]))) {
+          InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src[0]), opcode)) {
         GenArithOpIntLit(opcode, rl_dest, rl_src[1],
                              mir_graph_->ConstantValue(rl_src[0].orig_sreg));
       } else if (rl_src[1].is_const &&
-          InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src[1]))) {
+                 InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src[1]), opcode)) {
         GenArithOpIntLit(opcode, rl_dest, rl_src[0],
                              mir_graph_->ConstantValue(rl_src[1].orig_sreg));
       } else {
@@ -555,7 +951,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     case Instruction::USHR_INT:
     case Instruction::USHR_INT_2ADDR:
       if (rl_src[1].is_const &&
-          InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src[1]))) {
+          InexpensiveConstantInt(mir_graph_->ConstantValue(rl_src[1]), opcode)) {
         GenArithOpIntLit(opcode, rl_dest, rl_src[0], mir_graph_->ConstantValue(rl_src[1]));
       } else {
         GenArithOpInt(opcode, rl_dest, rl_src[0], rl_src[1]);
@@ -651,6 +1047,7 @@ void Mir2Lir::CompileDalvikInstruction(MIR* mir, BasicBlock* bb, LIR* label_list
     default:
       LOG(FATAL) << "Unexpected opcode: " << opcode;
   }
+  DCHECK(CheckCorePoolSanity());
 }  // NOLINT(readability/fn_size)
 
 // Process extended MIR instructions
@@ -680,8 +1077,27 @@ void Mir2Lir::HandleExtendedMethodMIR(BasicBlock* bb, MIR* mir) {
     case kMirOpSelect:
       GenSelect(bb, mir);
       break;
-    default:
+    case kMirOpPhi:
+    case kMirOpNop:
+    case kMirOpNullCheck:
+    case kMirOpRangeCheck:
+    case kMirOpDivZeroCheck:
+    case kMirOpCheck:
+    case kMirOpCheckPart2:
+      // Ignore these known opcodes
       break;
+    default:
+      // Give the backends a chance to handle unknown extended MIR opcodes.
+      GenMachineSpecificExtendedMethodMIR(bb, mir);
+      break;
+  }
+}
+
+void Mir2Lir::GenPrintLabel(MIR* mir) {
+  // Mark the beginning of a Dalvik instruction for line tracking.
+  if (cu_->verbose) {
+     char* inst_str = mir_graph_->GetDalvikDisassembly(mir);
+     MarkBoundary(mir->offset, inst_str);
   }
 }
 
@@ -696,6 +1112,7 @@ bool Mir2Lir::MethodBlockCodeGen(BasicBlock* bb) {
 
   // Insert the block label.
   block_label_list_[block_id].opcode = kPseudoNormalBlockLabel;
+  block_label_list_[block_id].flags.fixup = kFixupLabel;
   AppendLIR(&block_label_list_[block_id]);
 
   LIR* head_lir = NULL;
@@ -706,23 +1123,24 @@ bool Mir2Lir::MethodBlockCodeGen(BasicBlock* bb) {
   }
 
   // Free temp registers and reset redundant store tracking.
-  ResetRegPool();
-  ResetDefTracking();
-
-  ClobberAllRegs();
+  ClobberAllTemps();
 
   if (bb->block_type == kEntryBlock) {
+    ResetRegPool();
     int start_vreg = cu_->num_dalvik_registers - cu_->num_ins;
     GenEntrySequence(&mir_graph_->reg_location_[start_vreg],
                          mir_graph_->reg_location_[mir_graph_->GetMethodSReg()]);
   } else if (bb->block_type == kExitBlock) {
+    ResetRegPool();
     GenExitSequence();
   }
 
   for (mir = bb->first_mir_insn; mir != NULL; mir = mir->next) {
     ResetRegPool();
     if (cu_->disable_opt & (1 << kTrackLiveTemps)) {
-      ClobberAllRegs();
+      ClobberAllTemps();
+      // Reset temp allocation to minimize differences when A/B testing.
+      reg_pool_->ResetNextTemp();
     }
 
     if (cu_->disable_opt & (1 << kSuppressLoads)) {
@@ -736,31 +1154,31 @@ bool Mir2Lir::MethodBlockCodeGen(BasicBlock* bb) {
 
     current_dalvik_offset_ = mir->offset;
     int opcode = mir->dalvikInsn.opcode;
-    LIR* boundary_lir;
 
-    // Mark the beginning of a Dalvik instruction for line tracking.
-    char* inst_str = cu_->verbose ?
-       mir_graph_->GetDalvikDisassembly(mir) : NULL;
-    boundary_lir = MarkBoundary(mir->offset, inst_str);
+    GenPrintLabel(mir);
+
     // Remember the first LIR for this block.
     if (head_lir == NULL) {
-      head_lir = boundary_lir;
-      // Set the first boundary_lir as a scheduling barrier.
-      head_lir->def_mask = ENCODE_ALL;
+      head_lir = &block_label_list_[bb->id];
+      // Set the first label as a scheduling barrier.
+      DCHECK(!head_lir->flags.use_def_invalid);
+      head_lir->u.m.def_mask = &kEncodeAll;
     }
 
     if (opcode == kMirOpCheck) {
       // Combine check and work halves of throwing instruction.
       MIR* work_half = mir->meta.throw_insn;
       mir->dalvikInsn.opcode = work_half->dalvikInsn.opcode;
+      mir->meta = work_half->meta;  // Whatever the work_half had, we need to copy it.
       opcode = work_half->dalvikInsn.opcode;
       SSARepresentation* ssa_rep = work_half->ssa_rep;
       work_half->ssa_rep = mir->ssa_rep;
       mir->ssa_rep = ssa_rep;
       work_half->dalvikInsn.opcode = static_cast<Instruction::Code>(kMirOpCheckPart2);
+      work_half->meta.throw_insn = mir;
     }
 
-    if (opcode >= kMirOpFirst) {
+    if (MIR::DecodedInstruction::IsPseudoMirOp(opcode)) {
       HandleExtendedMethodMIR(bb, mir);
       continue;
     }
@@ -771,16 +1189,12 @@ bool Mir2Lir::MethodBlockCodeGen(BasicBlock* bb) {
   if (head_lir) {
     // Eliminate redundant loads/stores and delay stores into later slots.
     ApplyLocalOptimizations(head_lir, last_lir_insn_);
-
-    // Generate an unconditional branch to the fallthrough block.
-    if (bb->fall_through) {
-      OpUnconditionalBranch(&block_label_list_[bb->fall_through->id]);
-    }
   }
   return false;
 }
 
-void Mir2Lir::SpecialMIR2LIR(SpecialCaseHandler special_case) {
+bool Mir2Lir::SpecialMIR2LIR(const InlineMethod& special) {
+  cu_->NewTimingSplit("SpecialMIR2LIR");
   // Find the first DalvikByteCode block.
   int num_reachable_blocks = mir_graph_->GetNumReachableBlocks();
   BasicBlock*bb = NULL;
@@ -793,7 +1207,7 @@ void Mir2Lir::SpecialMIR2LIR(SpecialCaseHandler special_case) {
     }
   }
   if (bb == NULL) {
-    return;
+    return false;
   }
   DCHECK_EQ(bb->start_offset, 0);
   DCHECK(bb->first_mir_insn != NULL);
@@ -804,31 +1218,102 @@ void Mir2Lir::SpecialMIR2LIR(SpecialCaseHandler special_case) {
   // Free temp registers and reset redundant store tracking.
   ResetRegPool();
   ResetDefTracking();
-  ClobberAllRegs();
+  ClobberAllTemps();
 
-  GenSpecialCase(bb, mir, special_case);
+  return GenSpecialCase(bb, mir, special);
 }
 
 void Mir2Lir::MethodMIR2LIR() {
+  cu_->NewTimingSplit("MIR2LIR");
+
   // Hold the labels of each block.
   block_label_list_ =
       static_cast<LIR*>(arena_->Alloc(sizeof(LIR) * mir_graph_->GetNumBlocks(),
-                                      ArenaAllocator::kAllocLIR));
+                                      kArenaAllocLIR));
 
-  PreOrderDfsIterator iter(mir_graph_, false /* not iterative */);
-  for (BasicBlock* bb = iter.Next(); bb != NULL; bb = iter.Next()) {
-    MethodBlockCodeGen(bb);
+  PreOrderDfsIterator iter(mir_graph_);
+  BasicBlock* curr_bb = iter.Next();
+  BasicBlock* next_bb = iter.Next();
+  while (curr_bb != NULL) {
+    MethodBlockCodeGen(curr_bb);
+    // If the fall_through block is no longer laid out consecutively, drop in a branch.
+    BasicBlock* curr_bb_fall_through = mir_graph_->GetBasicBlock(curr_bb->fall_through);
+    if ((curr_bb_fall_through != NULL) && (curr_bb_fall_through != next_bb)) {
+      OpUnconditionalBranch(&block_label_list_[curr_bb->fall_through]);
+    }
+    curr_bb = next_bb;
+    do {
+      next_bb = iter.Next();
+    } while ((next_bb != NULL) && (next_bb->block_type == kDead));
   }
+  HandleSlowPaths();
+}
 
-  HandleSuspendLaunchPads();
+//
+// LIR Slow Path
+//
 
-  HandleThrowLaunchPads();
+LIR* Mir2Lir::LIRSlowPath::GenerateTargetLabel(int opcode) {
+  m2l_->SetCurrentDexPc(current_dex_pc_);
+  LIR* target = m2l_->NewLIR0(opcode);
+  fromfast_->target = target;
+  return target;
+}
 
-  HandleIntrinsicLaunchPads();
 
-  if (!(cu_->disable_opt & (1 << kSafeOptimizations))) {
-    RemoveRedundantBranches();
+void Mir2Lir::CheckRegStorageImpl(RegStorage rs, WidenessCheck wide, RefCheck ref, FPCheck fp,
+                                  bool fail, bool report)
+    const  {
+  if (rs.Valid()) {
+    if (ref == RefCheck::kCheckRef) {
+      if (cu_->target64 && !rs.Is64Bit()) {
+        if (fail) {
+          CHECK(false) << "Reg storage not 64b for ref.";
+        } else if (report) {
+          LOG(WARNING) << "Reg storage not 64b for ref.";
+        }
+      }
+    }
+    if (wide == WidenessCheck::kCheckWide) {
+      if (!rs.Is64Bit()) {
+        if (fail) {
+          CHECK(false) << "Reg storage not 64b for wide.";
+        } else if (report) {
+          LOG(WARNING) << "Reg storage not 64b for wide.";
+        }
+      }
+    }
+    // A tighter check would be nice, but for now soft-float will not check float at all.
+    if (fp == FPCheck::kCheckFP && cu_->instruction_set != kArm) {
+      if (!rs.IsFloat()) {
+        if (fail) {
+          CHECK(false) << "Reg storage not float for fp.";
+        } else if (report) {
+          LOG(WARNING) << "Reg storage not float for fp.";
+        }
+      }
+    } else if (fp == FPCheck::kCheckNotFP) {
+      if (rs.IsFloat()) {
+        if (fail) {
+          CHECK(false) << "Reg storage float for not-fp.";
+        } else if (report) {
+          LOG(WARNING) << "Reg storage float for not-fp.";
+        }
+      }
+    }
   }
+}
+
+void Mir2Lir::CheckRegLocationImpl(RegLocation rl, bool fail, bool report) const {
+  // Regrettably can't use the fp part of rl, as that is not really indicative of where a value
+  // will be stored.
+  CheckRegStorageImpl(rl.reg, rl.wide ? WidenessCheck::kCheckWide : WidenessCheck::kCheckNotWide,
+      rl.ref ? RefCheck::kCheckRef : RefCheck::kCheckNotRef, FPCheck::kIgnoreFP, fail, report);
+}
+
+size_t Mir2Lir::GetInstructionOffset(LIR* lir) {
+  UNIMPLEMENTED(FATAL) << "Unsuppored GetInstructionOffset()";
+  return 0;
 }
 
 }  // namespace art

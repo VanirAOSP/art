@@ -29,7 +29,8 @@ namespace art {
  *        pointer in r0 as a hidden arg0. Otherwise used as codegen scratch
  *        registers.
  * r0-r1: As in C/C++ r0 is 32-bit return register and r0/r1 is 64-bit
- * r4   : (rARM_SUSPEND) is reserved (suspend check/debugger assist)
+ * r4   : If ARM_R4_SUSPEND_FLAG is set then reserved as a suspend check/debugger
+ *        assist flag, otherwise a callee save promotion target.
  * r5   : Callee save (promotion target)
  * r6   : Callee save (promotion target)
  * r7   : Callee save (promotion target)
@@ -93,37 +94,10 @@ namespace art {
  * +========================+
  */
 
-// Offset to distingish FP regs.
-#define ARM_FP_REG_OFFSET 32
-// Offset to distinguish DP FP regs.
-#define ARM_FP_DOUBLE 64
 // First FP callee save.
 #define ARM_FP_CALLEE_SAVE_BASE 16
-// Reg types.
-#define ARM_REGTYPE(x) (x & (ARM_FP_REG_OFFSET | ARM_FP_DOUBLE))
-#define ARM_FPREG(x) ((x & ARM_FP_REG_OFFSET) == ARM_FP_REG_OFFSET)
-#define ARM_LOWREG(x) ((x & 0x7) == x)
-#define ARM_DOUBLEREG(x) ((x & ARM_FP_DOUBLE) == ARM_FP_DOUBLE)
-#define ARM_SINGLEREG(x) (ARM_FPREG(x) && !ARM_DOUBLEREG(x))
-
-/*
- * Note: the low register of a floating point pair is sufficient to
- * create the name of a double, but require both names to be passed to
- * allow for asserts to verify that the pair is consecutive if significant
- * rework is done in this area.  Also, it is a good reminder in the calling
- * code that reg locations always describe doubles as a pair of singles.
- */
-#define ARM_S2D(x, y) ((x) | ARM_FP_DOUBLE)
-// Mask to strip off fp flags.
-#define ARM_FP_REG_MASK (ARM_FP_REG_OFFSET-1)
-
-// RegisterLocation templates return values (r0, or r0/r1).
-#define ARM_LOC_C_RETURN {kLocPhysReg, 0, 0, 0, 0, 0, 0, 0, 1, r0, INVALID_REG, \
-                          INVALID_SREG, INVALID_SREG}
-#define ARM_LOC_C_RETURN_WIDE {kLocPhysReg, 1, 0, 0, 0, 0, 0, 0, 1, r0, r1, \
-                               INVALID_SREG, INVALID_SREG}
-#define ARM_LOC_C_RETURN_FLOAT  ARM_LOC_C_RETURN
-#define ARM_LOC_C_RETURN_DOUBLE  ARM_LOC_C_RETURN_WIDE
+// Flag for using R4 to do suspend check
+#define ARM_R4_SUSPEND_FLAG
 
 enum ArmResourceEncodingPos {
   kArmGPReg0   = 0,
@@ -135,95 +109,207 @@ enum ArmResourceEncodingPos {
   kArmRegEnd   = 48,
 };
 
-#define ENCODE_ARM_REG_LIST(N)      (static_cast<uint64_t>(N))
-#define ENCODE_ARM_REG_SP           (1ULL << kArmRegSP)
-#define ENCODE_ARM_REG_LR           (1ULL << kArmRegLR)
-#define ENCODE_ARM_REG_PC           (1ULL << kArmRegPC)
-#define ENCODE_ARM_REG_FPCS_LIST(N) (static_cast<uint64_t>(N) << kArmFPReg16)
-
 enum ArmNativeRegisterPool {
-  r0   = 0,
-  r1   = 1,
-  r2   = 2,
-  r3   = 3,
-  rARM_SUSPEND = 4,
-  r5   = 5,
-  r6   = 6,
-  r7   = 7,
-  r8   = 8,
-  rARM_SELF  = 9,
-  r10  = 10,
-  r11  = 11,
-  r12  = 12,
-  r13sp  = 13,
-  rARM_SP  = 13,
-  r14lr  = 14,
-  rARM_LR  = 14,
-  r15pc  = 15,
-  rARM_PC  = 15,
-  fr0  =  0 + ARM_FP_REG_OFFSET,
-  fr1  =  1 + ARM_FP_REG_OFFSET,
-  fr2  =  2 + ARM_FP_REG_OFFSET,
-  fr3  =  3 + ARM_FP_REG_OFFSET,
-  fr4  =  4 + ARM_FP_REG_OFFSET,
-  fr5  =  5 + ARM_FP_REG_OFFSET,
-  fr6  =  6 + ARM_FP_REG_OFFSET,
-  fr7  =  7 + ARM_FP_REG_OFFSET,
-  fr8  =  8 + ARM_FP_REG_OFFSET,
-  fr9  =  9 + ARM_FP_REG_OFFSET,
-  fr10 = 10 + ARM_FP_REG_OFFSET,
-  fr11 = 11 + ARM_FP_REG_OFFSET,
-  fr12 = 12 + ARM_FP_REG_OFFSET,
-  fr13 = 13 + ARM_FP_REG_OFFSET,
-  fr14 = 14 + ARM_FP_REG_OFFSET,
-  fr15 = 15 + ARM_FP_REG_OFFSET,
-  fr16 = 16 + ARM_FP_REG_OFFSET,
-  fr17 = 17 + ARM_FP_REG_OFFSET,
-  fr18 = 18 + ARM_FP_REG_OFFSET,
-  fr19 = 19 + ARM_FP_REG_OFFSET,
-  fr20 = 20 + ARM_FP_REG_OFFSET,
-  fr21 = 21 + ARM_FP_REG_OFFSET,
-  fr22 = 22 + ARM_FP_REG_OFFSET,
-  fr23 = 23 + ARM_FP_REG_OFFSET,
-  fr24 = 24 + ARM_FP_REG_OFFSET,
-  fr25 = 25 + ARM_FP_REG_OFFSET,
-  fr26 = 26 + ARM_FP_REG_OFFSET,
-  fr27 = 27 + ARM_FP_REG_OFFSET,
-  fr28 = 28 + ARM_FP_REG_OFFSET,
-  fr29 = 29 + ARM_FP_REG_OFFSET,
-  fr30 = 30 + ARM_FP_REG_OFFSET,
-  fr31 = 31 + ARM_FP_REG_OFFSET,
-  dr0 = fr0 + ARM_FP_DOUBLE,
-  dr1 = fr2 + ARM_FP_DOUBLE,
-  dr2 = fr4 + ARM_FP_DOUBLE,
-  dr3 = fr6 + ARM_FP_DOUBLE,
-  dr4 = fr8 + ARM_FP_DOUBLE,
-  dr5 = fr10 + ARM_FP_DOUBLE,
-  dr6 = fr12 + ARM_FP_DOUBLE,
-  dr7 = fr14 + ARM_FP_DOUBLE,
-  dr8 = fr16 + ARM_FP_DOUBLE,
-  dr9 = fr18 + ARM_FP_DOUBLE,
-  dr10 = fr20 + ARM_FP_DOUBLE,
-  dr11 = fr22 + ARM_FP_DOUBLE,
-  dr12 = fr24 + ARM_FP_DOUBLE,
-  dr13 = fr26 + ARM_FP_DOUBLE,
-  dr14 = fr28 + ARM_FP_DOUBLE,
-  dr15 = fr30 + ARM_FP_DOUBLE,
+  r0           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  0,
+  r1           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  1,
+  r2           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  2,
+  r3           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  3,
+#ifdef ARM_R4_SUSPEND_FLAG
+  rARM_SUSPEND = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  4,
+#else
+  r4           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  4,
+#endif
+  r5           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  5,
+  r6           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  6,
+  r7           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  7,
+  r8           = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  8,
+  rARM_SELF    = RegStorage::k32BitSolo | RegStorage::kCoreRegister |  9,
+  r10          = RegStorage::k32BitSolo | RegStorage::kCoreRegister | 10,
+  r11          = RegStorage::k32BitSolo | RegStorage::kCoreRegister | 11,
+  r12          = RegStorage::k32BitSolo | RegStorage::kCoreRegister | 12,
+  r13sp        = RegStorage::k32BitSolo | RegStorage::kCoreRegister | 13,
+  rARM_SP      = r13sp,
+  r14lr        = RegStorage::k32BitSolo | RegStorage::kCoreRegister | 14,
+  rARM_LR      = r14lr,
+  r15pc        = RegStorage::k32BitSolo | RegStorage::kCoreRegister | 15,
+  rARM_PC      = r15pc,
+
+  fr0          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  0,
+  fr1          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  1,
+  fr2          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  2,
+  fr3          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  3,
+  fr4          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  4,
+  fr5          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  5,
+  fr6          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  6,
+  fr7          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  7,
+  fr8          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  8,
+  fr9          = RegStorage::k32BitSolo | RegStorage::kFloatingPoint |  9,
+  fr10         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 10,
+  fr11         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 11,
+  fr12         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 12,
+  fr13         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 13,
+  fr14         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 14,
+  fr15         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 15,
+  fr16         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 16,
+  fr17         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 17,
+  fr18         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 18,
+  fr19         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 19,
+  fr20         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 20,
+  fr21         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 21,
+  fr22         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 22,
+  fr23         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 23,
+  fr24         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 24,
+  fr25         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 25,
+  fr26         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 26,
+  fr27         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 27,
+  fr28         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 28,
+  fr29         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 29,
+  fr30         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 30,
+  fr31         = RegStorage::k32BitSolo | RegStorage::kFloatingPoint | 31,
+
+  dr0          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  0,
+  dr1          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  1,
+  dr2          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  2,
+  dr3          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  3,
+  dr4          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  4,
+  dr5          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  5,
+  dr6          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  6,
+  dr7          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  7,
+  dr8          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  8,
+  dr9          = RegStorage::k64BitSolo | RegStorage::kFloatingPoint |  9,
+  dr10         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 10,
+  dr11         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 11,
+  dr12         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 12,
+  dr13         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 13,
+  dr14         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 14,
+  dr15         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 15,
+#if 0
+  // Enable when def/use and runtime able to handle these.
+  dr16         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 16,
+  dr17         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 17,
+  dr18         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 18,
+  dr19         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 19,
+  dr20         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 20,
+  dr21         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 21,
+  dr22         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 22,
+  dr23         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 23,
+  dr24         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 24,
+  dr25         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 25,
+  dr26         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 26,
+  dr27         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 27,
+  dr28         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 28,
+  dr29         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 29,
+  dr30         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 30,
+  dr31         = RegStorage::k64BitSolo | RegStorage::kFloatingPoint | 31,
+#endif
 };
 
-// Target-independent aliases.
-#define rARM_ARG0 r0
-#define rARM_ARG1 r1
-#define rARM_ARG2 r2
-#define rARM_ARG3 r3
-#define rARM_FARG0 r0
-#define rARM_FARG1 r1
-#define rARM_FARG2 r2
-#define rARM_FARG3 r3
-#define rARM_RET0 r0
-#define rARM_RET1 r1
-#define rARM_INVOKE_TGT rARM_LR
-#define rARM_COUNT INVALID_REG
+constexpr RegStorage rs_r0(RegStorage::kValid | r0);
+constexpr RegStorage rs_r1(RegStorage::kValid | r1);
+constexpr RegStorage rs_r2(RegStorage::kValid | r2);
+constexpr RegStorage rs_r3(RegStorage::kValid | r3);
+#ifdef ARM_R4_SUSPEND_FLAG
+constexpr RegStorage rs_rARM_SUSPEND(RegStorage::kValid | rARM_SUSPEND);
+#else
+constexpr RegStorage rs_r4(RegStorage::kValid | r4);
+#endif
+constexpr RegStorage rs_r5(RegStorage::kValid | r5);
+constexpr RegStorage rs_r6(RegStorage::kValid | r6);
+constexpr RegStorage rs_r7(RegStorage::kValid | r7);
+constexpr RegStorage rs_r8(RegStorage::kValid | r8);
+constexpr RegStorage rs_rARM_SELF(RegStorage::kValid | rARM_SELF);
+constexpr RegStorage rs_r10(RegStorage::kValid | r10);
+constexpr RegStorage rs_r11(RegStorage::kValid | r11);
+constexpr RegStorage rs_r12(RegStorage::kValid | r12);
+constexpr RegStorage rs_r13sp(RegStorage::kValid | r13sp);
+constexpr RegStorage rs_rARM_SP(RegStorage::kValid | rARM_SP);
+constexpr RegStorage rs_r14lr(RegStorage::kValid | r14lr);
+constexpr RegStorage rs_rARM_LR(RegStorage::kValid | rARM_LR);
+constexpr RegStorage rs_r15pc(RegStorage::kValid | r15pc);
+constexpr RegStorage rs_rARM_PC(RegStorage::kValid | rARM_PC);
+constexpr RegStorage rs_invalid(RegStorage::kInvalid);
+
+constexpr RegStorage rs_fr0(RegStorage::kValid | fr0);
+constexpr RegStorage rs_fr1(RegStorage::kValid | fr1);
+constexpr RegStorage rs_fr2(RegStorage::kValid | fr2);
+constexpr RegStorage rs_fr3(RegStorage::kValid | fr3);
+constexpr RegStorage rs_fr4(RegStorage::kValid | fr4);
+constexpr RegStorage rs_fr5(RegStorage::kValid | fr5);
+constexpr RegStorage rs_fr6(RegStorage::kValid | fr6);
+constexpr RegStorage rs_fr7(RegStorage::kValid | fr7);
+constexpr RegStorage rs_fr8(RegStorage::kValid | fr8);
+constexpr RegStorage rs_fr9(RegStorage::kValid | fr9);
+constexpr RegStorage rs_fr10(RegStorage::kValid | fr10);
+constexpr RegStorage rs_fr11(RegStorage::kValid | fr11);
+constexpr RegStorage rs_fr12(RegStorage::kValid | fr12);
+constexpr RegStorage rs_fr13(RegStorage::kValid | fr13);
+constexpr RegStorage rs_fr14(RegStorage::kValid | fr14);
+constexpr RegStorage rs_fr15(RegStorage::kValid | fr15);
+constexpr RegStorage rs_fr16(RegStorage::kValid | fr16);
+constexpr RegStorage rs_fr17(RegStorage::kValid | fr17);
+constexpr RegStorage rs_fr18(RegStorage::kValid | fr18);
+constexpr RegStorage rs_fr19(RegStorage::kValid | fr19);
+constexpr RegStorage rs_fr20(RegStorage::kValid | fr20);
+constexpr RegStorage rs_fr21(RegStorage::kValid | fr21);
+constexpr RegStorage rs_fr22(RegStorage::kValid | fr22);
+constexpr RegStorage rs_fr23(RegStorage::kValid | fr23);
+constexpr RegStorage rs_fr24(RegStorage::kValid | fr24);
+constexpr RegStorage rs_fr25(RegStorage::kValid | fr25);
+constexpr RegStorage rs_fr26(RegStorage::kValid | fr26);
+constexpr RegStorage rs_fr27(RegStorage::kValid | fr27);
+constexpr RegStorage rs_fr28(RegStorage::kValid | fr28);
+constexpr RegStorage rs_fr29(RegStorage::kValid | fr29);
+constexpr RegStorage rs_fr30(RegStorage::kValid | fr30);
+constexpr RegStorage rs_fr31(RegStorage::kValid | fr31);
+
+constexpr RegStorage rs_dr0(RegStorage::kValid | dr0);
+constexpr RegStorage rs_dr1(RegStorage::kValid | dr1);
+constexpr RegStorage rs_dr2(RegStorage::kValid | dr2);
+constexpr RegStorage rs_dr3(RegStorage::kValid | dr3);
+constexpr RegStorage rs_dr4(RegStorage::kValid | dr4);
+constexpr RegStorage rs_dr5(RegStorage::kValid | dr5);
+constexpr RegStorage rs_dr6(RegStorage::kValid | dr6);
+constexpr RegStorage rs_dr7(RegStorage::kValid | dr7);
+constexpr RegStorage rs_dr8(RegStorage::kValid | dr8);
+constexpr RegStorage rs_dr9(RegStorage::kValid | dr9);
+constexpr RegStorage rs_dr10(RegStorage::kValid | dr10);
+constexpr RegStorage rs_dr11(RegStorage::kValid | dr11);
+constexpr RegStorage rs_dr12(RegStorage::kValid | dr12);
+constexpr RegStorage rs_dr13(RegStorage::kValid | dr13);
+constexpr RegStorage rs_dr14(RegStorage::kValid | dr14);
+constexpr RegStorage rs_dr15(RegStorage::kValid | dr15);
+#if 0
+constexpr RegStorage rs_dr16(RegStorage::kValid | dr16);
+constexpr RegStorage rs_dr17(RegStorage::kValid | dr17);
+constexpr RegStorage rs_dr18(RegStorage::kValid | dr18);
+constexpr RegStorage rs_dr19(RegStorage::kValid | dr19);
+constexpr RegStorage rs_dr20(RegStorage::kValid | dr20);
+constexpr RegStorage rs_dr21(RegStorage::kValid | dr21);
+constexpr RegStorage rs_dr22(RegStorage::kValid | dr22);
+constexpr RegStorage rs_dr23(RegStorage::kValid | dr23);
+constexpr RegStorage rs_dr24(RegStorage::kValid | dr24);
+constexpr RegStorage rs_dr25(RegStorage::kValid | dr25);
+constexpr RegStorage rs_dr26(RegStorage::kValid | dr26);
+constexpr RegStorage rs_dr27(RegStorage::kValid | dr27);
+constexpr RegStorage rs_dr28(RegStorage::kValid | dr28);
+constexpr RegStorage rs_dr29(RegStorage::kValid | dr29);
+constexpr RegStorage rs_dr30(RegStorage::kValid | dr30);
+constexpr RegStorage rs_dr31(RegStorage::kValid | dr31);
+#endif
+
+// RegisterLocation templates return values (r0, or r0/r1).
+const RegLocation arm_loc_c_return
+    {kLocPhysReg, 0, 0, 0, 0, 0, 0, 0, 1,
+     RegStorage(RegStorage::k32BitSolo, r0), INVALID_SREG, INVALID_SREG};
+const RegLocation arm_loc_c_return_wide
+    {kLocPhysReg, 1, 0, 0, 0, 0, 0, 0, 1,
+     RegStorage(RegStorage::k64BitPair, r0, r1), INVALID_SREG, INVALID_SREG};
+const RegLocation arm_loc_c_return_float
+    {kLocPhysReg, 0, 0, 0, 0, 0, 0, 0, 1,
+     RegStorage(RegStorage::k32BitSolo, r0), INVALID_SREG, INVALID_SREG};
+const RegLocation arm_loc_c_return_double
+    {kLocPhysReg, 1, 0, 0, 0, 0, 0, 0, 1,
+     RegStorage(RegStorage::k64BitPair, r0, r1), INVALID_SREG, INVALID_SREG};
 
 enum ArmShiftEncodings {
   kArmLsl = 0x0,
@@ -241,7 +327,7 @@ enum ArmOpcode {
   kArmFirst = 0,
   kArm16BitData = kArmFirst,  // DATA   [0] rd[15..0].
   kThumbAdcRR,       // adc   [0100000101] rm[5..3] rd[2..0].
-  kThumbAddRRI3,     // add(1)  [0001110] imm_3[8..6] rn[5..3] rd[2..0]*/
+  kThumbAddRRI3,     // add(1)  [0001110] imm_3[8..6] rn[5..3] rd[2..0].
   kThumbAddRI8,      // add(2)  [00110] rd[10..8] imm_8[7..0].
   kThumbAddRRR,      // add(3)  [0001100] rm[8..6] rn[5..3] rd[2..0].
   kThumbAddRRLH,     // add(4)  [01000100] H12[01] rm[5..3] rd[2..0].
@@ -296,6 +382,8 @@ enum ArmOpcode {
   kThumbOrr,         // orr   [0100001100] rm[5..3] rd[2..0].
   kThumbPop,         // pop   [1011110] r[8..8] rl[7..0].
   kThumbPush,        // push  [1011010] r[8..8] rl[7..0].
+  kThumbRev,         // rev   [1011101000] rm[5..3] rd[2..0]
+  kThumbRevsh,       // revsh   [1011101011] rm[5..3] rd[2..0]
   kThumbRorRR,       // ror   [0100000111] rs[5..3] rd[2..0].
   kThumbSbc,         // sbc   [0100000110] rm[5..3] rd[2..0].
   kThumbStmia,       // stmia   [11000] rn[10..8] reglist [7.. 0].
@@ -324,34 +412,36 @@ enum ArmOpcode {
   kThumb2Vaddd,      // vadd vd, vn, vm [111011100011] rn[19..16] rd[15-12] [10110000] rm[3..0].
   kThumb2Vdivs,      // vdiv vd, vn, vm [111011101000] rn[19..16] rd[15-12] [10100000] rm[3..0].
   kThumb2Vdivd,      // vdiv vd, vn, vm [111011101000] rn[19..16] rd[15-12] [10110000] rm[3..0].
-  kThumb2VcvtIF,     // vcvt.F32 vd, vm [1110111010111000] vd[15..12] [10101100] vm[3..0].
-  kThumb2VcvtID,     // vcvt.F64 vd, vm [1110111010111000] vd[15..12] [10111100] vm[3..0].
+  kThumb2VmlaF64,    // vmla.F64 vd, vn, vm [111011100000] vn[19..16] vd[15..12] [10110000] vm[3..0].
+  kThumb2VcvtIF,     // vcvt.F32.S32 vd, vm [1110111010111000] vd[15..12] [10101100] vm[3..0].
   kThumb2VcvtFI,     // vcvt.S32.F32 vd, vm [1110111010111101] vd[15..12] [10101100] vm[3..0].
   kThumb2VcvtDI,     // vcvt.S32.F32 vd, vm [1110111010111101] vd[15..12] [10111100] vm[3..0].
   kThumb2VcvtFd,     // vcvt.F64.F32 vd, vm [1110111010110111] vd[15..12] [10101100] vm[3..0].
   kThumb2VcvtDF,     // vcvt.F32.F64 vd, vm [1110111010110111] vd[15..12] [10111100] vm[3..0].
+  kThumb2VcvtF64S32,  // vcvt.F64.S32 vd, vm [1110111010111000] vd[15..12] [10111100] vm[3..0].
+  kThumb2VcvtF64U32,  // vcvt.F64.U32 vd, vm [1110111010111000] vd[15..12] [10110100] vm[3..0].
   kThumb2Vsqrts,     // vsqrt.f32 vd, vm [1110111010110001] vd[15..12] [10101100] vm[3..0].
   kThumb2Vsqrtd,     // vsqrt.f64 vd, vm [1110111010110001] vd[15..12] [10111100] vm[3..0].
-  kThumb2MovImmShift,  // mov(T2) rd, #<const> [11110] i [00001001111] imm3 rd[11..8] imm8.
+  kThumb2MovI8M,     // mov(T2) rd, #<const> [11110] i [00001001111] imm3 rd[11..8] imm8.
   kThumb2MovImm16,   // mov(T3) rd, #<const> [11110] i [0010100] imm4 [0] imm3 rd[11..8] imm8.
   kThumb2StrRRI12,   // str(Imm,T3) rd,[rn,#imm12] [111110001100] rn[19..16] rt[15..12] imm12[11..0].
   kThumb2LdrRRI12,   // str(Imm,T3) rd,[rn,#imm12] [111110001100] rn[19..16] rt[15..12] imm12[11..0].
-  kThumb2StrRRI8Predec,  // str(Imm,T4) rd,[rn,#-imm8] [111110000100] rn[19..16] rt[15..12] [1100] imm[7..0]*/
-  kThumb2LdrRRI8Predec,  // ldr(Imm,T4) rd,[rn,#-imm8] [111110000101] rn[19..16] rt[15..12] [1100] imm[7..0]*/
+  kThumb2StrRRI8Predec,  // str(Imm,T4) rd,[rn,#-imm8] [111110000100] rn[19..16] rt[15..12] [1100] imm[7..0].
+  kThumb2LdrRRI8Predec,  // ldr(Imm,T4) rd,[rn,#-imm8] [111110000101] rn[19..16] rt[15..12] [1100] imm[7..0].
   kThumb2Cbnz,       // cbnz rd,<label> [101110] i [1] imm5[7..3] rn[2..0].
   kThumb2Cbz,        // cbn rd,<label> [101100] i [1] imm5[7..3] rn[2..0].
   kThumb2AddRRI12,   // add rd, rn, #imm12 [11110] i [100000] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
   kThumb2MovRR,      // mov rd, rm [11101010010011110000] rd[11..8] [0000] rm[3..0].
   kThumb2Vmovs,      // vmov.f32 vd, vm [111011101] D [110000] vd[15..12] 101001] M [0] vm[3..0].
   kThumb2Vmovd,      // vmov.f64 vd, vm [111011101] D [110000] vd[15..12] 101101] M [0] vm[3..0].
-  kThumb2Ldmia,      // ldmia  [111010001001[ rn[19..16] mask[15..0].
-  kThumb2Stmia,      // stmia  [111010001000[ rn[19..16] mask[15..0].
+  kThumb2Ldmia,      // ldmia  [111010001001] rn[19..16] mask[15..0].
+  kThumb2Stmia,      // stmia  [111010001000] rn[19..16] mask[15..0].
   kThumb2AddRRR,     // add [111010110000] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2SubRRR,     // sub [111010111010] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2SbcRRR,     // sbc [111010110110] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2CmpRR,      // cmp [111010111011] rn[19..16] [0000] [1111] [0000] rm[3..0].
-  kThumb2SubRRI12,   // sub rd, rn, #imm12 [11110] i [01010] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
-  kThumb2MvnImm12,   // mov(T2) rd, #<const> [11110] i [00011011110] imm3 rd[11..8] imm8.
+  kThumb2SubRRI12,   // sub rd, rn, #imm12 [11110] i [101010] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2MvnI8M,     // mov(T2) rd, #<const> [11110] i [00011011110] imm3 rd[11..8] imm8.
   kThumb2Sel,        // sel rd, rn, rm [111110101010] rn[19-16] rd[11-8] rm[3-0].
   kThumb2Ubfx,       // ubfx rd,rn,#lsb,#width [111100111100] rn[19..16] [0] imm3[14-12] rd[11-8] w[4-0].
   kThumb2Sbfx,       // ubfx rd,rn,#lsb,#width [111100110100] rn[19..16] [0] imm3[14-12] rd[11-8] w[4-0].
@@ -371,15 +461,18 @@ enum ArmOpcode {
   kThumb2StrbRRI12,  // strb rt,[rn,#imm12] [111110001000] rt[15..12] rn[19..16] imm12[11..0].
   kThumb2Pop,        // pop   [1110100010111101] list[15-0]*/
   kThumb2Push,       // push  [1110100100101101] list[15-0]*/
-  kThumb2CmpRI12,    // cmp rn, #<const> [11110] i [011011] rn[19-16] [0] imm3 [1111] imm8[7..0].
+  kThumb2CmpRI8M,    // cmp rn, #<const> [11110] i [011011] rn[19-16] [0] imm3 [1111] imm8[7..0].
+  kThumb2CmnRI8M,    // cmn rn, #<const> [11110] i [010001] rn[19-16] [0] imm3 [1111] imm8[7..0].
   kThumb2AdcRRR,     // adc [111010110101] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2AndRRR,     // and [111010100000] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2BicRRR,     // bic [111010100010] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2CmnRR,      // cmn [111010110001] rn[19..16] [0000] [1111] [0000] rm[3..0].
   kThumb2EorRRR,     // eor [111010101000] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2MulRRR,     // mul [111110110000] rn[19..16] [1111] rd[11..8] [0000] rm[3..0].
+  kThumb2SdivRRR,    // sdiv [111110111001] rn[19..16] [1111] rd[11..8] [1111] rm[3..0].
+  kThumb2UdivRRR,    // udiv [111110111011] rn[19..16] [1111] rd[11..8] [1111] rm[3..0].
   kThumb2MnvRR,      // mvn [11101010011011110] rd[11-8] [0000] rm[3..0].
-  kThumb2RsubRRI8,   // rsub [111100011100] rn[19..16] [0000] rd[11..8] imm8[7..0].
+  kThumb2RsubRRI8M,  // rsb rd, rn, #<const> [11110] i [011101] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
   kThumb2NegRR,      // actually rsub rd, rn, #0.
   kThumb2OrrRRR,     // orr [111010100100] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2TstRR,      // tst [111010100001] rn[19..16] [0000] [1111] [0000] rm[3..0].
@@ -391,22 +484,22 @@ enum ArmOpcode {
   kThumb2LsrRRI5,    // lsr [11101010010011110] imm[14.12] rd[11..8] [01] rm[3..0].
   kThumb2AsrRRI5,    // asr [11101010010011110] imm[14.12] rd[11..8] [10] rm[3..0].
   kThumb2RorRRI5,    // ror [11101010010011110] imm[14.12] rd[11..8] [11] rm[3..0].
-  kThumb2BicRRI8,    // bic [111100000010] rn[19..16] [0] imm3 rd[11..8] imm8.
-  kThumb2AndRRI8,    // bic [111100000000] rn[19..16] [0] imm3 rd[11..8] imm8.
-  kThumb2OrrRRI8,    // orr [111100000100] rn[19..16] [0] imm3 rd[11..8] imm8.
-  kThumb2EorRRI8,    // eor [111100001000] rn[19..16] [0] imm3 rd[11..8] imm8.
-  kThumb2AddRRI8,    // add [111100001000] rn[19..16] [0] imm3 rd[11..8] imm8.
-  kThumb2AdcRRI8,    // adc [111100010101] rn[19..16] [0] imm3 rd[11..8] imm8.
-  kThumb2SubRRI8,    // sub [111100011011] rn[19..16] [0] imm3 rd[11..8] imm8.
-  kThumb2SbcRRI8,    // sbc [111100010111] rn[19..16] [0] imm3 rd[11..8] imm8.
+  kThumb2BicRRI8M,   // bic rd, rn, #<const> [11110] i [000010] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2AndRRI8M,   // and rd, rn, #<const> [11110] i [000000] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2OrrRRI8M,   // orr rd, rn, #<const> [11110] i [000100] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2EorRRI8M,   // eor rd, rn, #<const> [11110] i [001000] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2AddRRI8M,   // add rd, rn, #<const> [11110] i [010001] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2AdcRRI8M,   // adc rd, rn, #<const> [11110] i [010101] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2SubRRI8M,   // sub rd, rn, #<const> [11110] i [011011] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2SbcRRI8M,   // sub rd, rn, #<const> [11110] i [010111] rn[19..16] [0] imm3[14..12] rd[11..8] imm8[7..0].
+  kThumb2RevRR,      // rev [111110101001] rm[19..16] [1111] rd[11..8] 1000 rm[3..0]
+  kThumb2RevshRR,    // rev [111110101001] rm[19..16] [1111] rd[11..8] 1011 rm[3..0]
   kThumb2It,         // it [10111111] firstcond[7-4] mask[3-0].
   kThumb2Fmstat,     // fmstat [11101110111100011111101000010000].
   kThumb2Vcmpd,      // vcmp [111011101] D [11011] rd[15-12] [1011] E [1] M [0] rm[3-0].
   kThumb2Vcmps,      // vcmp [111011101] D [11010] rd[15-12] [1011] E [1] M [0] rm[3-0].
   kThumb2LdrPcRel12,  // ldr rd,[pc,#imm12] [1111100011011111] rt[15-12] imm12[11-0].
   kThumb2BCond,      // b<c> [1110] S cond[25-22] imm6[21-16] [10] J1 [0] J2 imm11[10..0].
-  kThumb2Vmovd_RR,   // vmov [111011101] D [110000] vd[15-12 [101101] M [0] vm[3-0].
-  kThumb2Vmovs_RR,   // vmov [111011101] D [110000] vd[15-12 [101001] M [0] vm[3-0].
   kThumb2Fmrs,       // vmov [111011100000] vn[19-16] rt[15-12] [1010] N [0010000].
   kThumb2Fmsr,       // vmov [111011100001] vn[19-16] rt[15-12] [1010] N [0010000].
   kThumb2Fmrrd,      // vmov [111011000100] rt2[19-16] rt[15-12] [101100] M [1] vm[3-0].
@@ -419,9 +512,11 @@ enum ArmOpcode {
   kThumb2Vmovd_IMM8,  // vmov.f64 [111011101] D [11] imm4h[19-16] vd[15-12] [10110000] imm4l[3-0].
   kThumb2Mla,        // mla [111110110000] rn[19-16] ra[15-12] rd[7-4] [0000] rm[3-0].
   kThumb2Umull,      // umull [111110111010] rn[19-16], rdlo[15-12] rdhi[11-8] [0000] rm[3-0].
-  kThumb2Ldrex,      // ldrex [111010000101] rn[19-16] rt[11-8] [1111] imm8[7-0].
-  kThumb2Strex,      // strex [111010000100] rn[19-16] rt[11-8] rd[11-8] imm8[7-0].
-  kThumb2Clrex,      // clrex [111100111011111110000111100101111].
+  kThumb2Ldrex,      // ldrex [111010000101] rn[19-16] rt[15-12] [1111] imm8[7-0].
+  kThumb2Ldrexd,     // ldrexd [111010001101] rn[19-16] rt[15-12] rt2[11-8] [11111111].
+  kThumb2Strex,      // strex [111010000100] rn[19-16] rt[15-12] rd[11-8] imm8[7-0].
+  kThumb2Strexd,     // strexd [111010001100] rn[19-16] rt[15-12] rt2[11-8] [0111] Rd[3-0].
+  kThumb2Clrex,      // clrex [11110011101111111000111100101111].
   kThumb2Bfi,        // bfi [111100110110] rn[19-16] [0] imm3[14-12] rd[11-8] imm2[7-6] [0] msb[4-0].
   kThumb2Bfc,        // bfc [11110011011011110] [0] imm3[14-12] rd[11-8] imm2[7-6] [0] msb[4-0].
   kThumb2Dmb,        // dmb [1111001110111111100011110101] option[3-0].
@@ -439,8 +534,7 @@ enum ArmOpcode {
   kThumb2MovImm16LST,  // Special purpose version for switch table use.
   kThumb2MovImm16HST,  // Special purpose version for switch table use.
   kThumb2LdmiaWB,    // ldmia  [111010011001[ rn[19..16] mask[15..0].
-  kThumb2SubsRRI12,  // setflags encoding.
-  kThumb2OrrRRRs,    // orrx [111010100101] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
+  kThumb2OrrRRRs,    // orrs [111010100101] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
   kThumb2Push1,      // t3 encoding of push.
   kThumb2Pop1,       // t3 encoding of pop.
   kThumb2RsubRRR,    // rsb [111010111101] rn[19..16] [0000] rd[11..8] [0000] rm[3..0].
@@ -462,7 +556,7 @@ enum ArmOpDmbOptions {
 
 // Instruction assembly field_loc kind.
 enum ArmEncodingKind {
-  kFmtUnused,
+  kFmtUnused,    // Unused field and marks end of formats.
   kFmtBitBlt,    // Bit string using end/start.
   kFmtDfp,       // Double FP reg.
   kFmtSfp,       // Single FP reg.
@@ -477,6 +571,7 @@ enum ArmEncodingKind {
   kFmtBrOffset,  // Signed extended [26,11,13,21-16,10-0]:0.
   kFmtFPImm,     // Encoded floating point immediate.
   kFmtOff24,     // 24-bit Thumb2 unconditional branch encoding.
+  kFmtSkip,      // Unused field, but continue to next.
 };
 
 // Struct used to define the snippet positions for each Thumb opcode.
@@ -492,6 +587,7 @@ struct ArmEncodingMap {
   const char* name;
   const char* fmt;
   int size;   // Note: size is in bytes.
+  FixupKind fixup;
 };
 
 }  // namespace art

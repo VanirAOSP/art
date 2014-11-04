@@ -20,9 +20,8 @@
 #include "mirror/art_method-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
-#include "object_utils.h"
 #include "reflection.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_fast_native_object_access.h"
 #include "well_known_classes.h"
 
 namespace art {
@@ -34,41 +33,49 @@ namespace art {
  * check.  We can also safely assume the constructor isn't associated
  * with an interface, array, or primitive class.
  */
-static jobject Constructor_newInstance(JNIEnv* env, jobject javaMethod, jobjectArray javaArgs) {
-  ScopedObjectAccess soa(env);
-  jobject art_method = soa.Env()->GetObjectField(
-      javaMethod, WellKnownClasses::java_lang_reflect_AbstractMethod_artMethod);
-
-  mirror::ArtMethod* m = soa.Decode<mirror::Object*>(art_method)->AsArtMethod();
-  mirror::Class* c = m->GetDeclaringClass();
+static jobject Constructor_newInstance(JNIEnv* env, jobject javaMethod, jobjectArray javaArgs,
+                                       jboolean accessible) {
+  ScopedFastNativeObjectAccess soa(env);
+  mirror::ArtMethod* m = mirror::ArtMethod::FromReflectedMethod(soa, javaMethod);
+  StackHandleScope<1> hs(soa.Self());
+  Handle<mirror::Class> c(hs.NewHandle(m->GetDeclaringClass()));
   if (UNLIKELY(c->IsAbstract())) {
     ThrowLocation throw_location = soa.Self()->GetCurrentLocationForThrow();
     soa.Self()->ThrowNewExceptionF(throw_location, "Ljava/lang/InstantiationException;",
                                    "Can't instantiate %s %s",
                                    c->IsInterface() ? "interface" : "abstract class",
-                                   PrettyDescriptor(c).c_str());
-    return NULL;
+                                   PrettyDescriptor(c.Get()).c_str());
+    return nullptr;
   }
 
   if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(c, true, true)) {
     DCHECK(soa.Self()->IsExceptionPending());
-    return NULL;
+    return nullptr;
   }
 
-  mirror::Object* receiver = c->AllocObject(soa.Self());
-  if (receiver == NULL) {
-    return NULL;
+  bool movable = true;
+  if (!kMovingMethods && c->IsArtMethodClass()) {
+    movable = false;
+  } else if (!kMovingFields && c->IsArtFieldClass()) {
+    movable = false;
+  } else if (!kMovingClasses && c->IsClassClass()) {
+    movable = false;
+  }
+  mirror::Object* receiver =
+      movable ? c->AllocObject(soa.Self()) : c->AllocNonMovableObject(soa.Self());
+  if (receiver == nullptr) {
+    return nullptr;
   }
 
   jobject javaReceiver = soa.AddLocalReference<jobject>(receiver);
-  InvokeMethod(soa, javaMethod, javaReceiver, javaArgs);
+  InvokeMethod(soa, javaMethod, javaReceiver, javaArgs, (accessible == JNI_TRUE));
 
   // Constructors are ()V methods, so we shouldn't touch the result of InvokeMethod.
   return javaReceiver;
 }
 
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(Constructor, newInstance, "([Ljava/lang/Object;)Ljava/lang/Object;"),
+  NATIVE_METHOD(Constructor, newInstance, "!([Ljava/lang/Object;Z)Ljava/lang/Object;"),
 };
 
 void register_java_lang_reflect_Constructor(JNIEnv* env) {

@@ -18,322 +18,404 @@
 #include "class_linker-inl.h"
 #include "common_throws.h"
 #include "dex_file-inl.h"
+#include "field_helper.h"
 #include "jni_internal.h"
 #include "mirror/art_field-inl.h"
+#include "mirror/art_method-inl.h"
 #include "mirror/class-inl.h"
-#include "object_utils.h"
-#include "reflection.h"
-#include "scoped_thread_state_change.h"
+#include "reflection-inl.h"
+#include "scoped_fast_native_object_access.h"
 
 namespace art {
 
-static bool GetFieldValue(const ScopedObjectAccess& soa, mirror::Object* o, mirror::ArtField* f,
-                          JValue& value, bool allow_references)
+template<bool kIsSet>
+ALWAYS_INLINE inline static bool VerifyFieldAccess(Thread* self, mirror::ArtField* field,
+                                                   mirror::Object* obj)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  DCHECK_EQ(value.GetJ(), 0LL);
-  if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(f->GetDeclaringClass(),
-                                                               true, true)) {
+  if (kIsSet && field->IsFinal()) {
+    ThrowIllegalAccessException(nullptr, StringPrintf("Cannot set final field: %s",
+                                                      PrettyField(field).c_str()).c_str());
     return false;
   }
-  switch (FieldHelper(f).GetTypeAsPrimitiveType()) {
-  case Primitive::kPrimBoolean:
-    value.SetZ(f->GetBoolean(o));
-    return true;
-  case Primitive::kPrimByte:
-    value.SetB(f->GetByte(o));
-    return true;
-  case Primitive::kPrimChar:
-    value.SetC(f->GetChar(o));
-    return true;
-  case Primitive::kPrimDouble:
-    value.SetD(f->GetDouble(o));
-    return true;
-  case Primitive::kPrimFloat:
-    value.SetF(f->GetFloat(o));
-    return true;
-  case Primitive::kPrimInt:
-    value.SetI(f->GetInt(o));
-    return true;
-  case Primitive::kPrimLong:
-    value.SetJ(f->GetLong(o));
-    return true;
-  case Primitive::kPrimShort:
-    value.SetS(f->GetShort(o));
-    return true;
-  case Primitive::kPrimNot:
-    if (allow_references) {
-      value.SetL(f->GetObject(o));
-      return true;
-    }
-    // Else break to report an error.
-    break;
-  case Primitive::kPrimVoid:
-    // Never okay.
-    break;
-  }
-  ThrowIllegalArgumentException(NULL,
-                                StringPrintf("Not a primitive field: %s",
-                                             PrettyField(f).c_str()).c_str());
-  return false;
-}
-
-static bool CheckReceiver(const ScopedObjectAccess& soa, jobject j_rcvr, mirror::ArtField* f,
-                          mirror::Object*& class_or_rcvr)
-    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  if (f->IsStatic()) {
-    class_or_rcvr = f->GetDeclaringClass();
-    return true;
-  }
-
-  class_or_rcvr = soa.Decode<mirror::Object*>(j_rcvr);
-  mirror::Class* declaringClass = f->GetDeclaringClass();
-  if (!VerifyObjectInClass(class_or_rcvr, declaringClass)) {
+  if (!VerifyAccess(self, obj, field->GetDeclaringClass(), field->GetAccessFlags())) {
+    ThrowIllegalAccessException(nullptr, StringPrintf("Cannot access field: %s",
+                                                      PrettyField(field).c_str()).c_str());
     return false;
   }
   return true;
 }
 
-static jobject Field_get(JNIEnv* env, jobject javaField, jobject javaObj) {
-  ScopedObjectAccess soa(env);
-  mirror::ArtField* f = soa.DecodeField(env->FromReflectedField(javaField));
-  mirror::Object* o = NULL;
-  if (!CheckReceiver(soa, javaObj, f, o)) {
-    return NULL;
+template<bool kAllowReferences>
+ALWAYS_INLINE inline static bool GetFieldValue(
+    const ScopedFastNativeObjectAccess& soa, mirror::Object* o, mirror::ArtField* f,
+    Primitive::Type field_type, JValue* value)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  DCHECK_EQ(value->GetJ(), INT64_C(0));
+  switch (field_type) {
+    case Primitive::kPrimBoolean:
+      value->SetZ(f->GetBoolean(o));
+      return true;
+    case Primitive::kPrimByte:
+      value->SetB(f->GetByte(o));
+      return true;
+    case Primitive::kPrimChar:
+      value->SetC(f->GetChar(o));
+      return true;
+    case Primitive::kPrimDouble:
+      value->SetD(f->GetDouble(o));
+      return true;
+    case Primitive::kPrimFloat:
+      value->SetF(f->GetFloat(o));
+      return true;
+    case Primitive::kPrimInt:
+      value->SetI(f->GetInt(o));
+      return true;
+    case Primitive::kPrimLong:
+      value->SetJ(f->GetLong(o));
+      return true;
+    case Primitive::kPrimShort:
+      value->SetS(f->GetShort(o));
+      return true;
+    case Primitive::kPrimNot:
+      if (kAllowReferences) {
+        value->SetL(f->GetObject(o));
+        return true;
+      }
+      // Else break to report an error.
+      break;
+    case Primitive::kPrimVoid:
+      // Never okay.
+      break;
   }
-
-  // Get the field's value, boxing if necessary.
-  JValue value;
-  if (!GetFieldValue(soa, o, f, value, true)) {
-    return NULL;
-  }
-  return
-      soa.AddLocalReference<jobject>(BoxPrimitive(FieldHelper(f).GetTypeAsPrimitiveType(), value));
+  ThrowIllegalArgumentException(nullptr, StringPrintf("Not a primitive field: %s",
+                                                      PrettyField(f).c_str()).c_str());
+  return false;
 }
 
-static JValue GetPrimitiveField(JNIEnv* env, jobject javaField, jobject javaObj,
-                                char dst_descriptor) {
-  ScopedObjectAccess soa(env);
-  mirror::ArtField* f = soa.DecodeField(env->FromReflectedField(javaField));
-  mirror::Object* o = NULL;
-  if (!CheckReceiver(soa, javaObj, f, o)) {
+ALWAYS_INLINE inline static bool CheckReceiver(const ScopedFastNativeObjectAccess& soa,
+                                               jobject j_rcvr, mirror::ArtField** f,
+                                               mirror::Object** class_or_rcvr)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  soa.Self()->AssertThreadSuspensionIsAllowable();
+  mirror::Class* declaringClass = (*f)->GetDeclaringClass();
+  if ((*f)->IsStatic()) {
+    if (UNLIKELY(!declaringClass->IsInitialized())) {
+      ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
+      StackHandleScope<2> hs(soa.Self());
+      HandleWrapper<mirror::ArtField> h_f(hs.NewHandleWrapper(f));
+      HandleWrapper<mirror::Class> h_klass(hs.NewHandleWrapper(&declaringClass));
+      if (UNLIKELY(!class_linker->EnsureInitialized(h_klass, true, true))) {
+        DCHECK(soa.Self()->IsExceptionPending());
+        return false;
+      }
+    }
+    *class_or_rcvr = declaringClass;
+    return true;
+  }
+  *class_or_rcvr = soa.Decode<mirror::Object*>(j_rcvr);
+  if (!VerifyObjectIsClass(*class_or_rcvr, declaringClass)) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return false;
+  }
+  return true;
+}
+
+static jobject Field_get(JNIEnv* env, jobject javaField, jobject javaObj, jboolean accessible) {
+  ScopedFastNativeObjectAccess soa(env);
+  mirror::ArtField* f = mirror::ArtField::FromReflectedField(soa, javaField);
+  mirror::Object* o = nullptr;
+  if (!CheckReceiver(soa, javaObj, &f, &o)) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return nullptr;
+  }
+  // If field is not set to be accessible, verify it can be accessed by the caller.
+  if ((accessible == JNI_FALSE) && !VerifyFieldAccess<false>(soa.Self(), f, o)) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return nullptr;
+  }
+  // We now don't expect suspension unless an exception is thrown.
+  // Get the field's value, boxing if necessary.
+  Primitive::Type field_type = f->GetTypeAsPrimitiveType();
+  JValue value;
+  if (!GetFieldValue<true>(soa, o, f, field_type, &value)) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return nullptr;
+  }
+  return soa.AddLocalReference<jobject>(BoxPrimitive(field_type, value));
+}
+
+template<Primitive::Type kPrimitiveType>
+ALWAYS_INLINE inline static JValue GetPrimitiveField(JNIEnv* env, jobject javaField,
+                                                     jobject javaObj, jboolean accessible) {
+  ScopedFastNativeObjectAccess soa(env);
+  mirror::ArtField* f = mirror::ArtField::FromReflectedField(soa, javaField);
+  mirror::Object* o = nullptr;
+  if (!CheckReceiver(soa, javaObj, &f, &o)) {
+    DCHECK(soa.Self()->IsExceptionPending());
     return JValue();
   }
 
+  // If field is not set to be accessible, verify it can be accessed by the caller.
+  if (accessible == JNI_FALSE && !VerifyFieldAccess<false>(soa.Self(), f, o)) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return JValue();
+  }
+
+  // We now don't expect suspension unless an exception is thrown.
   // Read the value.
+  Primitive::Type field_type = f->GetTypeAsPrimitiveType();
   JValue field_value;
-  if (!GetFieldValue(soa, o, f, field_value, false)) {
+  if (field_type == kPrimitiveType) {
+    // This if statement should get optimized out since we only pass in valid primitive types.
+    if (UNLIKELY(!GetFieldValue<false>(soa, o, f, kPrimitiveType, &field_value))) {
+      DCHECK(soa.Self()->IsExceptionPending());
+      return JValue();
+    }
+    return field_value;
+  }
+  if (!GetFieldValue<false>(soa, o, f, field_type, &field_value)) {
+    DCHECK(soa.Self()->IsExceptionPending());
     return JValue();
   }
-
   // Widen it if necessary (and possible).
   JValue wide_value;
-  mirror::Class* dst_type =
-      Runtime::Current()->GetClassLinker()->FindPrimitiveClass(dst_descriptor);
-  if (!ConvertPrimitiveValue(NULL, false, FieldHelper(f).GetTypeAsPrimitiveType(),
-                             dst_type->GetPrimitiveType(), field_value, wide_value)) {
+  if (!ConvertPrimitiveValue(nullptr, false, field_type, kPrimitiveType, field_value,
+                             &wide_value)) {
+    DCHECK(soa.Self()->IsExceptionPending());
     return JValue();
   }
   return wide_value;
 }
 
-static jboolean Field_getBoolean(JNIEnv* env, jobject javaField, jobject javaObj) {
-  return GetPrimitiveField(env, javaField, javaObj, 'Z').GetZ();
+static jboolean Field_getBoolean(JNIEnv* env, jobject javaField, jobject javaObj,
+                                 jboolean accessible) {
+  return GetPrimitiveField<Primitive::kPrimBoolean>(env, javaField, javaObj, accessible).GetZ();
 }
 
-static jbyte Field_getByte(JNIEnv* env, jobject javaField, jobject javaObj) {
-  return GetPrimitiveField(env, javaField, javaObj, 'B').GetB();
+static jbyte Field_getByte(JNIEnv* env, jobject javaField, jobject javaObj, jboolean accessible) {
+  return GetPrimitiveField<Primitive::kPrimByte>(env, javaField, javaObj, accessible).GetB();
 }
 
-static jchar Field_getChar(JNIEnv* env, jobject javaField, jobject javaObj) {
-  return GetPrimitiveField(env, javaField, javaObj, 'C').GetC();
+static jchar Field_getChar(JNIEnv* env, jobject javaField, jobject javaObj, jboolean accessible) {
+  return GetPrimitiveField<Primitive::kPrimChar>(env, javaField, javaObj, accessible).GetC();
 }
 
-static jdouble Field_getDouble(JNIEnv* env, jobject javaField, jobject javaObj) {
-  return GetPrimitiveField(env, javaField, javaObj, 'D').GetD();
+static jdouble Field_getDouble(JNIEnv* env, jobject javaField, jobject javaObj,
+                               jboolean accessible) {
+  return GetPrimitiveField<Primitive::kPrimDouble>(env, javaField, javaObj, accessible).GetD();
 }
 
-static jfloat Field_getFloat(JNIEnv* env, jobject javaField, jobject javaObj) {
-  return GetPrimitiveField(env, javaField, javaObj, 'F').GetF();
+static jfloat Field_getFloat(JNIEnv* env, jobject javaField, jobject javaObj, jboolean accessible) {
+  return GetPrimitiveField<Primitive::kPrimFloat>(env, javaField, javaObj, accessible).GetF();
 }
 
-static jint Field_getInt(JNIEnv* env, jobject javaField, jobject javaObj) {
-  return GetPrimitiveField(env, javaField, javaObj, 'I').GetI();
+static jint Field_getInt(JNIEnv* env, jobject javaField, jobject javaObj, jboolean accessible) {
+  return GetPrimitiveField<Primitive::kPrimInt>(env, javaField, javaObj, accessible).GetI();
 }
 
-static jlong Field_getLong(JNIEnv* env, jobject javaField, jobject javaObj) {
-  return GetPrimitiveField(env, javaField, javaObj, 'J').GetJ();
+static jlong Field_getLong(JNIEnv* env, jobject javaField, jobject javaObj, jboolean accessible) {
+  return GetPrimitiveField<Primitive::kPrimLong>(env, javaField, javaObj, accessible).GetJ();
 }
 
-static jshort Field_getShort(JNIEnv* env, jobject javaField, jobject javaObj) {
-  return GetPrimitiveField(env, javaField, javaObj, 'S').GetS();
+static jshort Field_getShort(JNIEnv* env, jobject javaField, jobject javaObj, jboolean accessible) {
+  return GetPrimitiveField<Primitive::kPrimShort>(env, javaField, javaObj, accessible).GetS();
 }
 
-static void SetFieldValue(mirror::Object* o, mirror::ArtField* f, const JValue& new_value,
-                          bool allow_references)
+static void SetFieldValue(ScopedFastNativeObjectAccess& soa, mirror::Object* o,
+                          mirror::ArtField* f, Primitive::Type field_type, bool allow_references,
+                          const JValue& new_value)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  if (!Runtime::Current()->GetClassLinker()->EnsureInitialized(f->GetDeclaringClass(),
-                                                               true, true)) {
-    return;
-  }
-  switch (FieldHelper(f).GetTypeAsPrimitiveType()) {
+  DCHECK(f->GetDeclaringClass()->IsInitialized());
+  switch (field_type) {
   case Primitive::kPrimBoolean:
-    f->SetBoolean(o, new_value.GetZ());
+    f->SetBoolean<false>(o, new_value.GetZ());
     break;
   case Primitive::kPrimByte:
-    f->SetByte(o, new_value.GetB());
+    f->SetByte<false>(o, new_value.GetB());
     break;
   case Primitive::kPrimChar:
-    f->SetChar(o, new_value.GetC());
+    f->SetChar<false>(o, new_value.GetC());
     break;
   case Primitive::kPrimDouble:
-    f->SetDouble(o, new_value.GetD());
+    f->SetDouble<false>(o, new_value.GetD());
     break;
   case Primitive::kPrimFloat:
-    f->SetFloat(o, new_value.GetF());
+    f->SetFloat<false>(o, new_value.GetF());
     break;
   case Primitive::kPrimInt:
-    f->SetInt(o, new_value.GetI());
+    f->SetInt<false>(o, new_value.GetI());
     break;
   case Primitive::kPrimLong:
-    f->SetLong(o, new_value.GetJ());
+    f->SetLong<false>(o, new_value.GetJ());
     break;
   case Primitive::kPrimShort:
-    f->SetShort(o, new_value.GetS());
+    f->SetShort<false>(o, new_value.GetS());
     break;
   case Primitive::kPrimNot:
     if (allow_references) {
-      f->SetObject(o, new_value.GetL());
+      f->SetObject<false>(o, new_value.GetL());
       break;
     }
     // Else fall through to report an error.
   case Primitive::kPrimVoid:
     // Never okay.
-    ThrowIllegalArgumentException(NULL, StringPrintf("Not a primitive field: %s",
-                                                     PrettyField(f).c_str()).c_str());
+    ThrowIllegalArgumentException(nullptr, StringPrintf("Not a primitive field: %s",
+                                                        PrettyField(f).c_str()).c_str());
     return;
-  }
-
-  // Special handling for final fields on SMP systems.
-  // We need a store/store barrier here (JMM requirement).
-  if (f->IsFinal()) {
-    ANDROID_MEMBAR_STORE();
   }
 }
 
-static void Field_set(JNIEnv* env, jobject javaField, jobject javaObj, jobject javaValue) {
-  ScopedObjectAccess soa(env);
-  mirror::ArtField* f = soa.DecodeField(env->FromReflectedField(javaField));
-
+static void Field_set(JNIEnv* env, jobject javaField, jobject javaObj, jobject javaValue,
+                      jboolean accessible) {
+  ScopedFastNativeObjectAccess soa(env);
+  mirror::ArtField* f = mirror::ArtField::FromReflectedField(soa, javaField);
+  // Check that the receiver is non-null and an instance of the field's declaring class.
+  mirror::Object* o = nullptr;
+  if (!CheckReceiver(soa, javaObj, &f, &o)) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return;
+  }
+  mirror::Class* field_type;
+  const char* field_type_desciptor = f->GetTypeDescriptor();
+  Primitive::Type field_prim_type = Primitive::GetType(field_type_desciptor[0]);
+  if (field_prim_type == Primitive::kPrimNot) {
+    StackHandleScope<2> hs(soa.Self());
+    HandleWrapper<mirror::Object> h_o(hs.NewHandleWrapper(&o));
+    HandleWrapper<mirror::ArtField> h_f(hs.NewHandleWrapper(&f));
+    FieldHelper fh(h_f);
+    // May cause resolution.
+    field_type = fh.GetType(true);
+    if (field_type == nullptr) {
+      DCHECK(soa.Self()->IsExceptionPending());
+      return;
+    }
+  } else {
+    field_type = Runtime::Current()->GetClassLinker()->FindPrimitiveClass(field_type_desciptor[0]);
+  }
+  // We now don't expect suspension unless an exception is thrown.
   // Unbox the value, if necessary.
   mirror::Object* boxed_value = soa.Decode<mirror::Object*>(javaValue);
   JValue unboxed_value;
-  if (!UnboxPrimitiveForField(boxed_value, FieldHelper(f).GetType(), unboxed_value, f)) {
+  if (!UnboxPrimitiveForField(boxed_value, field_type, f, &unboxed_value)) {
+    DCHECK(soa.Self()->IsExceptionPending());
     return;
   }
-
-  // Check that the receiver is non-null and an instance of the field's declaring class.
-  mirror::Object* o = NULL;
-  if (!CheckReceiver(soa, javaObj, f, o)) {
+  // If field is not set to be accessible, verify it can be accessed by the caller.
+  if ((accessible == JNI_FALSE) && !VerifyFieldAccess<true>(soa.Self(), f, o)) {
+    DCHECK(soa.Self()->IsExceptionPending());
     return;
   }
-
-  SetFieldValue(o, f, unboxed_value, true);
+  SetFieldValue(soa, o, f, field_prim_type, true, unboxed_value);
 }
 
-static void SetPrimitiveField(JNIEnv* env, jobject javaField, jobject javaObj, char src_descriptor,
-                              const JValue& new_value) {
-  ScopedObjectAccess soa(env);
-  mirror::ArtField* f = soa.DecodeField(env->FromReflectedField(javaField));
-  mirror::Object* o = NULL;
-  if (!CheckReceiver(soa, javaObj, f, o)) {
+template<Primitive::Type kPrimitiveType>
+static void SetPrimitiveField(JNIEnv* env, jobject javaField, jobject javaObj,
+                              const JValue& new_value, jboolean accessible) {
+  ScopedFastNativeObjectAccess soa(env);
+  mirror::ArtField* f = mirror::ArtField::FromReflectedField(soa, javaField);
+  mirror::Object* o = nullptr;
+  if (!CheckReceiver(soa, javaObj, &f, &o)) {
     return;
   }
-  FieldHelper fh(f);
-  if (!fh.IsPrimitiveType()) {
-    ThrowIllegalArgumentException(NULL, StringPrintf("Not a primitive field: %s",
-                                                     PrettyField(f).c_str()).c_str());
+  Primitive::Type field_type = f->GetTypeAsPrimitiveType();
+  if (UNLIKELY(field_type == Primitive::kPrimNot)) {
+    ThrowIllegalArgumentException(nullptr, StringPrintf("Not a primitive field: %s",
+                                                        PrettyField(f).c_str()).c_str());
     return;
   }
 
   // Widen the value if necessary (and possible).
   JValue wide_value;
-  mirror::Class* src_type = Runtime::Current()->GetClassLinker()->FindPrimitiveClass(src_descriptor);
-  if (!ConvertPrimitiveValue(NULL, false, src_type->GetPrimitiveType(), fh.GetTypeAsPrimitiveType(),
-                             new_value, wide_value)) {
+  if (!ConvertPrimitiveValue(nullptr, false, kPrimitiveType, field_type, new_value, &wide_value)) {
+    DCHECK(soa.Self()->IsExceptionPending());
+    return;
+  }
+
+  // If field is not set to be accessible, verify it can be accessed by the caller.
+  if ((accessible == JNI_FALSE) && !VerifyFieldAccess<true>(soa.Self(), f, o)) {
+    DCHECK(soa.Self()->IsExceptionPending());
     return;
   }
 
   // Write the value.
-  SetFieldValue(o, f, wide_value, false);
+  SetFieldValue(soa, o, f, field_type, false, wide_value);
 }
 
-static void Field_setBoolean(JNIEnv* env, jobject javaField, jobject javaObj, jboolean z) {
+static void Field_setBoolean(JNIEnv* env, jobject javaField, jobject javaObj, jboolean z,
+                             jboolean accessible) {
   JValue value;
   value.SetZ(z);
-  SetPrimitiveField(env, javaField, javaObj, 'Z', value);
+  SetPrimitiveField<Primitive::kPrimBoolean>(env, javaField, javaObj, value, accessible);
 }
 
-static void Field_setByte(JNIEnv* env, jobject javaField, jobject javaObj, jbyte b) {
+static void Field_setByte(JNIEnv* env, jobject javaField, jobject javaObj, jbyte b,
+                          jboolean accessible) {
   JValue value;
   value.SetB(b);
-  SetPrimitiveField(env, javaField, javaObj, 'B', value);
+  SetPrimitiveField<Primitive::kPrimByte>(env, javaField, javaObj, value, accessible);
 }
 
-static void Field_setChar(JNIEnv* env, jobject javaField, jobject javaObj, jchar c) {
+static void Field_setChar(JNIEnv* env, jobject javaField, jobject javaObj, jchar c,
+                          jboolean accessible) {
   JValue value;
   value.SetC(c);
-  SetPrimitiveField(env, javaField, javaObj, 'C', value);
+  SetPrimitiveField<Primitive::kPrimChar>(env, javaField, javaObj, value, accessible);
 }
 
-static void Field_setDouble(JNIEnv* env, jobject javaField, jobject javaObj, jdouble d) {
+static void Field_setDouble(JNIEnv* env, jobject javaField, jobject javaObj, jdouble d,
+                            jboolean accessible) {
   JValue value;
   value.SetD(d);
-  SetPrimitiveField(env, javaField, javaObj, 'D', value);
+  SetPrimitiveField<Primitive::kPrimDouble>(env, javaField, javaObj, value, accessible);
 }
 
-static void Field_setFloat(JNIEnv* env, jobject javaField, jobject javaObj, jfloat f) {
+static void Field_setFloat(JNIEnv* env, jobject javaField, jobject javaObj, jfloat f,
+                           jboolean accessible) {
   JValue value;
   value.SetF(f);
-  SetPrimitiveField(env, javaField, javaObj, 'F', value);
+  SetPrimitiveField<Primitive::kPrimFloat>(env, javaField, javaObj, value, accessible);
 }
 
-static void Field_setInt(JNIEnv* env, jobject javaField, jobject javaObj, jint i) {
+static void Field_setInt(JNIEnv* env, jobject javaField, jobject javaObj, jint i,
+                         jboolean accessible) {
   JValue value;
   value.SetI(i);
-  SetPrimitiveField(env, javaField, javaObj, 'I', value);
+  SetPrimitiveField<Primitive::kPrimInt>(env, javaField, javaObj, value, accessible);
 }
 
-static void Field_setLong(JNIEnv* env, jobject javaField, jobject javaObj, jlong j) {
+static void Field_setLong(JNIEnv* env, jobject javaField, jobject javaObj, jlong j,
+                          jboolean accessible) {
   JValue value;
   value.SetJ(j);
-  SetPrimitiveField(env, javaField, javaObj, 'J', value);
+  SetPrimitiveField<Primitive::kPrimLong>(env, javaField, javaObj, value, accessible);
 }
 
-static void Field_setShort(JNIEnv* env, jobject javaField, jobject javaObj, jshort s) {
+static void Field_setShort(JNIEnv* env, jobject javaField, jobject javaObj, jshort s,
+                           jboolean accessible) {
   JValue value;
   value.SetS(s);
-  SetPrimitiveField(env, javaField, javaObj, 'S', value);
+  SetPrimitiveField<Primitive::kPrimShort>(env, javaField, javaObj, value, accessible);
 }
 
 static JNINativeMethod gMethods[] = {
-  NATIVE_METHOD(Field, get,        "(Ljava/lang/Object;)Ljava/lang/Object;"),
-  NATIVE_METHOD(Field, getBoolean, "(Ljava/lang/Object;)Z"),
-  NATIVE_METHOD(Field, getByte,    "(Ljava/lang/Object;)B"),
-  NATIVE_METHOD(Field, getChar,    "(Ljava/lang/Object;)C"),
-  NATIVE_METHOD(Field, getDouble,  "(Ljava/lang/Object;)D"),
-  NATIVE_METHOD(Field, getFloat,   "(Ljava/lang/Object;)F"),
-  NATIVE_METHOD(Field, getInt,     "(Ljava/lang/Object;)I"),
-  NATIVE_METHOD(Field, getLong,    "(Ljava/lang/Object;)J"),
-  NATIVE_METHOD(Field, getShort,   "(Ljava/lang/Object;)S"),
-  NATIVE_METHOD(Field, set,        "(Ljava/lang/Object;Ljava/lang/Object;)V"),
-  NATIVE_METHOD(Field, setBoolean, "(Ljava/lang/Object;Z)V"),
-  NATIVE_METHOD(Field, setByte,    "(Ljava/lang/Object;B)V"),
-  NATIVE_METHOD(Field, setChar,    "(Ljava/lang/Object;C)V"),
-  NATIVE_METHOD(Field, setDouble,  "(Ljava/lang/Object;D)V"),
-  NATIVE_METHOD(Field, setFloat,   "(Ljava/lang/Object;F)V"),
-  NATIVE_METHOD(Field, setInt,     "(Ljava/lang/Object;I)V"),
-  NATIVE_METHOD(Field, setLong,    "(Ljava/lang/Object;J)V"),
-  NATIVE_METHOD(Field, setShort,   "(Ljava/lang/Object;S)V"),
+  NATIVE_METHOD(Field, get,        "!(Ljava/lang/Object;Z)Ljava/lang/Object;"),
+  NATIVE_METHOD(Field, getBoolean, "!(Ljava/lang/Object;Z)Z"),
+  NATIVE_METHOD(Field, getByte,    "!(Ljava/lang/Object;Z)B"),
+  NATIVE_METHOD(Field, getChar,    "!(Ljava/lang/Object;Z)C"),
+  NATIVE_METHOD(Field, getDouble,  "!(Ljava/lang/Object;Z)D"),
+  NATIVE_METHOD(Field, getFloat,   "!(Ljava/lang/Object;Z)F"),
+  NATIVE_METHOD(Field, getInt,     "!(Ljava/lang/Object;Z)I"),
+  NATIVE_METHOD(Field, getLong,    "!(Ljava/lang/Object;Z)J"),
+  NATIVE_METHOD(Field, getShort,   "!(Ljava/lang/Object;Z)S"),
+  NATIVE_METHOD(Field, set,        "!(Ljava/lang/Object;Ljava/lang/Object;Z)V"),
+  NATIVE_METHOD(Field, setBoolean, "!(Ljava/lang/Object;ZZ)V"),
+  NATIVE_METHOD(Field, setByte,    "!(Ljava/lang/Object;BZ)V"),
+  NATIVE_METHOD(Field, setChar,    "!(Ljava/lang/Object;CZ)V"),
+  NATIVE_METHOD(Field, setDouble,  "!(Ljava/lang/Object;DZ)V"),
+  NATIVE_METHOD(Field, setFloat,   "!(Ljava/lang/Object;FZ)V"),
+  NATIVE_METHOD(Field, setInt,     "!(Ljava/lang/Object;IZ)V"),
+  NATIVE_METHOD(Field, setLong,    "!(Ljava/lang/Object;JZ)V"),
+  NATIVE_METHOD(Field, setShort,   "!(Ljava/lang/Object;SZ)V"),
 };
 
 void register_java_lang_reflect_Field(JNIEnv* env) {

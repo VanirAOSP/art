@@ -14,23 +14,25 @@
  * limitations under the License.
  */
 
-#include "common_test.h"
+#include "utils.h"
+
+#include "common_runtime_test.h"
 #include "mirror/array.h"
 #include "mirror/array-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
 #include "mirror/string.h"
 #include "scoped_thread_state_change.h"
-#include "sirt_ref.h"
-#include "utils.h"
+#include "handle_scope-inl.h"
+
+#include <valgrind.h>
 
 namespace art {
 
 std::string PrettyArguments(const char* signature);
 std::string PrettyReturnType(const char* signature);
 
-class UtilsTest : public CommonTest {
-};
+class UtilsTest : public CommonRuntimeTest {};
 
 TEST_F(UtilsTest, PrettyDescriptor_ArrayReferences) {
   EXPECT_EQ("java.lang.Class[]", PrettyDescriptor("[Ljava/lang/Class;"));
@@ -40,6 +42,18 @@ TEST_F(UtilsTest, PrettyDescriptor_ArrayReferences) {
 TEST_F(UtilsTest, PrettyDescriptor_ScalarReferences) {
   EXPECT_EQ("java.lang.String", PrettyDescriptor("Ljava.lang.String;"));
   EXPECT_EQ("java.lang.String", PrettyDescriptor("Ljava/lang/String;"));
+}
+
+TEST_F(UtilsTest, PrettyDescriptor_Primitive) {
+  EXPECT_EQ("boolean", PrettyDescriptor(Primitive::kPrimBoolean));
+  EXPECT_EQ("byte", PrettyDescriptor(Primitive::kPrimByte));
+  EXPECT_EQ("char", PrettyDescriptor(Primitive::kPrimChar));
+  EXPECT_EQ("short", PrettyDescriptor(Primitive::kPrimShort));
+  EXPECT_EQ("int", PrettyDescriptor(Primitive::kPrimInt));
+  EXPECT_EQ("float", PrettyDescriptor(Primitive::kPrimFloat));
+  EXPECT_EQ("long", PrettyDescriptor(Primitive::kPrimLong));
+  EXPECT_EQ("double", PrettyDescriptor(Primitive::kPrimDouble));
+  EXPECT_EQ("void", PrettyDescriptor(Primitive::kPrimVoid));
 }
 
 TEST_F(UtilsTest, PrettyDescriptor_PrimitiveArrays) {
@@ -93,13 +107,14 @@ TEST_F(UtilsTest, PrettyTypeOf) {
   ScopedObjectAccess soa(Thread::Current());
   EXPECT_EQ("null", PrettyTypeOf(NULL));
 
-  SirtRef<mirror::String> s(soa.Self(), mirror::String::AllocFromModifiedUtf8(soa.Self(), ""));
-  EXPECT_EQ("java.lang.String", PrettyTypeOf(s.get()));
+  StackHandleScope<2> hs(soa.Self());
+  Handle<mirror::String> s(hs.NewHandle(mirror::String::AllocFromModifiedUtf8(soa.Self(), "")));
+  EXPECT_EQ("java.lang.String", PrettyTypeOf(s.Get()));
 
-  SirtRef<mirror::ShortArray> a(soa.Self(), mirror::ShortArray::Alloc(soa.Self(), 2));
-  EXPECT_EQ("short[]", PrettyTypeOf(a.get()));
+  Handle<mirror::ShortArray> a(hs.NewHandle(mirror::ShortArray::Alloc(soa.Self(), 2)));
+  EXPECT_EQ("short[]", PrettyTypeOf(a.Get()));
 
-  mirror::Class* c = class_linker_->FindSystemClass("[Ljava/lang/String;");
+  mirror::Class* c = class_linker_->FindSystemClass(soa.Self(), "[Ljava/lang/String;");
   ASSERT_TRUE(c != NULL);
   mirror::Object* o = mirror::ObjectArray<mirror::String>::Alloc(soa.Self(), c, 0);
   EXPECT_EQ("java.lang.String[]", PrettyTypeOf(o));
@@ -109,7 +124,7 @@ TEST_F(UtilsTest, PrettyTypeOf) {
 TEST_F(UtilsTest, PrettyClass) {
   ScopedObjectAccess soa(Thread::Current());
   EXPECT_EQ("null", PrettyClass(NULL));
-  mirror::Class* c = class_linker_->FindSystemClass("[Ljava/lang/String;");
+  mirror::Class* c = class_linker_->FindSystemClass(soa.Self(), "[Ljava/lang/String;");
   ASSERT_TRUE(c != NULL);
   mirror::Object* o = mirror::ObjectArray<mirror::String>::Alloc(soa.Self(), c, 0);
   EXPECT_EQ("java.lang.Class<java.lang.String[]>", PrettyClass(o->GetClass()));
@@ -118,7 +133,7 @@ TEST_F(UtilsTest, PrettyClass) {
 TEST_F(UtilsTest, PrettyClassAndClassLoader) {
   ScopedObjectAccess soa(Thread::Current());
   EXPECT_EQ("null", PrettyClassAndClassLoader(NULL));
-  mirror::Class* c = class_linker_->FindSystemClass("[Ljava/lang/String;");
+  mirror::Class* c = class_linker_->FindSystemClass(soa.Self(), "[Ljava/lang/String;");
   ASSERT_TRUE(c != NULL);
   mirror::Object* o = mirror::ObjectArray<mirror::String>::Alloc(soa.Self(), c, 0);
   EXPECT_EQ("java.lang.Class<java.lang.String[],null>", PrettyClassAndClassLoader(o->GetClass()));
@@ -128,7 +143,8 @@ TEST_F(UtilsTest, PrettyField) {
   ScopedObjectAccess soa(Thread::Current());
   EXPECT_EQ("null", PrettyField(NULL));
 
-  mirror::Class* java_lang_String = class_linker_->FindSystemClass("Ljava/lang/String;");
+  mirror::Class* java_lang_String = class_linker_->FindSystemClass(soa.Self(),
+                                                                   "Ljava/lang/String;");
 
   mirror::ArtField* f;
   f = java_lang_String->FindDeclaredInstanceField("count", "I");
@@ -167,14 +183,15 @@ TEST_F(UtilsTest, PrettyDuration) {
   EXPECT_EQ("10s", PrettyDuration(10 * one_sec));
   EXPECT_EQ("100s", PrettyDuration(100 * one_sec));
   EXPECT_EQ("1.001s", PrettyDuration(1 * one_sec + one_ms));
-  EXPECT_EQ("1.000001s", PrettyDuration(1 * one_sec + one_us));
-  EXPECT_EQ("1.000000001s", PrettyDuration(1 * one_sec + 1));
+  EXPECT_EQ("1.000001s", PrettyDuration(1 * one_sec + one_us, 6));
+  EXPECT_EQ("1.000000001s", PrettyDuration(1 * one_sec + 1, 9));
+  EXPECT_EQ("1.000s", PrettyDuration(1 * one_sec + one_us, 3));
 
   EXPECT_EQ("1ms", PrettyDuration(1 * one_ms));
   EXPECT_EQ("10ms", PrettyDuration(10 * one_ms));
   EXPECT_EQ("100ms", PrettyDuration(100 * one_ms));
   EXPECT_EQ("1.001ms", PrettyDuration(1 * one_ms + one_us));
-  EXPECT_EQ("1.000001ms", PrettyDuration(1 * one_ms + 1));
+  EXPECT_EQ("1.000001ms", PrettyDuration(1 * one_ms + 1, 6));
 
   EXPECT_EQ("1us", PrettyDuration(1 * one_us));
   EXPECT_EQ("10us", PrettyDuration(10 * one_us));
@@ -197,7 +214,7 @@ TEST_F(UtilsTest, MangleForJni) {
 
 TEST_F(UtilsTest, JniShortName_JniLongName) {
   ScopedObjectAccess soa(Thread::Current());
-  mirror::Class* c = class_linker_->FindSystemClass("Ljava/lang/String;");
+  mirror::Class* c = class_linker_->FindSystemClass(soa.Self(), "Ljava/lang/String;");
   ASSERT_TRUE(c != NULL);
   mirror::ArtMethod* m;
 
@@ -335,18 +352,54 @@ TEST_F(UtilsTest, EndsWith) {
   EXPECT_FALSE(EndsWith("oo", "foo"));
 }
 
-void CheckGetDalvikCacheFilenameOrDie(const char* in, const char* out) {
-  std::string expected(getenv("ANDROID_DATA"));
-  expected += "/dalvik-cache/";
-  expected += out;
-  EXPECT_STREQ(expected.c_str(), GetDalvikCacheFilenameOrDie(in).c_str());
+TEST_F(UtilsTest, GetDalvikCacheFilenameOrDie) {
+  EXPECT_STREQ("/foo/system@app@Foo.apk@classes.dex",
+               GetDalvikCacheFilenameOrDie("/system/app/Foo.apk", "/foo").c_str());
+
+  EXPECT_STREQ("/foo/data@app@foo-1.apk@classes.dex",
+               GetDalvikCacheFilenameOrDie("/data/app/foo-1.apk", "/foo").c_str());
+  EXPECT_STREQ("/foo/system@framework@core.jar@classes.dex",
+               GetDalvikCacheFilenameOrDie("/system/framework/core.jar", "/foo").c_str());
+  EXPECT_STREQ("/foo/system@framework@boot.art",
+               GetDalvikCacheFilenameOrDie("/system/framework/boot.art", "/foo").c_str());
+  EXPECT_STREQ("/foo/system@framework@boot.oat",
+               GetDalvikCacheFilenameOrDie("/system/framework/boot.oat", "/foo").c_str());
 }
 
-TEST_F(UtilsTest, GetDalvikCacheFilenameOrDie) {
-  CheckGetDalvikCacheFilenameOrDie("/system/app/Foo.apk", "system@app@Foo.apk@classes.dex");
-  CheckGetDalvikCacheFilenameOrDie("/data/app/foo-1.apk", "data@app@foo-1.apk@classes.dex");
-  CheckGetDalvikCacheFilenameOrDie("/system/framework/core.jar", "system@framework@core.jar@classes.dex");
-  CheckGetDalvikCacheFilenameOrDie("/system/framework/boot.art", "system@framework@boot.art");
+TEST_F(UtilsTest, GetSystemImageFilename) {
+  EXPECT_STREQ("/system/framework/arm/boot.art",
+               GetSystemImageFilename("/system/framework/boot.art", kArm).c_str());
+}
+
+TEST_F(UtilsTest, DexFilenameToOdexFilename) {
+  EXPECT_STREQ("/foo/bar/arm/baz.odex",
+               DexFilenameToOdexFilename("/foo/bar/baz.jar", kArm).c_str());
+}
+
+TEST_F(UtilsTest, ExecSuccess) {
+  std::vector<std::string> command;
+  if (kIsTargetBuild) {
+    command.push_back("/system/bin/id");
+  } else {
+    command.push_back("/usr/bin/id");
+  }
+  std::string error_msg;
+  if (RUNNING_ON_VALGRIND == 0) {
+    // Running on valgrind fails due to some memory that leaks in thread alternate signal stacks.
+    EXPECT_TRUE(Exec(command, &error_msg));
+  }
+  EXPECT_EQ(0U, error_msg.size()) << error_msg;
+}
+
+TEST_F(UtilsTest, ExecError) {
+  std::vector<std::string> command;
+  command.push_back("bogus");
+  std::string error_msg;
+  if (RUNNING_ON_VALGRIND == 0) {
+    // Running on valgrind fails due to some memory that leaks in thread alternate signal stacks.
+    EXPECT_FALSE(Exec(command, &error_msg));
+    EXPECT_NE(0U, error_msg.size());
+  }
 }
 
 }  // namespace art

@@ -14,8 +14,18 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <memory>
+
 #include "compiler_internals.h"
 #include "dataflow_iterator-inl.h"
+#include "dex_instruction.h"
+#include "dex_instruction-inl.h"
+#include "dex/verified_method.h"
+#include "dex/quick/dex_file_method_inliner.h"
+#include "dex/quick/dex_file_to_method_inliner_map.h"
+#include "driver/compiler_options.h"
+#include "utils/scoped_arena_containers.h"
 
 namespace art {
 
@@ -864,7 +874,7 @@ void MIRGraph::AnalyzeBlock(BasicBlock* bb, MethodStats* stats) {
   if (ending_bb->last_mir_insn != NULL) {
     uint32_t ending_flags = analysis_attributes_[ending_bb->last_mir_insn->dalvikInsn.opcode];
     while ((ending_flags & AN_BRANCH) == 0) {
-      ending_bb = ending_bb->fall_through;
+      ending_bb = GetBasicBlock(ending_bb->fall_through);
       ending_flags = analysis_attributes_[ending_bb->last_mir_insn->dalvikInsn.opcode];
     }
   }
@@ -876,13 +886,14 @@ void MIRGraph::AnalyzeBlock(BasicBlock* bb, MethodStats* stats) {
    */
   int loop_scale_factor = 1;
   // Simple for and while loops
-  if ((ending_bb->taken != NULL) && (ending_bb->fall_through == NULL)) {
-    if ((ending_bb->taken->taken == bb) || (ending_bb->taken->fall_through == bb)) {
+  if ((ending_bb->taken != NullBasicBlockId) && (ending_bb->fall_through == NullBasicBlockId)) {
+    if ((GetBasicBlock(ending_bb->taken)->taken == bb->id) ||
+        (GetBasicBlock(ending_bb->taken)->fall_through == bb->id)) {
       loop_scale_factor = 25;
     }
   }
   // Simple do-while loop
-  if ((ending_bb->taken != NULL) && (ending_bb->taken == bb)) {
+  if ((ending_bb->taken != NullBasicBlockId) && (ending_bb->taken == bb->id)) {
     loop_scale_factor = 25;
   }
 
@@ -891,7 +902,7 @@ void MIRGraph::AnalyzeBlock(BasicBlock* bb, MethodStats* stats) {
   while (!done) {
     tbb->visited = true;
     for (MIR* mir = tbb->first_mir_insn; mir != NULL; mir = mir->next) {
-      if (static_cast<uint32_t>(mir->dalvikInsn.opcode) >= kMirOpFirst) {
+      if (MIR::DecodedInstruction::IsPseudoMirOp(mir->dalvikInsn.opcode)) {
         // Skip any MIR pseudo-op.
         continue;
       }
@@ -922,7 +933,7 @@ void MIRGraph::AnalyzeBlock(BasicBlock* bb, MethodStats* stats) {
     if (tbb == ending_bb) {
       done = true;
     } else {
-      tbb = tbb->fall_through;
+      tbb = GetBasicBlock(tbb->fall_through);
     }
   }
   if (has_math && computational_block && (loop_scale_factor > 1)) {
@@ -930,7 +941,8 @@ void MIRGraph::AnalyzeBlock(BasicBlock* bb, MethodStats* stats) {
   }
 }
 
-bool MIRGraph::ComputeSkipCompilation(MethodStats* stats, bool skip_default) {
+bool MIRGraph::ComputeSkipCompilation(MethodStats* stats, bool skip_default,
+                                      std::string* skip_message) {
   float count = stats->dex_instructions;
   stats->math_ratio = stats->math_ops / count;
   stats->fp_ratio = stats->fp_ops / count;
@@ -955,7 +967,7 @@ bool MIRGraph::ComputeSkipCompilation(MethodStats* stats, bool skip_default) {
   }
 
   // Complex, logic-intensive?
-  if ((GetNumDalvikInsns() > Runtime::Current()->GetSmallMethodThreshold()) &&
+  if (cu_->compiler_driver->GetCompilerOptions().IsSmallMethod(GetNumDalvikInsns()) &&
       stats->branch_ratio > 0.3) {
     return false;
   }
@@ -981,8 +993,10 @@ bool MIRGraph::ComputeSkipCompilation(MethodStats* stats, bool skip_default) {
   }
 
   // If significant in size and high proportion of expensive operations, skip.
-  if ((GetNumDalvikInsns() > Runtime::Current()->GetSmallMethodThreshold()) &&
+  if (cu_->compiler_driver->GetCompilerOptions().IsSmallMethod(GetNumDalvikInsns()) &&
       (stats->heavyweight_ratio > 0.3)) {
+    *skip_message = "Is a small method with heavyweight ratio " +
+                    std::to_string(stats->heavyweight_ratio);
     return true;
   }
 
@@ -991,15 +1005,22 @@ bool MIRGraph::ComputeSkipCompilation(MethodStats* stats, bool skip_default) {
 
  /*
   * Will eventually want this to be a bit more sophisticated and happen at verification time.
-  * Ultimate goal is to drive with profile data.
   */
-bool MIRGraph::SkipCompilation(Runtime::CompilerFilter compiler_filter) {
-  if (compiler_filter == Runtime::kEverything) {
+bool MIRGraph::SkipCompilation(std::string* skip_message) {
+  const CompilerOptions& compiler_options = cu_->compiler_driver->GetCompilerOptions();
+  CompilerOptions::CompilerFilter compiler_filter = compiler_options.GetCompilerFilter();
+  if (compiler_filter == CompilerOptions::kEverything) {
     return false;
   }
 
-  if (compiler_filter == Runtime::kInterpretOnly) {
-    LOG(WARNING) << "InterpretOnly should ideally be filtered out prior to parsing.";
+  // Contains a pattern we don't want to compile?
+  if (PuntToInterpreter()) {
+    *skip_message = "Punt to interpreter set";
+    return true;
+  }
+
+  if (!compiler_options.IsCompilationEnabled()) {
+    *skip_message = "Compilation disabled";
     return true;
   }
 
@@ -1007,17 +1028,17 @@ bool MIRGraph::SkipCompilation(Runtime::CompilerFilter compiler_filter) {
   size_t small_cutoff = 0;
   size_t default_cutoff = 0;
   switch (compiler_filter) {
-    case Runtime::kBalanced:
-      small_cutoff = Runtime::Current()->GetSmallMethodThreshold();
-      default_cutoff = Runtime::Current()->GetLargeMethodThreshold();
+    case CompilerOptions::kBalanced:
+      small_cutoff = compiler_options.GetSmallMethodThreshold();
+      default_cutoff = compiler_options.GetLargeMethodThreshold();
       break;
-    case Runtime::kSpace:
-      small_cutoff = Runtime::Current()->GetTinyMethodThreshold();
-      default_cutoff = Runtime::Current()->GetSmallMethodThreshold();
+    case CompilerOptions::kSpace:
+      small_cutoff = compiler_options.GetTinyMethodThreshold();
+      default_cutoff = compiler_options.GetSmallMethodThreshold();
       break;
-    case Runtime::kSpeed:
-      small_cutoff = Runtime::Current()->GetHugeMethodThreshold();
-      default_cutoff = Runtime::Current()->GetHugeMethodThreshold();
+    case CompilerOptions::kSpeed:
+      small_cutoff = compiler_options.GetHugeMethodThreshold();
+      default_cutoff = compiler_options.GetHugeMethodThreshold();
       break;
     default:
       LOG(FATAL) << "Unexpected compiler_filter_: " << compiler_filter;
@@ -1025,25 +1046,41 @@ bool MIRGraph::SkipCompilation(Runtime::CompilerFilter compiler_filter) {
 
   // If size < cutoff, assume we'll compile - but allow removal.
   bool skip_compilation = (GetNumDalvikInsns() >= default_cutoff);
+  if (skip_compilation) {
+    *skip_message = "#Insns >= default_cutoff: " + std::to_string(GetNumDalvikInsns());
+  }
 
   /*
    * Filter 1: Huge methods are likely to be machine generated, but some aren't.
    * If huge, assume we won't compile, but allow futher analysis to turn it back on.
    */
-  if (GetNumDalvikInsns() > Runtime::Current()->GetHugeMethodThreshold()) {
+  if (compiler_options.IsHugeMethod(GetNumDalvikInsns())) {
     skip_compilation = true;
-  } else if (compiler_filter == Runtime::kSpeed) {
+    *skip_message = "Huge method: " + std::to_string(GetNumDalvikInsns());
+    // If we're got a huge number of basic blocks, don't bother with further analysis.
+    if (static_cast<size_t>(num_blocks_) > (compiler_options.GetHugeMethodThreshold() / 2)) {
+      return true;
+    }
+  } else if (compiler_options.IsLargeMethod(GetNumDalvikInsns()) &&
+    /* If it's large and contains no branches, it's likely to be machine generated initialization */
+      (GetBranchCount() == 0)) {
+    *skip_message = "Large method with no branches";
+    return true;
+  } else if (compiler_filter == CompilerOptions::kSpeed) {
     // If not huge, compile.
     return false;
   }
 
   // Filter 2: Skip class initializers.
   if (((cu_->access_flags & kAccConstructor) != 0) && ((cu_->access_flags & kAccStatic) != 0)) {
+    *skip_message = "Class initializer";
     return true;
   }
 
   // Filter 3: if this method is a special pattern, go ahead and emit the canned pattern.
-  if (IsSpecialCase()) {
+  if (cu_->compiler_driver->GetMethodInlinerMap() != nullptr &&
+      cu_->compiler_driver->GetMethodInlinerMap()->GetMethodInliner(cu_->dex_file)
+          ->IsSpecial(cu_->method_idx)) {
     return false;
   }
 
@@ -1061,12 +1098,206 @@ bool MIRGraph::SkipCompilation(Runtime::CompilerFilter compiler_filter) {
   memset(&stats, 0, sizeof(stats));
 
   ClearAllVisitedFlags();
-  AllNodesIterator iter(this, false /* not iterative */);
+  AllNodesIterator iter(this);
   for (BasicBlock* bb = iter.Next(); bb != NULL; bb = iter.Next()) {
     AnalyzeBlock(bb, &stats);
   }
 
-  return ComputeSkipCompilation(&stats, skip_compilation);
+  return ComputeSkipCompilation(&stats, skip_compilation, skip_message);
+}
+
+void MIRGraph::DoCacheFieldLoweringInfo() {
+  // All IGET/IPUT/SGET/SPUT instructions take 2 code units and there must also be a RETURN.
+  const uint32_t max_refs = (current_code_item_->insns_size_in_code_units_ - 1u) / 2u;
+  ScopedArenaAllocator allocator(&cu_->arena_stack);
+  uint16_t* field_idxs =
+      reinterpret_cast<uint16_t*>(allocator.Alloc(max_refs * sizeof(uint16_t), kArenaAllocMisc));
+
+  // Find IGET/IPUT/SGET/SPUT insns, store IGET/IPUT fields at the beginning, SGET/SPUT at the end.
+  size_t ifield_pos = 0u;
+  size_t sfield_pos = max_refs;
+  AllNodesIterator iter(this);
+  for (BasicBlock* bb = iter.Next(); bb != nullptr; bb = iter.Next()) {
+    if (bb->block_type != kDalvikByteCode) {
+      continue;
+    }
+    for (MIR* mir = bb->first_mir_insn; mir != nullptr; mir = mir->next) {
+      if (mir->dalvikInsn.opcode >= Instruction::IGET &&
+          mir->dalvikInsn.opcode <= Instruction::SPUT_SHORT) {
+        const Instruction* insn = Instruction::At(current_code_item_->insns_ + mir->offset);
+        // Get field index and try to find it among existing indexes. If found, it's usually among
+        // the last few added, so we'll start the search from ifield_pos/sfield_pos. Though this
+        // is a linear search, it actually performs much better than map based approach.
+        if (mir->dalvikInsn.opcode <= Instruction::IPUT_SHORT) {
+          uint16_t field_idx = insn->VRegC_22c();
+          size_t i = ifield_pos;
+          while (i != 0u && field_idxs[i - 1] != field_idx) {
+            --i;
+          }
+          if (i != 0u) {
+            mir->meta.ifield_lowering_info = i - 1;
+          } else {
+            mir->meta.ifield_lowering_info = ifield_pos;
+            field_idxs[ifield_pos++] = field_idx;
+          }
+        } else {
+          uint16_t field_idx = insn->VRegB_21c();
+          size_t i = sfield_pos;
+          while (i != max_refs && field_idxs[i] != field_idx) {
+            ++i;
+          }
+          if (i != max_refs) {
+            mir->meta.sfield_lowering_info = max_refs - i - 1u;
+          } else {
+            mir->meta.sfield_lowering_info = max_refs - sfield_pos;
+            field_idxs[--sfield_pos] = field_idx;
+          }
+        }
+        DCHECK_LE(ifield_pos, sfield_pos);
+      }
+    }
+  }
+
+  if (ifield_pos != 0u) {
+    // Resolve instance field infos.
+    DCHECK_EQ(ifield_lowering_infos_.Size(), 0u);
+    ifield_lowering_infos_.Resize(ifield_pos);
+    for (size_t pos = 0u; pos != ifield_pos; ++pos) {
+      ifield_lowering_infos_.Insert(MirIFieldLoweringInfo(field_idxs[pos]));
+    }
+    MirIFieldLoweringInfo::Resolve(cu_->compiler_driver, GetCurrentDexCompilationUnit(),
+                                ifield_lowering_infos_.GetRawStorage(), ifield_pos);
+  }
+
+  if (sfield_pos != max_refs) {
+    // Resolve static field infos.
+    DCHECK_EQ(sfield_lowering_infos_.Size(), 0u);
+    sfield_lowering_infos_.Resize(max_refs - sfield_pos);
+    for (size_t pos = max_refs; pos != sfield_pos;) {
+      --pos;
+      sfield_lowering_infos_.Insert(MirSFieldLoweringInfo(field_idxs[pos]));
+    }
+    MirSFieldLoweringInfo::Resolve(cu_->compiler_driver, GetCurrentDexCompilationUnit(),
+                                sfield_lowering_infos_.GetRawStorage(), max_refs - sfield_pos);
+  }
+}
+
+void MIRGraph::DoCacheMethodLoweringInfo() {
+  static constexpr uint16_t invoke_types[] = { kVirtual, kSuper, kDirect, kStatic, kInterface };
+
+  // Embed the map value in the entry to avoid extra padding in 64-bit builds.
+  struct MapEntry {
+    // Map key: target_method_idx, invoke_type, devirt_target. Ordered to avoid padding.
+    const MethodReference* devirt_target;
+    uint16_t target_method_idx;
+    uint16_t invoke_type;
+    // Map value.
+    uint32_t lowering_info_index;
+  };
+
+  // Sort INVOKEs by method index, then by opcode, then by devirtualization target.
+  struct MapEntryComparator {
+    bool operator()(const MapEntry& lhs, const MapEntry& rhs) const {
+      if (lhs.target_method_idx != rhs.target_method_idx) {
+        return lhs.target_method_idx < rhs.target_method_idx;
+      }
+      if (lhs.invoke_type != rhs.invoke_type) {
+        return lhs.invoke_type < rhs.invoke_type;
+      }
+      if (lhs.devirt_target != rhs.devirt_target) {
+        if (lhs.devirt_target == nullptr) {
+          return true;
+        }
+        if (rhs.devirt_target == nullptr) {
+          return false;
+        }
+        return devirt_cmp(*lhs.devirt_target, *rhs.devirt_target);
+      }
+      return false;
+    }
+    MethodReferenceComparator devirt_cmp;
+  };
+
+  ScopedArenaAllocator allocator(&cu_->arena_stack);
+
+  // All INVOKE instructions take 3 code units and there must also be a RETURN.
+  uint32_t max_refs = (current_code_item_->insns_size_in_code_units_ - 1u) / 3u;
+
+  // Map invoke key (see MapEntry) to lowering info index and vice versa.
+  // The invoke_map and sequential entries are essentially equivalent to Boost.MultiIndex's
+  // multi_index_container with one ordered index and one sequential index.
+  ScopedArenaSet<MapEntry, MapEntryComparator> invoke_map(MapEntryComparator(),
+                                                          allocator.Adapter());
+  const MapEntry** sequential_entries = reinterpret_cast<const MapEntry**>(
+      allocator.Alloc(max_refs * sizeof(sequential_entries[0]), kArenaAllocMisc));
+
+  // Find INVOKE insns and their devirtualization targets.
+  AllNodesIterator iter(this);
+  for (BasicBlock* bb = iter.Next(); bb != nullptr; bb = iter.Next()) {
+    if (bb->block_type != kDalvikByteCode) {
+      continue;
+    }
+    for (MIR* mir = bb->first_mir_insn; mir != nullptr; mir = mir->next) {
+      if (mir->dalvikInsn.opcode >= Instruction::INVOKE_VIRTUAL &&
+          mir->dalvikInsn.opcode <= Instruction::INVOKE_INTERFACE_RANGE &&
+          mir->dalvikInsn.opcode != Instruction::RETURN_VOID_BARRIER) {
+        // Decode target method index and invoke type.
+        const Instruction* insn = Instruction::At(current_code_item_->insns_ + mir->offset);
+        uint16_t target_method_idx;
+        uint16_t invoke_type_idx;
+        if (mir->dalvikInsn.opcode <= Instruction::INVOKE_INTERFACE) {
+          target_method_idx = insn->VRegB_35c();
+          invoke_type_idx = mir->dalvikInsn.opcode - Instruction::INVOKE_VIRTUAL;
+        } else {
+          target_method_idx = insn->VRegB_3rc();
+          invoke_type_idx = mir->dalvikInsn.opcode - Instruction::INVOKE_VIRTUAL_RANGE;
+        }
+
+        // Find devirtualization target.
+        // TODO: The devirt map is ordered by the dex pc here. Is there a way to get INVOKEs
+        // ordered by dex pc as well? That would allow us to keep an iterator to devirt targets
+        // and increment it as needed instead of making O(log n) lookups.
+        const VerifiedMethod* verified_method = GetCurrentDexCompilationUnit()->GetVerifiedMethod();
+        const MethodReference* devirt_target = verified_method->GetDevirtTarget(mir->offset);
+
+        // Try to insert a new entry. If the insertion fails, we will have found an old one.
+        MapEntry entry = {
+            devirt_target,
+            target_method_idx,
+            invoke_types[invoke_type_idx],
+            static_cast<uint32_t>(invoke_map.size())
+        };
+        auto it = invoke_map.insert(entry).first;  // Iterator to either the old or the new entry.
+        mir->meta.method_lowering_info = it->lowering_info_index;
+        // If we didn't actually insert, this will just overwrite an existing value with the same.
+        sequential_entries[it->lowering_info_index] = &*it;
+      }
+    }
+  }
+
+  if (invoke_map.empty()) {
+    return;
+  }
+
+  // Prepare unique method infos, set method info indexes for their MIRs.
+  DCHECK_EQ(method_lowering_infos_.Size(), 0u);
+  const size_t count = invoke_map.size();
+  method_lowering_infos_.Resize(count);
+  for (size_t pos = 0u; pos != count; ++pos) {
+    const MapEntry* entry = sequential_entries[pos];
+    MirMethodLoweringInfo method_info(entry->target_method_idx,
+                                      static_cast<InvokeType>(entry->invoke_type));
+    if (entry->devirt_target != nullptr) {
+      method_info.SetDevirtualizationTarget(*entry->devirt_target);
+    }
+    method_lowering_infos_.Insert(method_info);
+  }
+  MirMethodLoweringInfo::Resolve(cu_->compiler_driver, GetCurrentDexCompilationUnit(),
+                                 method_lowering_infos_.GetRawStorage(), count);
+}
+
+bool MIRGraph::SkipCompilationByName(const std::string& methodname) {
+  return cu_->compiler_driver->SkipCompilation(methodname);
 }
 
 }  // namespace art

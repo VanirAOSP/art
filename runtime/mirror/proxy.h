@@ -17,7 +17,7 @@
 #ifndef ART_RUNTIME_MIRROR_PROXY_H_
 #define ART_RUNTIME_MIRROR_PROXY_H_
 
-#include "mirror/object.h"
+#include "object.h"
 
 namespace art {
 
@@ -25,28 +25,10 @@ struct ProxyOffsets;
 
 namespace mirror {
 
-// All proxy objects have a class which is a synthesized proxy class. The synthesized proxy class
-// has the static fields used to implement reflection on proxy objects.
-class MANAGED SynthesizedProxyClass : public Class {
- public:
-  ObjectArray<Class>* GetInterfaces() {
-    return interfaces_;
-  }
-
-  ObjectArray<ObjectArray<Class> >* GetThrows() {
-    return throws_;
-  }
-
- private:
-  ObjectArray<Class>* interfaces_;
-  ObjectArray<ObjectArray<Class> >* throws_;
-  DISALLOW_IMPLICIT_CONSTRUCTORS(SynthesizedProxyClass);
-};
-
 // C++ mirror of java.lang.reflect.Proxy.
-class MANAGED Proxy : public Object {
+class MANAGED Proxy FINAL : public Object {
  private:
-  Object* h_;
+  HeapReference<Object> h_;
 
   friend struct art::ProxyOffsets;  // for verifying offset information
   DISALLOW_IMPLICIT_CONSTRUCTORS(Proxy);

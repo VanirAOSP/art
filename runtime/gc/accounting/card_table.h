@@ -17,10 +17,11 @@
 #ifndef ART_RUNTIME_GC_ACCOUNTING_CARD_TABLE_H_
 #define ART_RUNTIME_GC_ACCOUNTING_CARD_TABLE_H_
 
+#include <memory>
+
+#include "base/mutex.h"
 #include "globals.h"
-#include "locks.h"
 #include "mem_map.h"
-#include "UniquePtr.h"
 
 namespace art {
 
@@ -38,17 +39,17 @@ class Heap;
 
 namespace accounting {
 
-class SpaceBitmap;
+template<size_t kAlignment> class SpaceBitmap;
 
 // Maintain a card table from the the write barrier. All writes of
 // non-NULL values to heap addresses should go through an entry in
 // WriteBarrier, and from there to here.
 class CardTable {
  public:
-  static const size_t kCardShift = 7;
-  static const size_t kCardSize = (1 << kCardShift);
-  static const uint8_t kCardClean = 0x0;
-  static const uint8_t kCardDirty = 0x70;
+  static constexpr size_t kCardShift = 7;
+  static constexpr size_t kCardSize = 1 << kCardShift;
+  static constexpr uint8_t kCardClean = 0x0;
+  static constexpr uint8_t kCardDirty = 0x70;
 
   static CardTable* Create(const byte* heap_begin, size_t heap_capacity);
 
@@ -102,7 +103,8 @@ class CardTable {
   // For every dirty at least minumum age between begin and end invoke the visitor with the
   // specified argument. Returns how many cards the visitor was run on.
   template <typename Visitor>
-  size_t Scan(SpaceBitmap* bitmap, byte* scan_begin, byte* scan_end, const Visitor& visitor,
+  size_t Scan(SpaceBitmap<kObjectAlignment>* bitmap, byte* scan_begin, byte* scan_end,
+              const Visitor& visitor,
               const byte minimum_age = kCardDirty) const
       EXCLUSIVE_LOCKS_REQUIRED(Locks::heap_bitmap_lock_)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -140,7 +142,7 @@ class CardTable {
   void VerifyCardTable();
 
   // Mmapped pages for the card table
-  UniquePtr<MemMap> mem_map_;
+  std::unique_ptr<MemMap> mem_map_;
   // Value used to compute card table addresses from object addresses, see GetBiasedBegin
   byte* const biased_begin_;
   // Card table doesn't begin at the beginning of the mem_map_, instead it is displaced by offset

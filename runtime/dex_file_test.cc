@@ -16,17 +16,94 @@
 
 #include "dex_file.h"
 
-#include "UniquePtr.h"
-#include "common_test.h"
+#include <memory>
+
+#include "base/stl_util.h"
+#include "base/unix_file/fd_file.h"
+#include "common_runtime_test.h"
+#include "os.h"
+#include "scoped_thread_state_change.h"
+#include "thread-inl.h"
 
 namespace art {
 
-class DexFileTest : public CommonTest {};
+class DexFileTest : public CommonRuntimeTest {};
 
 TEST_F(DexFileTest, Open) {
   ScopedObjectAccess soa(Thread::Current());
   const DexFile* dex(OpenTestDexFile("Nested"));
   ASSERT_TRUE(dex != NULL);
+}
+
+static const byte kBase64Map[256] = {
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255,  62, 255, 255, 255,  63,
+  52,  53,  54,  55,  56,  57,  58,  59,  60,  61, 255, 255,
+  255, 254, 255, 255, 255,   0,   1,   2,   3,   4,   5,   6,
+    7,   8,   9,  10,  11,  12,  13,  14,  15,  16,  17,  18,  // NOLINT
+   19,  20,  21,  22,  23,  24,  25, 255, 255, 255, 255, 255,  // NOLINT
+  255,  26,  27,  28,  29,  30,  31,  32,  33,  34,  35,  36,
+   37,  38,  39,  40,  41,  42,  43,  44,  45,  46,  47,  48,  // NOLINT
+   49,  50,  51, 255, 255, 255, 255, 255, 255, 255, 255, 255,  // NOLINT
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255,
+  255, 255, 255, 255
+};
+
+static inline byte* DecodeBase64(const char* src, size_t* dst_size) {
+  std::vector<byte> tmp;
+  uint32_t t = 0, y = 0;
+  int g = 3;
+  for (size_t i = 0; src[i] != '\0'; ++i) {
+    byte c = kBase64Map[src[i] & 0xFF];
+    if (c == 255) continue;
+    // the final = symbols are read and used to trim the remaining bytes
+    if (c == 254) {
+      c = 0;
+      // prevent g < 0 which would potentially allow an overflow later
+      if (--g < 0) {
+        *dst_size = 0;
+        return nullptr;
+      }
+    } else if (g != 3) {
+      // we only allow = to be at the end
+      *dst_size = 0;
+      return nullptr;
+    }
+    t = (t << 6) | c;
+    if (++y == 4) {
+      tmp.push_back((t >> 16) & 255);
+      if (g > 1) {
+        tmp.push_back((t >> 8) & 255);
+      }
+      if (g > 2) {
+        tmp.push_back(t & 255);
+      }
+      y = t = 0;
+    }
+  }
+  if (y != 0) {
+    *dst_size = 0;
+    return nullptr;
+  }
+  std::unique_ptr<byte[]> dst(new byte[tmp.size()]);
+  if (dst_size != nullptr) {
+    *dst_size = tmp.size();
+  } else {
+    *dst_size = 0;
+  }
+  std::copy(tmp.begin(), tmp.end(), dst.get());
+  return dst.release();
 }
 
 // Although this is the same content logically as the Nested test dex,
@@ -56,15 +133,15 @@ static const char kRawDex[] =
   "AAMgAAACAAAAiAIAAAQgAAADAAAAlAIAAAAgAAACAAAAqwIAAAAQAAABAAAAxAIAAA==";
 
 static const DexFile* OpenDexFileBase64(const char* base64,
-                                        const std::string& location) {
+                                        const char* location) {
   // decode base64
   CHECK(base64 != NULL);
   size_t length;
-  UniquePtr<byte[]> dex_bytes(DecodeBase64(base64, &length));
+  std::unique_ptr<byte[]> dex_bytes(DecodeBase64(base64, &length));
   CHECK(dex_bytes.get() != NULL);
 
   // write to provided file
-  UniquePtr<File> file(OS::CreateEmptyFile(location.c_str()));
+  std::unique_ptr<File> file(OS::CreateEmptyFile(location));
   CHECK(file.get() != NULL);
   if (!file->WriteFully(dex_bytes.get(), length)) {
     PLOG(FATAL) << "Failed to write base64 as dex file";
@@ -73,8 +150,12 @@ static const DexFile* OpenDexFileBase64(const char* base64,
 
   // read dex file
   ScopedObjectAccess soa(Thread::Current());
-  const DexFile* dex_file = DexFile::Open(location, location);
-  CHECK(dex_file != NULL);
+  std::string error_msg;
+  std::vector<const DexFile*> tmp;
+  bool success = DexFile::Open(location, location, &error_msg, &tmp);
+  CHECK(success) << error_msg;
+  EXPECT_EQ(1U, tmp.size());
+  const DexFile* dex_file = tmp[0];
   EXPECT_EQ(PROT_READ, dex_file->GetPermissions());
   EXPECT_TRUE(dex_file->IsReadOnly());
   return dex_file;
@@ -82,7 +163,7 @@ static const DexFile* OpenDexFileBase64(const char* base64,
 
 TEST_F(DexFileTest, Header) {
   ScratchFile tmp;
-  UniquePtr<const DexFile> raw(OpenDexFileBase64(kRawDex, tmp.GetFilename()));
+  std::unique_ptr<const DexFile> raw(OpenDexFileBase64(kRawDex, tmp.GetFilename().c_str()));
   ASSERT_TRUE(raw.get() != NULL);
 
   const DexFile::Header& header = raw->GetHeader();
@@ -120,7 +201,9 @@ TEST_F(DexFileTest, GetLocationChecksum) {
 TEST_F(DexFileTest, GetChecksum) {
   uint32_t checksum;
   ScopedObjectAccess soa(Thread::Current());
-  EXPECT_TRUE(DexFile::GetChecksum(GetLibCoreDexFileName(), &checksum));
+  std::string error_msg;
+  EXPECT_TRUE(DexFile::GetChecksum(GetLibCoreDexFileName().c_str(), &checksum, &error_msg))
+      << error_msg;
   EXPECT_EQ(java_lang_dex_file_->GetLocationChecksum(), checksum);
 }
 
@@ -137,14 +220,14 @@ TEST_F(DexFileTest, ClassDefs) {
   EXPECT_STREQ("LNested;", raw->GetClassDescriptor(c1));
 }
 
-TEST_F(DexFileTest, CreateMethodSignature) {
+TEST_F(DexFileTest, GetMethodSignature) {
   ScopedObjectAccess soa(Thread::Current());
-  const DexFile* raw(OpenTestDexFile("CreateMethodSignature"));
+  const DexFile* raw(OpenTestDexFile("GetMethodSignature"));
   ASSERT_TRUE(raw != NULL);
   EXPECT_EQ(1U, raw->NumClassDefs());
 
   const DexFile::ClassDef& class_def = raw->GetClassDef(0);
-  ASSERT_STREQ("LCreateMethodSignature;", raw->GetClassDescriptor(class_def));
+  ASSERT_STREQ("LGetMethodSignature;", raw->GetClassDescriptor(class_def));
 
   const byte* class_data = raw->GetClassData(class_def);
   ASSERT_TRUE(class_data != NULL);
@@ -156,11 +239,9 @@ TEST_F(DexFileTest, CreateMethodSignature) {
   {
     ASSERT_EQ(1U, it.NumDirectMethods());
     const DexFile::MethodId& method_id = raw->GetMethodId(it.GetMemberIndex());
-    uint32_t proto_idx = method_id.proto_idx_;
     const char* name = raw->StringDataByIdx(method_id.name_idx_);
     ASSERT_STREQ("<init>", name);
-    int32_t length;
-    std::string signature(raw->CreateMethodSignature(proto_idx, &length));
+    std::string signature(raw->GetMethodSignature(method_id).ToString());
     ASSERT_EQ("()V", signature);
   }
 
@@ -173,9 +254,7 @@ TEST_F(DexFileTest, CreateMethodSignature) {
     const char* name = raw->StringDataByIdx(method_id.name_idx_);
     ASSERT_STREQ("m1", name);
 
-    uint32_t proto_idx = method_id.proto_idx_;
-    int32_t length;
-    std::string signature(raw->CreateMethodSignature(proto_idx, &length));
+    std::string signature(raw->GetMethodSignature(method_id).ToString());
     ASSERT_EQ("(IDJLjava/lang/Object;)Ljava/lang/Float;", signature);
   }
 
@@ -186,20 +265,18 @@ TEST_F(DexFileTest, CreateMethodSignature) {
     const char* name = raw->StringDataByIdx(method_id.name_idx_);
     ASSERT_STREQ("m2", name);
 
-    uint32_t proto_idx = method_id.proto_idx_;
-    int32_t length;
-    std::string signature(raw->CreateMethodSignature(proto_idx, &length));
-    ASSERT_EQ("(ZSC)LCreateMethodSignature;", signature);
+    std::string signature(raw->GetMethodSignature(method_id).ToString());
+    ASSERT_EQ("(ZSC)LGetMethodSignature;", signature);
   }
 }
 
 TEST_F(DexFileTest, FindStringId) {
   ScopedObjectAccess soa(Thread::Current());
-  const DexFile* raw(OpenTestDexFile("CreateMethodSignature"));
+  const DexFile* raw(OpenTestDexFile("GetMethodSignature"));
   ASSERT_TRUE(raw != NULL);
   EXPECT_EQ(1U, raw->NumClassDefs());
 
-  const char* strings[] = { "LCreateMethodSignature;", "Ljava/lang/Float;", "Ljava/lang/Object;",
+  const char* strings[] = { "LGetMethodSignature;", "Ljava/lang/Float;", "Ljava/lang/Object;",
       "D", "I", "J", NULL };
   for (size_t i = 0; strings[i] != NULL; i++) {
     const char* str = strings[i];
@@ -245,11 +322,10 @@ TEST_F(DexFileTest, FindMethodId) {
     const DexFile::StringId& name = java_lang_dex_file_->GetStringId(to_find.name_idx_);
     const DexFile::ProtoId& signature = java_lang_dex_file_->GetProtoId(to_find.proto_idx_);
     const DexFile::MethodId* found = java_lang_dex_file_->FindMethodId(klass, name, signature);
-    int32_t length;
     ASSERT_TRUE(found != NULL) << "Didn't find method " << i << ": "
         << java_lang_dex_file_->StringByTypeIdx(to_find.class_idx_) << "."
         << java_lang_dex_file_->GetStringData(name)
-        << java_lang_dex_file_->CreateMethodSignature(to_find.proto_idx_, &length);
+        << java_lang_dex_file_->GetMethodSignature(to_find);
     EXPECT_EQ(java_lang_dex_file_->GetIndexForMethodId(*found), i);
   }
 }
@@ -267,6 +343,34 @@ TEST_F(DexFileTest, FindFieldId) {
         << java_lang_dex_file_->GetStringData(name);
     EXPECT_EQ(java_lang_dex_file_->GetIndexForFieldId(*found), i);
   }
+}
+
+TEST_F(DexFileTest, GetMultiDexClassesDexName) {
+  std::string dex_location_str = "/system/app/framework.jar";
+  const char* dex_location = dex_location_str.c_str();
+  ASSERT_EQ("/system/app/framework.jar", DexFile::GetMultiDexClassesDexName(0, dex_location));
+  ASSERT_EQ("/system/app/framework.jar:classes2.dex", DexFile::GetMultiDexClassesDexName(1, dex_location));
+  ASSERT_EQ("/system/app/framework.jar:classes101.dex", DexFile::GetMultiDexClassesDexName(100, dex_location));
+}
+
+TEST_F(DexFileTest, GetDexCanonicalLocation) {
+  ScratchFile file;
+  UniqueCPtr<const char[]> dex_location_real(realpath(file.GetFilename().c_str(), nullptr));
+  std::string dex_location(dex_location_real.get());
+
+  ASSERT_EQ(dex_location, DexFile::GetDexCanonicalLocation(dex_location.c_str()));
+  std::string multidex_location = DexFile::GetMultiDexClassesDexName(1, dex_location.c_str());
+  ASSERT_EQ(multidex_location, DexFile::GetDexCanonicalLocation(multidex_location.c_str()));
+
+  std::string dex_location_sym = dex_location + "symlink";
+  ASSERT_EQ(0, symlink(dex_location.c_str(), dex_location_sym.c_str()));
+
+  ASSERT_EQ(dex_location, DexFile::GetDexCanonicalLocation(dex_location_sym.c_str()));
+
+  std::string multidex_location_sym = DexFile::GetMultiDexClassesDexName(1, dex_location_sym.c_str());
+  ASSERT_EQ(multidex_location, DexFile::GetDexCanonicalLocation(multidex_location_sym.c_str()));
+
+  ASSERT_EQ(0, unlink(dex_location_sym.c_str()));
 }
 
 }  // namespace art

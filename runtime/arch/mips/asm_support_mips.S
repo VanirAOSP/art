@@ -19,6 +19,14 @@
 
 #include "asm_support_mips.h"
 
+// Define special registers.
+
+// Register holding suspend check count down.
+#define rSUSPEND $s0
+// Register holding Thread::Current().
+#define rSELF $s1
+
+
     /* Cache alignment for function entry */
 .macro ENTRY name
     .type \name, %function
@@ -26,6 +34,8 @@
     .balign 16
 \name:
     .cfi_startproc
+     /* Ensure we get a sane starting CFA. */
+    .cfi_def_cfa $sp,0
 .endm
 
 .macro END name

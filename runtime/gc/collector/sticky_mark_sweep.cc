@@ -18,7 +18,7 @@
 #include "gc/space/large_object_space.h"
 #include "gc/space/space.h"
 #include "sticky_mark_sweep.h"
-#include "thread.h"
+#include "thread-inl.h"
 
 namespace art {
 namespace gc {
@@ -26,7 +26,7 @@ namespace collector {
 
 StickyMarkSweep::StickyMarkSweep(Heap* heap, bool is_concurrent, const std::string& name_prefix)
     : PartialMarkSweep(heap, is_concurrent,
-                       name_prefix + (name_prefix.empty() ? "" : " ") + "sticky") {
+                       name_prefix.empty() ? "sticky " : name_prefix) {
   cumulative_timings_.SetName(GetName());
 }
 
@@ -38,31 +38,26 @@ void StickyMarkSweep::BindBitmaps() {
   // know what was allocated since the last GC. A side-effect of binding the allocation space mark
   // and live bitmap is that marking the objects will place them in the live bitmap.
   for (const auto& space : GetHeap()->GetContinuousSpaces()) {
-    if (space->GetGcRetentionPolicy() == space::kGcRetentionPolicyAlwaysCollect) {
-      BindLiveToMarkBitmap(space);
+    if (space->IsContinuousMemMapAllocSpace() &&
+        space->GetGcRetentionPolicy() == space::kGcRetentionPolicyAlwaysCollect) {
+      DCHECK(space->IsContinuousMemMapAllocSpace());
+      space->AsContinuousMemMapAllocSpace()->BindLiveToMarkBitmap();
     }
   }
-
   GetHeap()->GetLargeObjectsSpace()->CopyLiveToMarked();
 }
 
 void StickyMarkSweep::MarkReachableObjects() {
   // All reachable objects must be referenced by a root or a dirty card, so we can clear the mark
-  // stack here since all objects in the mark stack will get scanned by the card scanning anyways.
+  // stack here since all objects in the mark stack will Get scanned by the card scanning anyways.
   // TODO: Not put these objects in the mark stack in the first place.
   mark_stack_->Reset();
   RecursiveMarkDirtyObjects(false, accounting::CardTable::kCardDirty - 1);
 }
 
 void StickyMarkSweep::Sweep(bool swap_bitmaps) {
-  accounting::ObjectStack* live_stack = GetHeap()->GetLiveStack();
-  SweepArray(live_stack, false);
+  SweepArray(GetHeap()->GetLiveStack(), false);
 }
-
-void StickyMarkSweep::MarkThreadRoots(Thread* self) {
-  MarkRootsCheckpoint(self);
-}
-
 
 }  // namespace collector
 }  // namespace gc

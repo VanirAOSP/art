@@ -53,7 +53,7 @@ ENTRY art_portable_invoke_stub
     mov    ip, #0                          @ set ip to 0
     str    ip, [sp]                        @ store NULL for method* at bottom of frame
     add    sp, #16                         @ first 4 args are not passed on stack for portable
-    ldr    ip, [r0, #METHOD_CODE_OFFSET]   @ get pointer to the code
+    ldr    ip, [r0, #METHOD_PORTABLE_CODE_OFFSET]  @ get pointer to the code
     blx    ip                              @ call the method
     mov    sp, r11                         @ restore the stack pointer
     ldr    ip, [sp, #24]                   @ load the result pointer
@@ -138,7 +138,7 @@ ENTRY art_portable_resolution_trampoline
 END art_portable_resolution_trampoline
 
     .extern artPortableToInterpreterBridge
-ENTRY art_portable_to_interpreter_bridge
+ENTRY_NO_HIDE art_portable_to_interpreter_bridge
     @ Fake callee save ref and args frame set up, note portable doesn't use callee save frames.
     @ TODO: just save the registers that are needed in artPortableToInterpreterBridge.
     push {r1-r3, r5-r8, r10-r11, lr}  @ 10 words of callee saves

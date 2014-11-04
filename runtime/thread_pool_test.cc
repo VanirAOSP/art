@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 
+#include "thread_pool.h"
 
 #include <string>
 
-#include "atomic_integer.h"
-#include "common_test.h"
-#include "thread_pool.h"
+#include "atomic.h"
+#include "common_runtime_test.h"
+#include "thread-inl.h"
 
 namespace art {
 
@@ -49,7 +50,7 @@ class CountTask : public Task {
   const bool verbose_;
 };
 
-class ThreadPoolTest : public CommonTest {
+class ThreadPoolTest : public CommonRuntimeTest {
  public:
   static int32_t num_threads;
 };
@@ -59,7 +60,7 @@ int32_t ThreadPoolTest::num_threads = 4;
 // Check that the thread pool actually runs tasks that you assign it.
 TEST_F(ThreadPoolTest, CheckRun) {
   Thread* self = Thread::Current();
-  ThreadPool thread_pool(num_threads);
+  ThreadPool thread_pool("Thread pool test thread pool", num_threads);
   AtomicInteger count(0);
   static const int32_t num_tasks = num_threads * 4;
   for (int32_t i = 0; i < num_tasks; ++i) {
@@ -69,12 +70,12 @@ TEST_F(ThreadPoolTest, CheckRun) {
   // Wait for tasks to complete.
   thread_pool.Wait(self, true, false);
   // Make sure that we finished all the work.
-  EXPECT_EQ(num_tasks, count);
+  EXPECT_EQ(num_tasks, count.LoadSequentiallyConsistent());
 }
 
 TEST_F(ThreadPoolTest, StopStart) {
   Thread* self = Thread::Current();
-  ThreadPool thread_pool(num_threads);
+  ThreadPool thread_pool("Thread pool test thread pool", num_threads);
   AtomicInteger count(0);
   static const int32_t num_tasks = num_threads * 4;
   for (int32_t i = 0; i < num_tasks; ++i) {
@@ -82,7 +83,7 @@ TEST_F(ThreadPoolTest, StopStart) {
   }
   usleep(200);
   // Check that no threads started prematurely.
-  EXPECT_EQ(0, count);
+  EXPECT_EQ(0, count.LoadSequentiallyConsistent());
   // Signal the threads to start processing tasks.
   thread_pool.StartWorkers(self);
   usleep(200);
@@ -91,10 +92,11 @@ TEST_F(ThreadPoolTest, StopStart) {
   thread_pool.AddTask(self, new CountTask(&bad_count));
   usleep(200);
   // Ensure that the task added after the workers were stopped doesn't get run.
-  EXPECT_EQ(0, bad_count);
+  EXPECT_EQ(0, bad_count.LoadSequentiallyConsistent());
   // Allow tasks to finish up and delete themselves.
   thread_pool.StartWorkers(self);
-  while (count.load() != num_tasks && bad_count.load() != 1) {
+  while (count.LoadSequentiallyConsistent() != num_tasks &&
+      bad_count.LoadSequentiallyConsistent() != 1) {
     usleep(200);
   }
   thread_pool.StopWorkers(self);
@@ -129,13 +131,13 @@ class TreeTask : public Task {
 // Test that adding new tasks from within a task works.
 TEST_F(ThreadPoolTest, RecursiveTest) {
   Thread* self = Thread::Current();
-  ThreadPool thread_pool(num_threads);
+  ThreadPool thread_pool("Thread pool test thread pool", num_threads);
   AtomicInteger count(0);
   static const int depth = 8;
   thread_pool.AddTask(self, new TreeTask(&thread_pool, &count, depth));
   thread_pool.StartWorkers(self);
   thread_pool.Wait(self, true, false);
-  EXPECT_EQ((1 << depth) - 1, count);
+  EXPECT_EQ((1 << depth) - 1, count.LoadSequentiallyConsistent());
 }
 
 }  // namespace art

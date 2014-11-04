@@ -16,6 +16,8 @@
 
 #include "common_throws.h"
 
+#include <sstream>
+
 #include "base/logging.h"
 #include "class_linker-inl.h"
 #include "dex_file-inl.h"
@@ -25,19 +27,15 @@
 #include "mirror/class-inl.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
-#include "object_utils.h"
 #include "thread.h"
 #include "verifier/method_verifier.h"
 
-#include <sstream>
-
 namespace art {
 
-static void AddReferrerLocation(std::ostream& os, const mirror::Class* referrer)
+static void AddReferrerLocation(std::ostream& os, mirror::Class* referrer)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   if (referrer != NULL) {
-    ClassHelper kh(referrer);
-    std::string location(kh.GetLocation());
+    std::string location(referrer->GetLocation());
     if (!location.empty()) {
       os << " (declaration of '" << PrettyDescriptor(referrer)
             << "' appears in " << location << ")";
@@ -46,7 +44,7 @@ static void AddReferrerLocation(std::ostream& os, const mirror::Class* referrer)
 }
 
 static void ThrowException(const ThrowLocation* throw_location, const char* exception_descriptor,
-                           const mirror::Class* referrer, const char* fmt, va_list* args = NULL)
+                           mirror::Class* referrer, const char* fmt, va_list* args = NULL)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   std::ostringstream msg;
   if (args != NULL) {
@@ -66,9 +64,31 @@ static void ThrowException(const ThrowLocation* throw_location, const char* exce
   }
 }
 
+static void ThrowWrappedException(const ThrowLocation* throw_location,
+                                  const char* exception_descriptor,
+                                  mirror::Class* referrer, const char* fmt, va_list* args = NULL)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+  std::ostringstream msg;
+  if (args != NULL) {
+    std::string vmsg;
+    StringAppendV(&vmsg, fmt, *args);
+    msg << vmsg;
+  } else {
+    msg << fmt;
+  }
+  AddReferrerLocation(msg, referrer);
+  Thread* self = Thread::Current();
+  if (throw_location == NULL) {
+    ThrowLocation computed_throw_location = self->GetCurrentLocationForThrow();
+    self->ThrowNewWrappedException(computed_throw_location, exception_descriptor, msg.str().c_str());
+  } else {
+    self->ThrowNewWrappedException(*throw_location, exception_descriptor, msg.str().c_str());
+  }
+}
+
 // AbstractMethodError
 
-void ThrowAbstractMethodError(const mirror::ArtMethod* method) {
+void ThrowAbstractMethodError(mirror::ArtMethod* method) {
   ThrowException(NULL, "Ljava/lang/AbstractMethodError;", NULL,
                  StringPrintf("abstract method \"%s\"",
                               PrettyMethod(method).c_str()).c_str());
@@ -89,8 +109,7 @@ void ThrowArrayIndexOutOfBoundsException(int index, int length) {
 
 // ArrayStoreException
 
-void ThrowArrayStoreException(const mirror::Class* element_class,
-                              const mirror::Class* array_class) {
+void ThrowArrayStoreException(mirror::Class* element_class, mirror::Class* array_class) {
   ThrowException(NULL, "Ljava/lang/ArrayStoreException;", NULL,
                  StringPrintf("%s cannot be stored in an array of type %s",
                               PrettyDescriptor(element_class).c_str(),
@@ -99,7 +118,7 @@ void ThrowArrayStoreException(const mirror::Class* element_class,
 
 // ClassCastException
 
-void ThrowClassCastException(const mirror::Class* dest_type, const mirror::Class* src_type) {
+void ThrowClassCastException(mirror::Class* dest_type, mirror::Class* src_type) {
   ThrowException(NULL, "Ljava/lang/ClassCastException;", NULL,
                  StringPrintf("%s cannot be cast to %s",
                               PrettyDescriptor(src_type).c_str(),
@@ -120,7 +139,7 @@ void ThrowClassCircularityError(mirror::Class* c) {
 
 // ClassFormatError
 
-void ThrowClassFormatError(const mirror::Class* referrer, const char* fmt, ...) {
+void ThrowClassFormatError(mirror::Class* referrer, const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
   ThrowException(NULL, "Ljava/lang/ClassFormatError;", referrer, fmt, &args);
@@ -136,8 +155,7 @@ void ThrowIllegalAccessErrorClass(mirror::Class* referrer, mirror::Class* access
 }
 
 void ThrowIllegalAccessErrorClassForMethodDispatch(mirror::Class* referrer, mirror::Class* accessed,
-                                                   const mirror::ArtMethod* caller,
-                                                   const mirror::ArtMethod* called,
+                                                   mirror::ArtMethod* called,
                                                    InvokeType type) {
   std::ostringstream msg;
   msg << "Illegal class access ('" << PrettyDescriptor(referrer) << "' attempting to access '"
@@ -160,7 +178,7 @@ void ThrowIllegalAccessErrorField(mirror::Class* referrer, mirror::ArtField* acc
   ThrowException(NULL, "Ljava/lang/IllegalAccessError;", referrer, msg.str().c_str());
 }
 
-void ThrowIllegalAccessErrorFinalField(const mirror::ArtMethod* referrer,
+void ThrowIllegalAccessErrorFinalField(mirror::ArtMethod* referrer,
                                        mirror::ArtField* accessed) {
   std::ostringstream msg;
   msg << "Final field '" << PrettyField(accessed, false) << "' cannot be written to by method '"
@@ -177,6 +195,12 @@ void ThrowIllegalAccessError(mirror::Class* referrer, const char* fmt, ...) {
   va_end(args);
 }
 
+// IllegalAccessException
+
+void ThrowIllegalAccessException(const ThrowLocation* throw_location, const char* msg) {
+  ThrowException(throw_location, "Ljava/lang/IllegalAccessException;", NULL, msg);
+}
+
 // IllegalArgumentException
 
 void ThrowIllegalArgumentException(const ThrowLocation* throw_location, const char* msg) {
@@ -188,7 +212,7 @@ void ThrowIllegalArgumentException(const ThrowLocation* throw_location, const ch
 
 void ThrowIncompatibleClassChangeError(InvokeType expected_type, InvokeType found_type,
                                        mirror::ArtMethod* method,
-                                       const mirror::ArtMethod* referrer) {
+                                       mirror::ArtMethod* referrer) {
   std::ostringstream msg;
   msg << "The method '" << PrettyMethod(method) << "' was expected to be of type "
       << expected_type << " but instead was found to be of type " << found_type;
@@ -197,9 +221,9 @@ void ThrowIncompatibleClassChangeError(InvokeType expected_type, InvokeType foun
                  msg.str().c_str());
 }
 
-void ThrowIncompatibleClassChangeErrorClassForInterfaceDispatch(const mirror::ArtMethod* interface_method,
+void ThrowIncompatibleClassChangeErrorClassForInterfaceDispatch(mirror::ArtMethod* interface_method,
                                                                 mirror::Object* this_object,
-                                                                const mirror::ArtMethod* referrer) {
+                                                                mirror::ArtMethod* referrer) {
   // Referrer is calling interface_method on this_object, however, the interface_method isn't
   // implemented by this_object.
   CHECK(this_object != NULL);
@@ -213,8 +237,8 @@ void ThrowIncompatibleClassChangeErrorClassForInterfaceDispatch(const mirror::Ar
                  msg.str().c_str());
 }
 
-void ThrowIncompatibleClassChangeErrorField(const mirror::ArtField* resolved_field, bool is_static,
-                                            const mirror::ArtMethod* referrer) {
+void ThrowIncompatibleClassChangeErrorField(mirror::ArtField* resolved_field, bool is_static,
+                                            mirror::ArtMethod* referrer) {
   std::ostringstream msg;
   msg << "Expected '" << PrettyField(resolved_field) << "' to be a "
       << (is_static ? "static" : "instance") << " field" << " rather than a "
@@ -223,16 +247,32 @@ void ThrowIncompatibleClassChangeErrorField(const mirror::ArtField* resolved_fie
                  msg.str().c_str());
 }
 
-void ThrowIncompatibleClassChangeError(const mirror::Class* referrer, const char* fmt, ...) {
+void ThrowIncompatibleClassChangeError(mirror::Class* referrer, const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
   ThrowException(NULL, "Ljava/lang/IncompatibleClassChangeError;", referrer, fmt, &args);
   va_end(args);
 }
 
+// IOException
+
+void ThrowIOException(const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  ThrowException(NULL, "Ljava/io/IOException;", NULL, fmt, &args);
+  va_end(args);
+}
+
+void ThrowWrappedIOException(const char* fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  ThrowWrappedException(NULL, "Ljava/io/IOException;", NULL, fmt, &args);
+  va_end(args);
+}
+
 // LinkageError
 
-void ThrowLinkageError(const mirror::Class* referrer, const char* fmt, ...) {
+void ThrowLinkageError(mirror::Class* referrer, const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
   ThrowException(NULL, "Ljava/lang/LinkageError;", referrer, fmt, &args);
@@ -255,21 +295,21 @@ void ThrowNegativeArraySizeException(const char* msg) {
 void ThrowNoSuchFieldError(const StringPiece& scope, mirror::Class* c,
                            const StringPiece& type, const StringPiece& name)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-  ClassHelper kh(c);
   std::ostringstream msg;
+  std::string temp;
   msg << "No " << scope << "field " << name << " of type " << type
-      << " in class " << kh.GetDescriptor() << " or its superclasses";
+      << " in class " << c->GetDescriptor(&temp) << " or its superclasses";
   ThrowException(NULL, "Ljava/lang/NoSuchFieldError;", c, msg.str().c_str());
 }
 
 // NoSuchMethodError
 
 void ThrowNoSuchMethodError(InvokeType type, mirror::Class* c, const StringPiece& name,
-                            const StringPiece& signature) {
+                            const Signature& signature) {
   std::ostringstream msg;
-  ClassHelper kh(c);
+  std::string temp;
   msg << "No " << type << " method " << name << signature
-      << " in class " << kh.GetDescriptor() << " or its super classes";
+      << " in class " << c->GetDescriptor(&temp) << " or its super classes";
   ThrowException(NULL, "Ljava/lang/NoSuchMethodError;", c, msg.str().c_str());
 }
 
@@ -324,7 +364,7 @@ void ThrowNullPointerExceptionForMethodAccess(const ThrowLocation& throw_locatio
 }
 
 void ThrowNullPointerExceptionFromDexPC(const ThrowLocation& throw_location) {
-  const DexFile::CodeItem* code = MethodHelper(throw_location.GetMethod()).GetCodeItem();
+  const DexFile::CodeItem* code = throw_location.GetMethod()->GetCodeItem();
   uint32_t throw_dex_pc = throw_location.GetDexPc();
   CHECK_LT(throw_dex_pc, code->insns_size_in_code_units_);
   const Instruction* instr = Instruction::At(&code->insns_[throw_dex_pc]);
@@ -478,7 +518,7 @@ void ThrowRuntimeException(const char* fmt, ...) {
 
 // VerifyError
 
-void ThrowVerifyError(const mirror::Class* referrer, const char* fmt, ...) {
+void ThrowVerifyError(mirror::Class* referrer, const char* fmt, ...) {
   va_list args;
   va_start(args, fmt);
   ThrowException(NULL, "Ljava/lang/VerifyError;", referrer, fmt, &args);

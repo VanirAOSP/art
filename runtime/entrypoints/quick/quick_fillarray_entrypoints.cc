@@ -39,7 +39,7 @@ namespace art {
  */
 extern "C" int artHandleFillArrayDataFromCode(mirror::Array* array,
                                               const Instruction::ArrayDataPayload* payload,
-                                              Thread* self, mirror::ArtMethod** sp)
+                                              Thread* self, StackReference<mirror::ArtMethod>* sp)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   FinishCalleeSaveFrameSetup(self, sp, Runtime::kRefsOnly);
   DCHECK_EQ(payload->ident, static_cast<uint16_t>(Instruction::kArrayDataSignature));
@@ -56,7 +56,7 @@ extern "C" int artHandleFillArrayDataFromCode(mirror::Array* array,
     return -1;  // Error
   }
   uint32_t size_in_bytes = payload->element_count * payload->element_width;
-  memcpy(array->GetRawData(payload->element_width), payload->data, size_in_bytes);
+  memcpy(array->GetRawData(payload->element_width, 0), payload->data, size_in_bytes);
   return 0;  // Success
 }
 

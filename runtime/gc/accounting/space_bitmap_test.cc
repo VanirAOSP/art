@@ -16,32 +16,31 @@
 
 #include "space_bitmap.h"
 
-#include "common_test.h"
+#include <stdint.h>
+#include <memory>
+
+#include "common_runtime_test.h"
 #include "globals.h"
 #include "space_bitmap-inl.h"
-#include "UniquePtr.h"
-
-#include <stdint.h>
 
 namespace art {
 namespace gc {
 namespace accounting {
 
-class SpaceBitmapTest : public CommonTest {
- public:
-};
+class SpaceBitmapTest : public CommonRuntimeTest {};
 
 TEST_F(SpaceBitmapTest, Init) {
   byte* heap_begin = reinterpret_cast<byte*>(0x10000000);
   size_t heap_capacity = 16 * MB;
-  UniquePtr<SpaceBitmap> space_bitmap(SpaceBitmap::Create("test bitmap",
-                                                          heap_begin, heap_capacity));
+  std::unique_ptr<ContinuousSpaceBitmap> space_bitmap(
+      ContinuousSpaceBitmap::Create("test bitmap", heap_begin, heap_capacity));
   EXPECT_TRUE(space_bitmap.get() != NULL);
 }
 
 class BitmapVerify {
  public:
-  BitmapVerify(SpaceBitmap* bitmap, const mirror::Object* begin, const mirror::Object* end)
+  BitmapVerify(ContinuousSpaceBitmap* bitmap, const mirror::Object* begin,
+               const mirror::Object* end)
     : bitmap_(bitmap),
       begin_(begin),
       end_(end) {}
@@ -52,7 +51,7 @@ class BitmapVerify {
     EXPECT_EQ(bitmap_->Test(obj), ((reinterpret_cast<uintptr_t>(obj) & 0xF) != 0));
   }
 
-  SpaceBitmap* bitmap_;
+  ContinuousSpaceBitmap* bitmap_;
   const mirror::Object* begin_;
   const mirror::Object* end_;
 };
@@ -61,14 +60,14 @@ TEST_F(SpaceBitmapTest, ScanRange) {
   byte* heap_begin = reinterpret_cast<byte*>(0x10000000);
   size_t heap_capacity = 16 * MB;
 
-  UniquePtr<SpaceBitmap> space_bitmap(SpaceBitmap::Create("test bitmap",
-                                                          heap_begin, heap_capacity));
+  std::unique_ptr<ContinuousSpaceBitmap> space_bitmap(
+      ContinuousSpaceBitmap::Create("test bitmap", heap_begin, heap_capacity));
   EXPECT_TRUE(space_bitmap.get() != NULL);
 
   // Set all the odd bits in the first BitsPerWord * 3 to one.
   for (size_t j = 0; j < kBitsPerWord * 3; ++j) {
     const mirror::Object* obj =
-        reinterpret_cast<mirror::Object*>(heap_begin + j * SpaceBitmap::kAlignment);
+        reinterpret_cast<mirror::Object*>(heap_begin + j * kObjectAlignment);
     if (reinterpret_cast<uintptr_t>(obj) & 0xF) {
       space_bitmap->Set(obj);
     }
@@ -79,13 +78,91 @@ TEST_F(SpaceBitmapTest, ScanRange) {
   // words.
   for (size_t i = 0; i < static_cast<size_t>(kBitsPerWord); ++i) {
     mirror::Object* start =
-        reinterpret_cast<mirror::Object*>(heap_begin + i * SpaceBitmap::kAlignment);
+        reinterpret_cast<mirror::Object*>(heap_begin + i * kObjectAlignment);
     for (size_t j = 0; j < static_cast<size_t>(kBitsPerWord * 2); ++j) {
       mirror::Object* end =
-          reinterpret_cast<mirror::Object*>(heap_begin + (i + j) * SpaceBitmap::kAlignment);
+          reinterpret_cast<mirror::Object*>(heap_begin + (i + j) * kObjectAlignment);
       BitmapVerify(space_bitmap.get(), start, end);
     }
   }
+}
+
+class SimpleCounter {
+ public:
+  explicit SimpleCounter(size_t* counter) : count_(counter) {}
+
+  void operator()(mirror::Object* obj) const {
+    (*count_)++;
+  }
+
+  size_t* count_;
+};
+
+class RandGen {
+ public:
+  explicit RandGen(uint32_t seed) : val_(seed) {}
+
+  uint32_t next() {
+    val_ = val_ * 48271 % 2147483647;
+    return val_;
+  }
+
+  uint32_t val_;
+};
+
+template <size_t kAlignment>
+void RunTest() NO_THREAD_SAFETY_ANALYSIS {
+  byte* heap_begin = reinterpret_cast<byte*>(0x10000000);
+  size_t heap_capacity = 16 * MB;
+
+  // Seed with 0x1234 for reproducability.
+  RandGen r(0x1234);
+
+
+  for (int i = 0; i < 5 ; ++i) {
+    std::unique_ptr<ContinuousSpaceBitmap> space_bitmap(
+        ContinuousSpaceBitmap::Create("test bitmap", heap_begin, heap_capacity));
+
+    for (int j = 0; j < 10000; ++j) {
+      size_t offset = RoundDown(r.next() % heap_capacity, kAlignment);
+      bool set = r.next() % 2 == 1;
+
+      if (set) {
+        space_bitmap->Set(reinterpret_cast<mirror::Object*>(heap_begin + offset));
+      } else {
+        space_bitmap->Clear(reinterpret_cast<mirror::Object*>(heap_begin + offset));
+      }
+    }
+
+    for (int j = 0; j < 50; ++j) {
+      size_t count = 0;
+      SimpleCounter c(&count);
+
+      size_t offset = RoundDown(r.next() % heap_capacity, kAlignment);
+      size_t remain = heap_capacity - offset;
+      size_t end = offset + RoundDown(r.next() % (remain + 1), kAlignment);
+
+      space_bitmap->VisitMarkedRange(reinterpret_cast<uintptr_t>(heap_begin) + offset,
+                                     reinterpret_cast<uintptr_t>(heap_begin) + end, c);
+
+      size_t manual = 0;
+      for (uintptr_t k = offset; k < end; k += kAlignment) {
+        if (space_bitmap->Test(reinterpret_cast<mirror::Object*>(heap_begin + k))) {
+          manual++;
+        }
+      }
+
+      EXPECT_EQ(count, manual);
+    }
+  }
+}
+
+TEST_F(SpaceBitmapTest, VisitorObjectAlignment) {
+  RunTest<kObjectAlignment>();
+}
+
+TEST_F(SpaceBitmapTest, VisitorPageAlignment) {
+  RunTest<kPageSize>();
 }
 
 }  // namespace accounting

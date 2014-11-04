@@ -14,38 +14,39 @@
  * limitations under the License.
  */
 
-#include "class_linker.h"
-#include "common_test.h"
 #include "dex_cache.h"
+
+#include <stdio.h>
+
+#include "class_linker.h"
+#include "common_runtime_test.h"
 #include "gc/heap.h"
 #include "mirror/object_array-inl.h"
 #include "mirror/object-inl.h"
-#include "sirt_ref.h"
-
-#include <stdio.h>
+#include "handle_scope-inl.h"
+#include "scoped_thread_state_change.h"
 
 namespace art {
 namespace mirror {
 
-class DexCacheTest : public CommonTest {};
+class DexCacheTest : public CommonRuntimeTest {};
 
 TEST_F(DexCacheTest, Open) {
   ScopedObjectAccess soa(Thread::Current());
-  SirtRef<DexCache> dex_cache(soa.Self(), class_linker_->AllocDexCache(soa.Self(),
-                                                                       *java_lang_dex_file_));
-  ASSERT_TRUE(dex_cache.get() != NULL);
+  StackHandleScope<1> hs(soa.Self());
+  Handle<DexCache> dex_cache(
+      hs.NewHandle(class_linker_->AllocDexCache(soa.Self(), *java_lang_dex_file_)));
+  ASSERT_TRUE(dex_cache.Get() != NULL);
 
   EXPECT_EQ(java_lang_dex_file_->NumStringIds(), dex_cache->NumStrings());
   EXPECT_EQ(java_lang_dex_file_->NumTypeIds(),   dex_cache->NumResolvedTypes());
   EXPECT_EQ(java_lang_dex_file_->NumMethodIds(), dex_cache->NumResolvedMethods());
   EXPECT_EQ(java_lang_dex_file_->NumFieldIds(),  dex_cache->NumResolvedFields());
-  EXPECT_EQ(java_lang_dex_file_->NumTypeIds(),   dex_cache->NumInitializedStaticStorage());
 
   EXPECT_LE(0, dex_cache->GetStrings()->GetLength());
   EXPECT_LE(0, dex_cache->GetResolvedTypes()->GetLength());
   EXPECT_LE(0, dex_cache->GetResolvedMethods()->GetLength());
   EXPECT_LE(0, dex_cache->GetResolvedFields()->GetLength());
-  EXPECT_LE(0, dex_cache->GetInitializedStaticStorage()->GetLength());
 
   EXPECT_EQ(java_lang_dex_file_->NumStringIds(),
             static_cast<uint32_t>(dex_cache->GetStrings()->GetLength()));
@@ -55,8 +56,6 @@ TEST_F(DexCacheTest, Open) {
             static_cast<uint32_t>(dex_cache->GetResolvedMethods()->GetLength()));
   EXPECT_EQ(java_lang_dex_file_->NumFieldIds(),
             static_cast<uint32_t>(dex_cache->GetResolvedFields()->GetLength()));
-  EXPECT_EQ(java_lang_dex_file_->NumTypeIds(),
-            static_cast<uint32_t>(dex_cache->GetInitializedStaticStorage()->GetLength()));
 }
 
 }  // namespace mirror

@@ -17,16 +17,18 @@
 #ifndef ART_RUNTIME_VERIFIER_REG_TYPE_H_
 #define ART_RUNTIME_VERIFIER_REG_TYPE_H_
 
-#include "base/macros.h"
-#include "globals.h"
-#include "primitive.h"
-
-#include "jni.h"
-
 #include <limits>
 #include <stdint.h>
 #include <set>
 #include <string>
+
+#include "jni.h"
+
+#include "base/macros.h"
+#include "gc_root.h"
+#include "globals.h"
+#include "object_callbacks.h"
+#include "primitive.h"
 
 namespace art {
 namespace mirror {
@@ -106,7 +108,7 @@ class RegType {
     return IsLowHalf();
   }
   // Check this is the low half, and that type_h is its matching high-half.
-  inline bool CheckWidePair(const RegType& type_h) const {
+  inline bool CheckWidePair(RegType& type_h) const {
     if (IsLowHalf()) {
       return ((IsPreciseConstantLo() && type_h.IsPreciseConstantHi()) ||
               (IsPreciseConstantLo() && type_h.IsImpreciseConstantHi()) ||
@@ -118,7 +120,7 @@ class RegType {
     return false;
   }
   // The high half that corresponds to this low half
-  const RegType& HighHalf(RegTypeCache* cache) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  RegType& HighHalf(RegTypeCache* cache) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   bool IsConstantBoolean() const {
     return IsConstant() && (ConstantValue() >= 0) && (ConstantValue() <= 1);
@@ -197,55 +199,54 @@ class RegType {
   virtual bool HasClass() const {
     return false;
   }
-  bool IsJavaLangObject() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  bool IsArrayTypes() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  bool IsObjectArrayTypes() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool IsJavaLangObject() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool IsArrayTypes() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool IsObjectArrayTypes() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   Primitive::Type GetPrimitiveType() const;
-  bool IsJavaLangObjectArray() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-  bool IsInstantiableTypes() const;
+  bool IsJavaLangObjectArray() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool IsInstantiableTypes() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   const std::string& GetDescriptor() const {
     DCHECK(HasClass() || (IsUnresolvedTypes() && !IsUnresolvedMergedReference() &&
                           !IsUnresolvedSuperClass()));
     return descriptor_;
   }
-  mirror::Class* GetClass() const {
+  mirror::Class* GetClass() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     DCHECK(!IsUnresolvedReference());
-    DCHECK(klass_ != NULL);
+    DCHECK(!klass_.IsNull()) << Dump();
     DCHECK(HasClass());
-    return klass_;
+    return klass_.Read();
   }
   uint16_t GetId() const {
     return cache_id_;
   }
-  const RegType& GetSuperClass(RegTypeCache* cache) const
+  RegType& GetSuperClass(RegTypeCache* cache)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  virtual std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) = 0;
+  virtual std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) = 0;
 
   // Can this type access other?
-  bool CanAccess(const RegType& other) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool CanAccess(RegType& other) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Can this type access a member with the given properties?
-  bool CanAccessMember(mirror::Class* klass, uint32_t access_flags) const
+  bool CanAccessMember(mirror::Class* klass, uint32_t access_flags)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Can this type be assigned by src?
   // Note: Object and interface types may always be assigned to one another, see comment on
   // ClassJoin.
-  bool IsAssignableFrom(const RegType& src) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool IsAssignableFrom(RegType& src) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Can this type be assigned by src? Variant of IsAssignableFrom that doesn't allow assignment to
   // an interface from an Object.
-  bool IsStrictlyAssignableFrom(const RegType& src) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  bool IsStrictlyAssignableFrom(RegType& src) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Are these RegTypes the same?
-  bool Equals(const RegType& other) const {
+  bool Equals(RegType& other) const {
     return GetId() == other.GetId();
   }
 
   // Compute the merge of this register from one edge (path) with incoming_type from another.
-  virtual const RegType& Merge(const RegType& incoming_type, RegTypeCache* reg_types) const
+  virtual RegType& Merge(RegType& incoming_type, RegTypeCache* reg_types)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   /*
@@ -269,10 +270,12 @@ class RegType {
 
   virtual ~RegType() {}
 
+  void VisitRoots(RootCallback* callback, void* arg) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
  protected:
   RegType(mirror::Class* klass, const std::string& descriptor, uint16_t cache_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
-      : descriptor_(descriptor), klass_(klass), cache_id_(cache_id) {
+      : descriptor_(descriptor), klass_(GcRoot<mirror::Class>(klass)), cache_id_(cache_id) {
     if (kIsDebugBuild) {
       CheckInvariants();
     }
@@ -282,7 +285,7 @@ class RegType {
 
 
   const std::string descriptor_;
-  mirror::Class* const klass_;
+  GcRoot<mirror::Class> klass_;
   const uint16_t cache_id_;
 
   friend class RegTypeCache;
@@ -298,7 +301,7 @@ class ConflictType : public RegType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Get the singleton Conflict instance.
   static ConflictType* GetInstance();
@@ -328,7 +331,7 @@ class UndefinedType : public RegType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   // Get the singleton Undefined instance.
   static UndefinedType* GetInstance();
@@ -347,7 +350,7 @@ class UndefinedType : public RegType {
       : RegType(klass, descriptor, cache_id) {
   }
 
-  virtual const RegType& Merge(const RegType& incoming_type, RegTypeCache* reg_types) const
+  virtual RegType& Merge(RegType& incoming_type, RegTypeCache* reg_types)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   static UndefinedType* instance_;
@@ -370,7 +373,7 @@ class IntegerType : public Cat1Type {
   bool IsInteger() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static IntegerType* CreateInstance(mirror::Class* klass, const std::string& descriptor,
                                      uint16_t cache_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -389,7 +392,7 @@ class BooleanType : public Cat1Type {
   bool IsBoolean() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static BooleanType* CreateInstance(mirror::Class* klass, const std::string& descriptor,
                                      uint16_t cache_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -409,7 +412,7 @@ class ByteType : public Cat1Type {
   bool IsByte() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static ByteType* CreateInstance(mirror::Class* klass, const std::string& descriptor,
                                   uint16_t cache_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -428,7 +431,7 @@ class ShortType : public Cat1Type {
   bool IsShort() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static ShortType* CreateInstance(mirror::Class* klass, const std::string& descriptor,
                                    uint16_t cache_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -447,7 +450,7 @@ class CharType : public Cat1Type {
   bool IsChar() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static CharType* CreateInstance(mirror::Class* klass, const std::string& descriptor,
                                   uint16_t cache_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -466,7 +469,7 @@ class FloatType : public Cat1Type {
   bool IsFloat() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   static FloatType* CreateInstance(mirror::Class* klass, const std::string& descriptor,
                                    uint16_t cache_id)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -488,7 +491,7 @@ class Cat2Type : public PrimitiveType {
 
 class LongLoType : public Cat2Type {
  public:
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   bool IsLongLo() const {
     return true;
   }
@@ -510,7 +513,7 @@ class LongLoType : public Cat2Type {
 
 class LongHiType : public Cat2Type {
  public:
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   bool IsLongHi() const {
     return true;
   }
@@ -529,7 +532,7 @@ class LongHiType : public Cat2Type {
 
 class DoubleLoType : public Cat2Type {
  public:
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
   bool IsDoubleLo() const {
     return true;
   }
@@ -551,7 +554,7 @@ class DoubleLoType : public Cat2Type {
 
 class DoubleHiType : public Cat2Type {
  public:
-  std::string Dump() const;
+  std::string Dump();
   virtual bool IsDoubleHi() const {
     return true;
   }
@@ -574,9 +577,12 @@ class ConstantType : public RegType {
 
   // If this is a 32-bit constant, what is the value? This value may be imprecise in which case
   // the value represents part of the integer range of values that may be held in the register.
-  virtual int32_t ConstantValue() const;
-  virtual int32_t ConstantValueLo() const;
-  virtual int32_t ConstantValueHi() const;
+  int32_t ConstantValue() const {
+    DCHECK(IsConstantTypes());
+    return constant_;
+  }
+  int32_t ConstantValueLo() const;
+  int32_t ConstantValueHi() const;
 
   bool IsZero() const {
     return IsPreciseConstant() && ConstantValue() == 0;
@@ -615,7 +621,7 @@ class PreciseConstType : public ConstantType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 class PreciseConstLoType : public ConstantType {
@@ -627,7 +633,7 @@ class PreciseConstLoType : public ConstantType {
   bool IsPreciseConstantLo() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 class PreciseConstHiType : public ConstantType {
@@ -639,7 +645,7 @@ class PreciseConstHiType : public ConstantType {
   bool IsPreciseConstantHi() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 class ImpreciseConstType : public ConstantType {
@@ -649,7 +655,7 @@ class ImpreciseConstType : public ConstantType {
   bool IsImpreciseConstant() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 class ImpreciseConstLoType : public ConstantType {
@@ -660,7 +666,7 @@ class ImpreciseConstLoType : public ConstantType {
   bool IsImpreciseConstantLo() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 class ImpreciseConstHiType : public ConstantType {
@@ -671,7 +677,7 @@ class ImpreciseConstHiType : public ConstantType {
   bool IsImpreciseConstantHi() const {
     return true;
   }
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 // Common parent of all uninitialized types. Uninitialized types are created by "new" dex
@@ -712,7 +718,7 @@ class UninitializedReferenceType : public UninitializedType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 // Similar to UnresolvedReferenceType but not yet having been passed to a constructor.
@@ -731,7 +737,7 @@ class UnresolvedUninitializedRefType : public UninitializedType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
  private:
   void CheckInvariants() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
@@ -756,7 +762,7 @@ class UninitializedThisReferenceType : public UninitializedType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  private:
   void CheckInvariants() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -776,7 +782,7 @@ class UnresolvedUninitializedThisRefType : public UninitializedType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
  private:
   void CheckInvariants() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
@@ -801,7 +807,7 @@ class ReferenceType : public RegType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 // A type of register holding a reference to an Object of type GetClass and only an object of that
@@ -823,7 +829,7 @@ class PreciseReferenceType : public RegType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
 
 // Common parent of unresolved types.
@@ -851,7 +857,7 @@ class UnresolvedReferenceType : public UnresolvedType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
  private:
   void CheckInvariants() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 };
@@ -877,7 +883,7 @@ class UnresolvedSuperClass : public UnresolvedType {
     return static_cast<uint16_t>(unresolved_child_id_ & 0xFFFF);
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  private:
   void CheckInvariants() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -912,7 +918,7 @@ class UnresolvedMergedType : public UnresolvedType {
     return true;
   }
 
-  std::string Dump() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  std::string Dump() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  private:
   void CheckInvariants() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);

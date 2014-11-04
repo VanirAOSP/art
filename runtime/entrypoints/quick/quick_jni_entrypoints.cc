@@ -15,25 +15,29 @@
  */
 
 #include "dex_file-inl.h"
-#include "entrypoints/entrypoint_utils.h"
+#include "entrypoints/entrypoint_utils-inl.h"
 #include "mirror/art_method-inl.h"
 #include "mirror/class-inl.h"
 #include "mirror/object.h"
 #include "mirror/object-inl.h"
 #include "mirror/object_array-inl.h"
-#include "object_utils.h"
 #include "scoped_thread_state_change.h"
 #include "thread.h"
+#include "verify_object-inl.h"
 
 namespace art {
 
 // Called on entry to JNI, transition out of Runnable and release share of mutator_lock_.
 extern uint32_t JniMethodStart(Thread* self) {
   JNIEnvExt* env = self->GetJniEnv();
-  DCHECK(env != NULL);
+  DCHECK(env != nullptr);
   uint32_t saved_local_ref_cookie = env->local_ref_cookie;
   env->local_ref_cookie = env->locals.GetSegmentState();
-  self->TransitionFromRunnableToSuspended(kNative);
+  mirror::ArtMethod* native_method = self->GetManagedStack()->GetTopQuickFrame()->AsMirrorPtr();
+  if (!native_method->IsFastNative()) {
+    // When not fast JNI we transition out of runnable.
+    self->TransitionFromRunnableToSuspended(kNative);
+  }
   return saved_local_ref_cookie;
 }
 
@@ -42,29 +46,44 @@ extern uint32_t JniMethodStartSynchronized(jobject to_lock, Thread* self) {
   return JniMethodStart(self);
 }
 
-static void PopLocalReferences(uint32_t saved_local_ref_cookie, Thread* self) {
+// TODO: NO_THREAD_SAFETY_ANALYSIS due to different control paths depending on fast JNI.
+static void GoToRunnable(Thread* self) NO_THREAD_SAFETY_ANALYSIS {
+  mirror::ArtMethod* native_method = self->GetManagedStack()->GetTopQuickFrame()->AsMirrorPtr();
+  bool is_fast = native_method->IsFastNative();
+  if (!is_fast) {
+    self->TransitionFromSuspendedToRunnable();
+  } else if (UNLIKELY(self->TestAllFlags())) {
+    // In fast JNI mode we never transitioned out of runnable. Perform a suspend check if there
+    // is a flag raised.
+    DCHECK(Locks::mutator_lock_->IsSharedHeld(self));
+    CheckSuspend(self);
+  }
+}
+
+static void PopLocalReferences(uint32_t saved_local_ref_cookie, Thread* self)
+    SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   JNIEnvExt* env = self->GetJniEnv();
   env->locals.SetSegmentState(env->local_ref_cookie);
   env->local_ref_cookie = saved_local_ref_cookie;
-  self->PopSirt();
+  self->PopHandleScope();
 }
 
 extern void JniMethodEnd(uint32_t saved_local_ref_cookie, Thread* self) {
-  self->TransitionFromSuspendedToRunnable();
+  GoToRunnable(self);
   PopLocalReferences(saved_local_ref_cookie, self);
 }
 
 
 extern void JniMethodEndSynchronized(uint32_t saved_local_ref_cookie, jobject locked,
                                      Thread* self) {
-  self->TransitionFromSuspendedToRunnable();
+  GoToRunnable(self);
   UnlockJniSynchronizedMethod(locked, self);  // Must decode before pop.
   PopLocalReferences(saved_local_ref_cookie, self);
 }
 
 extern mirror::Object* JniMethodEndWithReference(jobject result, uint32_t saved_local_ref_cookie,
                                                  Thread* self) {
-  self->TransitionFromSuspendedToRunnable();
+  GoToRunnable(self);
   mirror::Object* o = self->DecodeJObject(result);  // Must decode before pop.
   PopLocalReferences(saved_local_ref_cookie, self);
   // Process result.
@@ -74,13 +93,14 @@ extern mirror::Object* JniMethodEndWithReference(jobject result, uint32_t saved_
     }
     CheckReferenceResult(o, self);
   }
+  VerifyObject(o);
   return o;
 }
 
 extern mirror::Object* JniMethodEndWithReferenceSynchronized(jobject result,
                                                              uint32_t saved_local_ref_cookie,
                                                              jobject locked, Thread* self) {
-  self->TransitionFromSuspendedToRunnable();
+  GoToRunnable(self);
   UnlockJniSynchronizedMethod(locked, self);  // Must decode before pop.
   mirror::Object* o = self->DecodeJObject(result);
   PopLocalReferences(saved_local_ref_cookie, self);
@@ -91,6 +111,7 @@ extern mirror::Object* JniMethodEndWithReferenceSynchronized(jobject result,
     }
     CheckReferenceResult(o, self);
   }
+  VerifyObject(o);
   return o;
 }
 

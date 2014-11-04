@@ -17,13 +17,15 @@
 #ifndef ART_RUNTIME_STACK_H_
 #define ART_RUNTIME_STACK_H_
 
-#include "dex_file.h"
-#include "instrumentation.h"
-#include "base/macros.h"
-#include "arch/context.h"
-
 #include <stdint.h>
 #include <string>
+
+#include "dex_file.h"
+#include "instruction_set.h"
+#include "mirror/object_reference.h"
+#include "throw_location.h"
+#include "utils.h"
+#include "verify_object.h"
 
 namespace art {
 
@@ -34,7 +36,7 @@ namespace mirror {
 
 class Context;
 class ShadowFrame;
-class StackIndirectReferenceTable;
+class HandleScope;
 class ScopedObjectAccess;
 class Thread;
 
@@ -52,24 +54,84 @@ enum VRegKind {
   kUndefined,
 };
 
+/**
+ * @brief Represents the virtual register numbers that denote special meaning.
+ * @details This is used to make some virtual register numbers to have specific
+ * semantic meaning. This is done so that the compiler can treat all virtual
+ * registers the same way and only special case when needed. For example,
+ * calculating SSA does not care whether a virtual register is a normal one or
+ * a compiler temporary, so it can deal with them in a consistent manner. But,
+ * for example if backend cares about temporaries because it has custom spill
+ * location, then it can special case them only then.
+ */
+enum VRegBaseRegNum : int {
+  /**
+   * @brief Virtual registers originating from dex have number >= 0.
+   */
+  kVRegBaseReg = 0,
+
+  /**
+   * @brief Invalid virtual register number.
+   */
+  kVRegInvalid = -1,
+
+  /**
+   * @brief Used to denote the base register for compiler temporaries.
+   * @details Compiler temporaries are virtual registers not originating
+   * from dex but that are created by compiler.  All virtual register numbers
+   * that are <= kVRegTempBaseReg are categorized as compiler temporaries.
+   */
+  kVRegTempBaseReg = -2,
+
+  /**
+   * @brief Base register of temporary that holds the method pointer.
+   * @details This is a special compiler temporary because it has a specific
+   * location on stack.
+   */
+  kVRegMethodPtrBaseReg = kVRegTempBaseReg,
+
+  /**
+   * @brief Base register of non-special compiler temporary.
+   * @details A non-special compiler temporary is one whose spill location
+   * is flexible.
+   */
+  kVRegNonSpecialTempBaseReg = -3,
+};
+
+// A reference from the shadow stack to a MirrorType object within the Java heap.
+template<class MirrorType>
+class MANAGED StackReference : public mirror::ObjectReference<false, MirrorType> {
+ public:
+  StackReference<MirrorType>() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
+      : mirror::ObjectReference<false, MirrorType>(nullptr) {}
+
+  static StackReference<MirrorType> FromMirrorPtr(MirrorType* p)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return StackReference<MirrorType>(p);
+  }
+
+ private:
+  StackReference<MirrorType>(MirrorType* p) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_)
+      : mirror::ObjectReference<false, MirrorType>(p) {}
+};
+
 // ShadowFrame has 3 possible layouts:
 //  - portable - a unified array of VRegs and references. Precise references need GC maps.
 //  - interpreter - separate VRegs and reference arrays. References are in the reference array.
 //  - JNI - just VRegs, but where every VReg holds a reference.
 class ShadowFrame {
  public:
-  // Compute size of ShadowFrame in bytes.
+  // Compute size of ShadowFrame in bytes assuming it has a reference array.
   static size_t ComputeSize(uint32_t num_vregs) {
     return sizeof(ShadowFrame) + (sizeof(uint32_t) * num_vregs) +
-           (sizeof(mirror::Object*) * num_vregs);
+           (sizeof(StackReference<mirror::Object>) * num_vregs);
   }
 
   // Create ShadowFrame in heap for deoptimization.
   static ShadowFrame* Create(uint32_t num_vregs, ShadowFrame* link,
                              mirror::ArtMethod* method, uint32_t dex_pc) {
     uint8_t* memory = new uint8_t[ComputeSize(num_vregs)];
-    ShadowFrame* sf = new (memory) ShadowFrame(num_vregs, link, method, dex_pc, true);
-    return sf;
+    return Create(num_vregs, link, method, dex_pc, memory);
   }
 
   // Create ShadowFrame for interpreter using provided memory.
@@ -151,14 +213,20 @@ class ShadowFrame {
     return *reinterpret_cast<unaligned_double*>(vreg);
   }
 
-  mirror::Object* GetVRegReference(size_t i) const {
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  mirror::Object* GetVRegReference(size_t i) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     DCHECK_LT(i, NumberOfVRegs());
+    mirror::Object* ref;
     if (HasReferenceArray()) {
-      return References()[i];
+      ref = References()[i].AsMirrorPtr();
     } else {
-      const uint32_t* vreg = &vregs_[i];
-      return *reinterpret_cast<mirror::Object* const*>(vreg);
+      const uint32_t* vreg_ptr = &vregs_[i];
+      ref = reinterpret_cast<const StackReference<mirror::Object>*>(vreg_ptr)->AsMirrorPtr();
     }
+    if (kVerifyFlags & kVerifyReads) {
+      VerifyObject(ref);
+    }
+    return ref;
   }
 
   // Get view of vregs as range of consecutive arguments starting at i.
@@ -170,12 +238,22 @@ class ShadowFrame {
     DCHECK_LT(i, NumberOfVRegs());
     uint32_t* vreg = &vregs_[i];
     *reinterpret_cast<int32_t*>(vreg) = val;
+    // This is needed for moving collectors since these can update the vreg references if they
+    // happen to agree with references in the reference array.
+    if (kMovingCollector && HasReferenceArray()) {
+      References()[i].Clear();
+    }
   }
 
   void SetVRegFloat(size_t i, float val) {
     DCHECK_LT(i, NumberOfVRegs());
     uint32_t* vreg = &vregs_[i];
     *reinterpret_cast<float*>(vreg) = val;
+    // This is needed for moving collectors since these can update the vreg references if they
+    // happen to agree with references in the reference array.
+    if (kMovingCollector && HasReferenceArray()) {
+      References()[i].Clear();
+    }
   }
 
   void SetVRegLong(size_t i, int64_t val) {
@@ -184,6 +262,12 @@ class ShadowFrame {
     // Alignment attribute required for GCC 4.8
     typedef int64_t unaligned_int64 __attribute__ ((aligned (4)));
     *reinterpret_cast<unaligned_int64*>(vreg) = val;
+    // This is needed for moving collectors since these can update the vreg references if they
+    // happen to agree with references in the reference array.
+    if (kMovingCollector && HasReferenceArray()) {
+      References()[i].Clear();
+      References()[i + 1].Clear();
+    }
   }
 
   void SetVRegDouble(size_t i, double val) {
@@ -192,20 +276,35 @@ class ShadowFrame {
     // Alignment attribute required for GCC 4.8
     typedef double unaligned_double __attribute__ ((aligned (4)));
     *reinterpret_cast<unaligned_double*>(vreg) = val;
-  }
-
-  void SetVRegReference(size_t i, mirror::Object* val) {
-    DCHECK_LT(i, NumberOfVRegs());
-    uint32_t* vreg = &vregs_[i];
-    *reinterpret_cast<mirror::Object**>(vreg) = val;
-    if (HasReferenceArray()) {
-      References()[i] = val;
+    // This is needed for moving collectors since these can update the vreg references if they
+    // happen to agree with references in the reference array.
+    if (kMovingCollector && HasReferenceArray()) {
+      References()[i].Clear();
+      References()[i + 1].Clear();
     }
   }
 
-  mirror::ArtMethod* GetMethod() const {
-    DCHECK_NE(method_, static_cast<void*>(NULL));
+  template<VerifyObjectFlags kVerifyFlags = kDefaultVerifyFlags>
+  void SetVRegReference(size_t i, mirror::Object* val) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    DCHECK_LT(i, NumberOfVRegs());
+    if (kVerifyFlags & kVerifyWrites) {
+      VerifyObject(val);
+    }
+    uint32_t* vreg = &vregs_[i];
+    reinterpret_cast<StackReference<mirror::Object>*>(vreg)->Assign(val);
+    if (HasReferenceArray()) {
+      References()[i].Assign(val);
+    }
+  }
+
+  mirror::ArtMethod* GetMethod() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    DCHECK(method_ != nullptr);
     return method_;
+  }
+
+  mirror::ArtMethod** GetMethodAddress() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    DCHECK(method_ != nullptr);
+    return &method_;
   }
 
   mirror::Object* GetThisObject() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -216,7 +315,7 @@ class ShadowFrame {
 
   void SetMethod(mirror::ArtMethod* method) {
 #if defined(ART_USE_PORTABLE_COMPILER)
-    DCHECK_NE(method, static_cast<void*>(NULL));
+    DCHECK(method != nullptr);
     method_ = method;
 #else
     UNUSED(method);
@@ -224,7 +323,7 @@ class ShadowFrame {
 #endif
   }
 
-  bool Contains(mirror::Object** shadow_frame_entry_obj) const {
+  bool Contains(StackReference<mirror::Object>* shadow_frame_entry_obj) const {
     if (HasReferenceArray()) {
       return ((&References()[0] <= shadow_frame_entry_obj) &&
               (shadow_frame_entry_obj <= (&References()[NumberOfVRegs() - 1])));
@@ -264,20 +363,20 @@ class ShadowFrame {
       CHECK_LT(num_vregs, static_cast<uint32_t>(kHasReferenceArray));
       number_of_vregs_ |= kHasReferenceArray;
 #endif
-      memset(vregs_, 0, num_vregs * (sizeof(uint32_t) + sizeof(mirror::Object*)));
+      memset(vregs_, 0, num_vregs * (sizeof(uint32_t) + sizeof(StackReference<mirror::Object>)));
     } else {
       memset(vregs_, 0, num_vregs * sizeof(uint32_t));
     }
   }
 
-  mirror::Object* const* References() const {
+  const StackReference<mirror::Object>* References() const {
     DCHECK(HasReferenceArray());
     const uint32_t* vreg_end = &vregs_[NumberOfVRegs()];
-    return reinterpret_cast<mirror::Object* const*>(vreg_end);
+    return reinterpret_cast<const StackReference<mirror::Object>*>(vreg_end);
   }
 
-  mirror::Object** References() {
-    return const_cast<mirror::Object**>(const_cast<const ShadowFrame*>(this)->References());
+  StackReference<mirror::Object>* References() {
+    return const_cast<StackReference<mirror::Object>*>(const_cast<const ShadowFrame*>(this)->References());
   }
 
 #if defined(ART_USE_PORTABLE_COMPILER)
@@ -291,12 +390,7 @@ class ShadowFrame {
 #endif
   // Link to previous shadow frame or NULL.
   ShadowFrame* link_;
-#if defined(ART_USE_PORTABLE_COMPILER)
-  // TODO: make const in the portable case.
   mirror::ArtMethod* method_;
-#else
-  mirror::ArtMethod* const method_;
-#endif
   uint32_t dex_pc_;
   uint32_t vregs_[0];
 
@@ -331,11 +425,11 @@ class PACKED(4) ManagedStack {
     return link_;
   }
 
-  mirror::ArtMethod** GetTopQuickFrame() const {
+  StackReference<mirror::ArtMethod>* GetTopQuickFrame() const {
     return top_quick_frame_;
   }
 
-  void SetTopQuickFrame(mirror::ArtMethod** top) {
+  void SetTopQuickFrame(StackReference<mirror::ArtMethod>* top) {
     DCHECK(top_shadow_frame_ == NULL);
     top_quick_frame_ = top;
   }
@@ -386,14 +480,14 @@ class PACKED(4) ManagedStack {
     return OFFSETOF_MEMBER(ManagedStack, top_shadow_frame_);
   }
 
-  size_t NumJniShadowFrameReferences() const;
+  size_t NumJniShadowFrameReferences() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  bool ShadowFramesContain(mirror::Object** shadow_frame_entry) const;
+  bool ShadowFramesContain(StackReference<mirror::Object>* shadow_frame_entry) const;
 
  private:
   ManagedStack* link_;
   ShadowFrame* top_shadow_frame_;
-  mirror::ArtMethod** top_quick_frame_;
+  StackReference<mirror::ArtMethod>* top_quick_frame_;
   uintptr_t top_quick_frame_pc_;
 };
 
@@ -410,32 +504,33 @@ class StackVisitor {
   void WalkStack(bool include_transitions = false)
       SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  mirror::ArtMethod* GetMethod() const {
-    if (cur_shadow_frame_ != NULL) {
+  mirror::ArtMethod* GetMethod() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    if (cur_shadow_frame_ != nullptr) {
       return cur_shadow_frame_->GetMethod();
-    } else if (cur_quick_frame_ != NULL) {
-      return *cur_quick_frame_;
+    } else if (cur_quick_frame_ != nullptr) {
+      return cur_quick_frame_->AsMirrorPtr();
     } else {
-      return NULL;
+      return nullptr;
     }
   }
 
   bool IsShadowFrame() const {
-    return cur_shadow_frame_ != NULL;
+    return cur_shadow_frame_ != nullptr;
   }
 
-  uint32_t GetDexPc() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+  uint32_t GetDexPc(bool abort_on_failure = true) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   mirror::Object* GetThisObject() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   size_t GetNativePcOffset() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  uintptr_t* CalleeSaveAddress(int num, size_t frame_size) const {
+  uintptr_t* CalleeSaveAddress(int num, size_t frame_size) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
     // Callee saves are held at the top of the frame
-    DCHECK(GetMethod() != NULL);
+    DCHECK(GetMethod() != nullptr);
     byte* save_addr =
         reinterpret_cast<byte*>(cur_quick_frame_) + frame_size - ((num + 1) * kPointerSize);
-#if defined(__i386__)
+#if defined(__i386__) || defined(__x86_64__)
     save_addr -= kPointerSize;  // account for return address
 #endif
     return reinterpret_cast<uintptr_t*>(save_addr);
@@ -458,90 +553,152 @@ class StackVisitor {
     return num_frames_;
   }
 
-  uint32_t GetVReg(mirror::ArtMethod* m, uint16_t vreg, VRegKind kind) const
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  void SetVReg(mirror::ArtMethod* m, uint16_t vreg, uint32_t new_value, VRegKind kind)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
-
-  uintptr_t GetGPR(uint32_t reg) const;
-  void SetGPR(uint32_t reg, uintptr_t value);
-
-  uint32_t GetVReg(mirror::ArtMethod** cur_quick_frame, const DexFile::CodeItem* code_item,
-                   uint32_t core_spills, uint32_t fp_spills, size_t frame_size,
-                   uint16_t vreg) const {
-    int offset = GetVRegOffset(code_item, core_spills, fp_spills, frame_size, vreg);
-    DCHECK_EQ(cur_quick_frame, GetCurrentQuickFrame());
-    byte* vreg_addr = reinterpret_cast<byte*>(cur_quick_frame) + offset;
-    return *reinterpret_cast<uint32_t*>(vreg_addr);
+  size_t GetFrameDepth() SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    return cur_depth_;
   }
 
-  uintptr_t GetReturnPc() const;
+  // Get the method and dex pc immediately after the one that's currently being visited.
+  bool GetNextMethodAndDexPc(mirror::ArtMethod** next_method, uint32_t* next_dex_pc)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
-  void SetReturnPc(uintptr_t new_ret_pc);
+  bool GetVReg(mirror::ArtMethod* m, uint16_t vreg, VRegKind kind, uint32_t* val) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  uint32_t GetVReg(mirror::ArtMethod* m, uint16_t vreg, VRegKind kind) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    uint32_t val;
+    bool success = GetVReg(m, vreg, kind, &val);
+    CHECK(success) << "Failed to read vreg " << vreg << " of kind " << kind;
+    return val;
+  }
+
+  bool GetVRegPair(mirror::ArtMethod* m, uint16_t vreg, VRegKind kind_lo, VRegKind kind_hi,
+                   uint64_t* val) const
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  uint64_t GetVRegPair(mirror::ArtMethod* m, uint16_t vreg, VRegKind kind_lo,
+                       VRegKind kind_hi) const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
+    uint64_t val;
+    bool success = GetVRegPair(m, vreg, kind_lo, kind_hi, &val);
+    CHECK(success) << "Failed to read vreg pair " << vreg
+                   << " of kind [" << kind_lo << "," << kind_hi << "]";
+    return val;
+  }
+
+  bool SetVReg(mirror::ArtMethod* m, uint16_t vreg, uint32_t new_value, VRegKind kind)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  bool SetVRegPair(mirror::ArtMethod* m, uint16_t vreg, uint64_t new_value,
+                   VRegKind kind_lo, VRegKind kind_hi)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  uintptr_t* GetGPRAddress(uint32_t reg) const;
+
+  // This is a fast-path for getting/setting values in a quick frame.
+  uint32_t* GetVRegAddr(StackReference<mirror::ArtMethod>* cur_quick_frame,
+                        const DexFile::CodeItem* code_item,
+                        uint32_t core_spills, uint32_t fp_spills, size_t frame_size,
+                        uint16_t vreg) const {
+    int offset = GetVRegOffset(code_item, core_spills, fp_spills, frame_size, vreg, kRuntimeISA);
+    DCHECK_EQ(cur_quick_frame, GetCurrentQuickFrame());
+    byte* vreg_addr = reinterpret_cast<byte*>(cur_quick_frame) + offset;
+    return reinterpret_cast<uint32_t*>(vreg_addr);
+  }
+
+  uintptr_t GetReturnPc() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  void SetReturnPc(uintptr_t new_ret_pc) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   /*
    * Return sp-relative offset for a Dalvik virtual register, compiler
    * spill or Method* in bytes using Method*.
-   * Note that (reg >= 0) refers to a Dalvik register, (reg == -2)
-   * denotes Method* and (reg <= -3) denotes a compiler temp.
+   * Note that (reg >= 0) refers to a Dalvik register, (reg == -1)
+   * denotes an invalid Dalvik register, (reg == -2) denotes Method*
+   * and (reg <= -3) denotes a compiler temporary. A compiler temporary
+   * can be thought of as a virtual register that does not exist in the
+   * dex but holds intermediate values to help optimizations and code
+   * generation. A special compiler temporary is one whose location
+   * in frame is well known while non-special ones do not have a requirement
+   * on location in frame as long as code generator itself knows how
+   * to access them.
    *
-   *     +------------------------+
-   *     | IN[ins-1]              |  {Note: resides in caller's frame}
-   *     |       .                |
-   *     | IN[0]                  |
-   *     | caller's Method*       |
-   *     +========================+  {Note: start of callee's frame}
-   *     | core callee-save spill |  {variable sized}
-   *     +------------------------+
-   *     | fp callee-save spill   |
-   *     +------------------------+
-   *     | filler word            |  {For compatibility, if V[locals-1] used as wide
-   *     +------------------------+
-   *     | V[locals-1]            |
-   *     | V[locals-2]            |
-   *     |      .                 |
-   *     |      .                 |  ... (reg == 2)
-   *     | V[1]                   |  ... (reg == 1)
-   *     | V[0]                   |  ... (reg == 0) <---- "locals_start"
-   *     +------------------------+
-   *     | Compiler temps         |  ... (reg == -2)
-   *     |                        |  ... (reg == -3)
-   *     |                        |  ... (reg == -4)
-   *     +------------------------+
-   *     | stack alignment padding|  {0 to (kStackAlignWords-1) of padding}
-   *     +------------------------+
-   *     | OUT[outs-1]            |
-   *     | OUT[outs-2]            |
-   *     |       .                |
-   *     | OUT[0]                 |
-   *     | curMethod*             |  ... (reg == -1) <<== sp, 16-byte aligned
-   *     +========================+
+   *     +---------------------------+
+   *     | IN[ins-1]                 |  {Note: resides in caller's frame}
+   *     |       .                   |
+   *     | IN[0]                     |
+   *     | caller's ArtMethod        |  ... StackReference<ArtMethod>
+   *     +===========================+  {Note: start of callee's frame}
+   *     | core callee-save spill    |  {variable sized}
+   *     +---------------------------+
+   *     | fp callee-save spill      |
+   *     +---------------------------+
+   *     | filler word               |  {For compatibility, if V[locals-1] used as wide
+   *     +---------------------------+
+   *     | V[locals-1]               |
+   *     | V[locals-2]               |
+   *     |      .                    |
+   *     |      .                    |  ... (reg == 2)
+   *     | V[1]                      |  ... (reg == 1)
+   *     | V[0]                      |  ... (reg == 0) <---- "locals_start"
+   *     +---------------------------+
+   *     | Compiler temp region      |  ... (reg <= -3)
+   *     |                           |
+   *     |                           |
+   *     +---------------------------+
+   *     | stack alignment padding   |  {0 to (kStackAlignWords-1) of padding}
+   *     +---------------------------+
+   *     | OUT[outs-1]               |
+   *     | OUT[outs-2]               |
+   *     |       .                   |
+   *     | OUT[0]                    |
+   *     | StackReference<ArtMethod> |  ... (reg == -2) <<== sp, 16-byte aligned
+   *     +===========================+
    */
   static int GetVRegOffset(const DexFile::CodeItem* code_item,
                            uint32_t core_spills, uint32_t fp_spills,
-                           size_t frame_size, int reg) {
+                           size_t frame_size, int reg, InstructionSet isa) {
     DCHECK_EQ(frame_size & (kStackAlignment - 1), 0U);
-    int num_spills = __builtin_popcount(core_spills) + __builtin_popcount(fp_spills) + 1;  // Filler.
+    DCHECK_NE(reg, static_cast<int>(kVRegInvalid));
+    int spill_size = POPCOUNT(core_spills) * GetBytesPerGprSpillLocation(isa)
+        + POPCOUNT(fp_spills) * GetBytesPerFprSpillLocation(isa)
+        + sizeof(uint32_t);  // Filler.
     int num_ins = code_item->ins_size_;
     int num_regs = code_item->registers_size_ - num_ins;
-    int locals_start = frame_size - ((num_spills + num_regs) * sizeof(uint32_t));
-    if (reg == -2) {
-      return 0;  // Method*
-    } else if (reg <= -3) {
-      return locals_start - ((reg + 1) * sizeof(uint32_t));  // Compiler temp.
-    } else if (reg < num_regs) {
-      return locals_start + (reg * sizeof(uint32_t));        // Dalvik local reg.
+    int locals_start = frame_size - spill_size - num_regs * sizeof(uint32_t);
+    if (reg == static_cast<int>(kVRegMethodPtrBaseReg)) {
+      // The current method pointer corresponds to special location on stack.
+      return 0;
+    } else if (reg <= static_cast<int>(kVRegNonSpecialTempBaseReg)) {
+      /*
+       * Special temporaries may have custom locations and the logic above deals with that.
+       * However, non-special temporaries are placed relative to the locals. Since the
+       * virtual register numbers for temporaries "grow" in negative direction, reg number
+       * will always be <= to the temp base reg. Thus, the logic ensures that the first
+       * temp is at offset -4 bytes from locals, the second is at -8 bytes from locals,
+       * and so on.
+       */
+      int relative_offset =
+          (reg + std::abs(static_cast<int>(kVRegNonSpecialTempBaseReg)) - 1) * sizeof(uint32_t);
+      return locals_start + relative_offset;
+    }  else if (reg < num_regs) {
+      return locals_start + (reg * sizeof(uint32_t));
     } else {
-      return frame_size + ((reg - num_regs) * sizeof(uint32_t)) + sizeof(uint32_t);  // Dalvik in.
+      // Handle ins.
+      return frame_size + ((reg - num_regs) * sizeof(uint32_t)) +
+          sizeof(StackReference<mirror::ArtMethod>);
     }
+  }
+
+  static int GetOutVROffset(uint16_t out_num, InstructionSet isa) {
+    // According to stack model, the first out is above the Method referernce.
+    return sizeof(StackReference<mirror::ArtMethod>) + (out_num * sizeof(uint32_t));
   }
 
   uintptr_t GetCurrentQuickFramePc() const {
     return cur_quick_frame_pc_;
   }
 
-  mirror::ArtMethod** GetCurrentQuickFrame() const {
+  StackReference<mirror::ArtMethod>* GetCurrentQuickFrame() const {
     return cur_quick_frame_;
   }
 
@@ -549,10 +706,10 @@ class StackVisitor {
     return cur_shadow_frame_;
   }
 
-  StackIndirectReferenceTable* GetCurrentSirt() const {
-    mirror::ArtMethod** sp = GetCurrentQuickFrame();
-    ++sp;  // Skip Method*; SIRT comes next;
-    return reinterpret_cast<StackIndirectReferenceTable*>(sp);
+  HandleScope* GetCurrentHandleScope() const {
+    StackReference<mirror::ArtMethod>* sp = GetCurrentQuickFrame();
+    ++sp;  // Skip Method*; handle scope comes next;
+    return reinterpret_cast<HandleScope*>(sp);
   }
 
   std::string DescribeLocation() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
@@ -562,13 +719,20 @@ class StackVisitor {
   static void DescribeStack(Thread* thread) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
  private:
-  instrumentation::InstrumentationStackFrame GetInstrumentationStackFrame(uint32_t depth) const;
+  // Private constructor known in the case that num_frames_ has already been computed.
+  StackVisitor(Thread* thread, Context* context, size_t num_frames)
+      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
+
+  bool GetGPR(uint32_t reg, uintptr_t* val) const;
+  bool SetGPR(uint32_t reg, uintptr_t value);
+  bool GetFPR(uint32_t reg, uintptr_t* val) const;
+  bool SetFPR(uint32_t reg, uintptr_t value);
 
   void SanityCheckFrame() const SHARED_LOCKS_REQUIRED(Locks::mutator_lock_);
 
   Thread* const thread_;
   ShadowFrame* cur_shadow_frame_;
-  mirror::ArtMethod** cur_quick_frame_;
+  StackReference<mirror::ArtMethod>* cur_quick_frame_;
   uintptr_t cur_quick_frame_pc_;
   // Lazily computed, number of frames in the stack.
   size_t num_frames_;

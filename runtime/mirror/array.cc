@@ -18,14 +18,14 @@
 
 #include "class.h"
 #include "class-inl.h"
+#include "class_linker-inl.h"
 #include "common_throws.h"
 #include "dex_file-inl.h"
 #include "gc/accounting/card_table-inl.h"
 #include "object-inl.h"
 #include "object_array.h"
 #include "object_array-inl.h"
-#include "object_utils.h"
-#include "sirt_ref.h"
+#include "handle_scope-inl.h"
 #include "thread.h"
 #include "utils.h"
 
@@ -40,31 +40,40 @@ namespace mirror {
 // piece and work our way in.
 // Recursively create an array with multiple dimensions.  Elements may be
 // Objects or primitive types.
-static Array* RecursiveCreateMultiArray(Thread* self, Class* array_class, int current_dimension,
-                                        IntArray* dimensions)
+static Array* RecursiveCreateMultiArray(Thread* self,
+                                        Handle<Class> array_class, int current_dimension,
+                                        Handle<mirror::IntArray> dimensions)
     SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
   int32_t array_length = dimensions->Get(current_dimension);
-  SirtRef<Array> new_array(self, Array::Alloc(self, array_class, array_length));
-  if (UNLIKELY(new_array.get() == NULL)) {
+  StackHandleScope<1> hs(self);
+  Handle<Array> new_array(
+      hs.NewHandle(
+          Array::Alloc<true>(self, array_class.Get(), array_length, array_class->GetComponentSize(),
+                             Runtime::Current()->GetHeap()->GetCurrentAllocator())));
+  if (UNLIKELY(new_array.Get() == nullptr)) {
     CHECK(self->IsExceptionPending());
-    return NULL;
+    return nullptr;
   }
-  if ((current_dimension + 1) < dimensions->GetLength()) {
+  if (current_dimension + 1 < dimensions->GetLength()) {
     // Create a new sub-array in every element of the array.
     for (int32_t i = 0; i < array_length; i++) {
-      Array* sub_array = RecursiveCreateMultiArray(self, array_class->GetComponentType(),
+      StackHandleScope<1> hs(self);
+      Handle<mirror::Class> h_component_type(hs.NewHandle(array_class->GetComponentType()));
+      Array* sub_array = RecursiveCreateMultiArray(self, h_component_type,
                                                    current_dimension + 1, dimensions);
-      if (UNLIKELY(sub_array == NULL)) {
+      if (UNLIKELY(sub_array == nullptr)) {
         CHECK(self->IsExceptionPending());
-        return NULL;
+        return nullptr;
       }
-      new_array->AsObjectArray<Array>()->Set(i, sub_array);
+      // Use non-transactional mode without check.
+      new_array->AsObjectArray<Array>()->Set<false, false>(i, sub_array);
     }
   }
-  return new_array.get();
+  return new_array.Get();
 }
 
-Array* Array::CreateMultiArray(Thread* self, Class* element_class, IntArray* dimensions) {
+Array* Array::CreateMultiArray(Thread* self, Handle<Class> element_class,
+                               Handle<IntArray> dimensions) {
   // Verify dimensions.
   //
   // The caller is responsible for verifying that "dimArray" is non-null
@@ -77,46 +86,45 @@ Array* Array::CreateMultiArray(Thread* self, Class* element_class, IntArray* dim
     int dimension = dimensions->Get(i);
     if (UNLIKELY(dimension < 0)) {
       ThrowNegativeArraySizeException(StringPrintf("Dimension %d: %d", i, dimension).c_str());
-      return NULL;
+      return nullptr;
     }
   }
 
-  // Generate the full name of the array class.
-  std::string descriptor(num_dimensions, '[');
-  descriptor += ClassHelper(element_class).GetDescriptor();
-
   // Find/generate the array class.
   ClassLinker* class_linker = Runtime::Current()->GetClassLinker();
-  Class* array_class = class_linker->FindClass(descriptor.c_str(), element_class->GetClassLoader());
-  if (UNLIKELY(array_class == NULL)) {
+  mirror::Class* element_class_ptr = element_class.Get();
+  StackHandleScope<1> hs(self);
+  Handle<mirror::Class> array_class(
+      hs.NewHandle(class_linker->FindArrayClass(self, &element_class_ptr)));
+  if (UNLIKELY(array_class.Get() == nullptr)) {
     CHECK(self->IsExceptionPending());
-    return NULL;
+    return nullptr;
   }
-  // create the array
+  for (int32_t i = 1; i < dimensions->GetLength(); ++i) {
+    mirror::Class* array_class_ptr = array_class.Get();
+    array_class.Assign(class_linker->FindArrayClass(self, &array_class_ptr));
+    if (UNLIKELY(array_class.Get() == nullptr)) {
+      CHECK(self->IsExceptionPending());
+      return nullptr;
+    }
+  }
+  // Create the array.
   Array* new_array = RecursiveCreateMultiArray(self, array_class, 0, dimensions);
-  if (UNLIKELY(new_array == NULL)) {
+  if (UNLIKELY(new_array == nullptr)) {
     CHECK(self->IsExceptionPending());
-    return NULL;
   }
   return new_array;
 }
 
-void Array::ThrowArrayIndexOutOfBoundsException(int32_t index) const {
+void Array::ThrowArrayIndexOutOfBoundsException(int32_t index) {
   art::ThrowArrayIndexOutOfBoundsException(index, GetLength());
 }
 
-void Array::ThrowArrayStoreException(Object* object) const {
+void Array::ThrowArrayStoreException(Object* object) {
   art::ThrowArrayStoreException(object->GetClass(), this->GetClass());
 }
 
-template<typename T>
-PrimitiveArray<T>* PrimitiveArray<T>::Alloc(Thread* self, size_t length) {
-  DCHECK(array_class_ != NULL);
-  Array* raw_array = Array::Alloc(self, array_class_, length, sizeof(T));
-  return down_cast<PrimitiveArray<T>*>(raw_array);
-}
-
-template <typename T> Class* PrimitiveArray<T>::array_class_ = NULL;
+template <typename T> GcRoot<Class> PrimitiveArray<T>::array_class_;
 
 // Explicitly instantiate all the primitive array types.
 template class PrimitiveArray<uint8_t>;   // BooleanArray

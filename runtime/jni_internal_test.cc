@@ -16,704 +16,86 @@
 
 #include "jni_internal.h"
 
-#include <limits.h>
-#include <cfloat>
-#include <cmath>
-
-#include "common_test.h"
-#include "invoke_arg_array_builder.h"
+#include "common_compiler_test.h"
 #include "mirror/art_method-inl.h"
-#include "mirror/class-inl.h"
-#include "mirror/object_array-inl.h"
-#include "mirror/object-inl.h"
+#include "mirror/string-inl.h"
+#include "scoped_thread_state_change.h"
 #include "ScopedLocalRef.h"
-#include "sirt_ref.h"
 
 namespace art {
 
-class JniInternalTest : public CommonTest {
+// TODO: Convert to CommonRuntimeTest. Currently MakeExecutable is used.
+class JniInternalTest : public CommonCompilerTest {
  protected:
   virtual void SetUp() {
-    CommonTest::SetUp();
+    CommonCompilerTest::SetUp();
 
     vm_ = Runtime::Current()->GetJavaVM();
 
     // Turn on -verbose:jni for the JNI tests.
     // gLogVerbosity.jni = true;
 
-    vm_->AttachCurrentThread(&env_, NULL);
+    vm_->AttachCurrentThread(&env_, nullptr);
 
     ScopedLocalRef<jclass> aioobe(env_,
                                   env_->FindClass("java/lang/ArrayIndexOutOfBoundsException"));
-    CHECK(aioobe.get() != NULL);
+    CHECK(aioobe.get() != nullptr);
     aioobe_ = reinterpret_cast<jclass>(env_->NewGlobalRef(aioobe.get()));
 
     ScopedLocalRef<jclass> ase(env_, env_->FindClass("java/lang/ArrayStoreException"));
-    CHECK(ase.get() != NULL);
+    CHECK(ase.get() != nullptr);
     ase_ = reinterpret_cast<jclass>(env_->NewGlobalRef(ase.get()));
 
     ScopedLocalRef<jclass> sioobe(env_,
                                   env_->FindClass("java/lang/StringIndexOutOfBoundsException"));
-    CHECK(sioobe.get() != NULL);
+    CHECK(sioobe.get() != nullptr);
     sioobe_ = reinterpret_cast<jclass>(env_->NewGlobalRef(sioobe.get()));
   }
 
+  void ExpectException(jclass exception_class) {
+    EXPECT_TRUE(env_->ExceptionCheck());
+    jthrowable exception = env_->ExceptionOccurred();
+    EXPECT_NE(nullptr, exception);
+    env_->ExceptionClear();
+    EXPECT_TRUE(env_->IsInstanceOf(exception, exception_class));
+  }
+
+  void ExpectClassFound(const char* name) {
+    EXPECT_NE(env_->FindClass(name), nullptr) << name;
+    EXPECT_FALSE(env_->ExceptionCheck()) << name;
+  }
+
+  void ExpectClassNotFound(const char* name) {
+    EXPECT_EQ(env_->FindClass(name), nullptr) << name;
+    EXPECT_TRUE(env_->ExceptionCheck()) << name;
+    env_->ExceptionClear();
+  }
+
   void CleanUpJniEnv() {
-    if (aioobe_ != NULL) {
+    if (aioobe_ != nullptr) {
       env_->DeleteGlobalRef(aioobe_);
-      aioobe_ = NULL;
+      aioobe_ = nullptr;
     }
-    if (ase_ != NULL) {
+    if (ase_ != nullptr) {
       env_->DeleteGlobalRef(ase_);
-      ase_ = NULL;
+      ase_ = nullptr;
     }
-    if (sioobe_ != NULL) {
+    if (sioobe_ != nullptr) {
       env_->DeleteGlobalRef(sioobe_);
-      sioobe_ = NULL;
+      sioobe_ = nullptr;
     }
   }
 
-  virtual void TearDown() {
+  virtual void TearDown() OVERRIDE {
     CleanUpJniEnv();
-    CommonTest::TearDown();
+    CommonCompilerTest::TearDown();
   }
 
-  void DoCompile(mirror::ArtMethod*& method,
-                 mirror::Object*& receiver,
-                 bool is_static, const char* method_name,
-                 const char* method_signature)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    const char* class_name = is_static ? "StaticLeafMethods" : "NonStaticLeafMethods";
-    jobject jclass_loader(LoadDex(class_name));
-    Thread* self = Thread::Current();
-    SirtRef<mirror::ClassLoader>
-        class_loader(self,
-                     ScopedObjectAccessUnchecked(self).Decode<mirror::ClassLoader*>(jclass_loader));
-    if (is_static) {
-      CompileDirectMethod(class_loader.get(), class_name, method_name, method_signature);
-    } else {
-      CompileVirtualMethod(NULL, "java.lang.Class", "isFinalizable", "()Z");
-      CompileDirectMethod(NULL, "java.lang.Object", "<init>", "()V");
-      CompileVirtualMethod(class_loader.get(), class_name, method_name, method_signature);
-    }
-
-    mirror::Class* c = class_linker_->FindClass(DotToDescriptor(class_name).c_str(),
-                                                class_loader.get());
-    CHECK(c != NULL);
-
-    method = is_static ? c->FindDirectMethod(method_name, method_signature)
-                       : c->FindVirtualMethod(method_name, method_signature);
-    CHECK(method != NULL);
-
-    receiver = (is_static ? NULL : c->AllocObject(self));
-
-    // Start runtime.
-    bool started = runtime_->Start();
-    CHECK(started);
-    self->TransitionFromSuspendedToRunnable();
-  }
-
-  void InvokeNopMethod(bool is_static) SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "nop", "()V");
-
-    ArgArray arg_array(NULL, 0);
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-    }
-
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'V');
-  }
-
-  void InvokeIdentityByteMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "identity", "(I)I");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    arg_array.Append(0);
-    result.SetB(-1);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'B');
-    EXPECT_EQ(0, result.GetB());
-
-    args[0] = -1;
-    result.SetB(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'B');
-    EXPECT_EQ(-1, result.GetB());
-
-    args[0] = SCHAR_MAX;
-    result.SetB(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'B');
-    EXPECT_EQ(SCHAR_MAX, result.GetB());
-
-    args[0] = (SCHAR_MIN << 24) >> 24;
-    result.SetB(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'B');
-    EXPECT_EQ(SCHAR_MIN, result.GetB());
-  }
-
-  void InvokeIdentityIntMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "identity", "(I)I");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    arg_array.Append(0);
-    result.SetI(-1);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(0, result.GetI());
-
-    args[0] = -1;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(-1, result.GetI());
-
-    args[0] = INT_MAX;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(INT_MAX, result.GetI());
-
-    args[0] = INT_MIN;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(INT_MIN, result.GetI());
-  }
-
-  void InvokeIdentityDoubleMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "identity", "(D)D");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue value;
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    value.SetD(0.0);
-    arg_array.AppendWide(value.GetJ());
-    result.SetD(-1.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(0.0, result.GetD());
-
-    value.SetD(-1.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(-1.0, result.GetD());
-
-    value.SetD(DBL_MAX);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(DBL_MAX, result.GetD());
-
-    value.SetD(DBL_MIN);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(DBL_MIN, result.GetD());
-  }
-
-  void InvokeSumIntIntMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "sum", "(II)I");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    arg_array.Append(0);
-    arg_array.Append(0);
-    result.SetI(-1);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(0, result.GetI());
-
-    args[0] = 1;
-    args[1] = 2;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(3, result.GetI());
-
-    args[0] = -2;
-    args[1] = 5;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(3, result.GetI());
-
-    args[0] = INT_MAX;
-    args[1] = INT_MIN;
-    result.SetI(1234);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(-1, result.GetI());
-
-    args[0] = INT_MAX;
-    args[1] = INT_MAX;
-    result.SetI(INT_MIN);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(-2, result.GetI());
-  }
-
-  void InvokeSumIntIntIntMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "sum", "(III)I");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    arg_array.Append(0);
-    arg_array.Append(0);
-    arg_array.Append(0);
-    result.SetI(-1);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(0, result.GetI());
-
-    args[0] = 1;
-    args[1] = 2;
-    args[2] = 3;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(6, result.GetI());
-
-    args[0] = -1;
-    args[1] = 2;
-    args[2] = -3;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(-2, result.GetI());
-
-    args[0] = INT_MAX;
-    args[1] = INT_MIN;
-    args[2] = INT_MAX;
-    result.SetI(1234);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(2147483646, result.GetI());
-
-    args[0] = INT_MAX;
-    args[1] = INT_MAX;
-    args[2] = INT_MAX;
-    result.SetI(INT_MIN);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(2147483645, result.GetI());
-  }
-
-  void InvokeSumIntIntIntIntMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "sum", "(IIII)I");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    arg_array.Append(0);
-    arg_array.Append(0);
-    arg_array.Append(0);
-    arg_array.Append(0);
-    result.SetI(-1);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(0, result.GetI());
-
-    args[0] = 1;
-    args[1] = 2;
-    args[2] = 3;
-    args[3] = 4;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(10, result.GetI());
-
-    args[0] = -1;
-    args[1] = 2;
-    args[2] = -3;
-    args[3] = 4;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(2, result.GetI());
-
-    args[0] = INT_MAX;
-    args[1] = INT_MIN;
-    args[2] = INT_MAX;
-    args[3] = INT_MIN;
-    result.SetI(1234);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(-2, result.GetI());
-
-    args[0] = INT_MAX;
-    args[1] = INT_MAX;
-    args[2] = INT_MAX;
-    args[3] = INT_MAX;
-    result.SetI(INT_MIN);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(-4, result.GetI());
-  }
-
-  void InvokeSumIntIntIntIntIntMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "sum", "(IIIII)I");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    arg_array.Append(0);
-    arg_array.Append(0);
-    arg_array.Append(0);
-    arg_array.Append(0);
-    arg_array.Append(0);
-    result.SetI(-1.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(0, result.GetI());
-
-    args[0] = 1;
-    args[1] = 2;
-    args[2] = 3;
-    args[3] = 4;
-    args[4] = 5;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(15, result.GetI());
-
-    args[0] = -1;
-    args[1] = 2;
-    args[2] = -3;
-    args[3] = 4;
-    args[4] = -5;
-    result.SetI(0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(-3, result.GetI());
-
-    args[0] = INT_MAX;
-    args[1] = INT_MIN;
-    args[2] = INT_MAX;
-    args[3] = INT_MIN;
-    args[4] = INT_MAX;
-    result.SetI(1234);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(2147483645, result.GetI());
-
-    args[0] = INT_MAX;
-    args[1] = INT_MAX;
-    args[2] = INT_MAX;
-    args[3] = INT_MAX;
-    args[4] = INT_MAX;
-    result.SetI(INT_MIN);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'I');
-    EXPECT_EQ(2147483643, result.GetI());
-  }
-
-  void InvokeSumDoubleDoubleMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "sum", "(DD)D");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue value;
-    JValue value2;
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    value.SetD(0.0);
-    value2.SetD(0.0);
-    arg_array.AppendWide(value.GetJ());
-    arg_array.AppendWide(value2.GetJ());
-    result.SetD(-1.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(0.0, result.GetD());
-
-    value.SetD(1.0);
-    value2.SetD(2.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(3.0, result.GetD());
-
-    value.SetD(1.0);
-    value2.SetD(-2.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(-1.0, result.GetD());
-
-    value.SetD(DBL_MAX);
-    value2.SetD(DBL_MIN);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(1.7976931348623157e308, result.GetD());
-
-    value.SetD(DBL_MAX);
-    value2.SetD(DBL_MAX);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(INFINITY, result.GetD());
-  }
-
-  void InvokeSumDoubleDoubleDoubleMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "sum", "(DDD)D");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue value;
-    JValue value2;
-    JValue value3;
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    value.SetD(0.0);
-    value2.SetD(0.0);
-    value3.SetD(0.0);
-    arg_array.AppendWide(value.GetJ());
-    arg_array.AppendWide(value2.GetJ());
-    arg_array.AppendWide(value3.GetJ());
-    result.SetD(-1.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(0.0, result.GetD());
-
-    value.SetD(1.0);
-    value2.SetD(2.0);
-    value3.SetD(3.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    args[4] = value3.GetJ();
-    args[5] = value3.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(6.0, result.GetD());
-
-    value.SetD(1.0);
-    value2.SetD(-2.0);
-    value3.SetD(3.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    args[4] = value3.GetJ();
-    args[5] = value3.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(2.0, result.GetD());
-  }
-
-  void InvokeSumDoubleDoubleDoubleDoubleMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "sum", "(DDDD)D");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue value;
-    JValue value2;
-    JValue value3;
-    JValue value4;
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    value.SetD(0.0);
-    value2.SetD(0.0);
-    value3.SetD(0.0);
-    value4.SetD(0.0);
-    arg_array.AppendWide(value.GetJ());
-    arg_array.AppendWide(value2.GetJ());
-    arg_array.AppendWide(value3.GetJ());
-    arg_array.AppendWide(value4.GetJ());
-    result.SetD(-1.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(0.0, result.GetD());
-
-    value.SetD(1.0);
-    value2.SetD(2.0);
-    value3.SetD(3.0);
-    value4.SetD(4.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    args[4] = value3.GetJ();
-    args[5] = value3.GetJ() >> 32;
-    args[6] = value4.GetJ();
-    args[7] = value4.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(10.0, result.GetD());
-
-    value.SetD(1.0);
-    value2.SetD(-2.0);
-    value3.SetD(3.0);
-    value4.SetD(-4.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    args[4] = value3.GetJ();
-    args[5] = value3.GetJ() >> 32;
-    args[6] = value4.GetJ();
-    args[7] = value4.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(-2.0, result.GetD());
-  }
-
-  void InvokeSumDoubleDoubleDoubleDoubleDoubleMethod(bool is_static)
-      SHARED_LOCKS_REQUIRED(Locks::mutator_lock_) {
-    mirror::ArtMethod* method;
-    mirror::Object* receiver;
-    DoCompile(method, receiver, is_static, "sum", "(DDDDD)D");
-
-    ArgArray arg_array(NULL, 0);
-    uint32_t* args = arg_array.GetArray();
-    JValue value;
-    JValue value2;
-    JValue value3;
-    JValue value4;
-    JValue value5;
-    JValue result;
-
-    if (!is_static) {
-      arg_array.Append(reinterpret_cast<uint32_t>(receiver));
-      args++;
-    }
-
-    value.SetD(0.0);
-    value2.SetD(0.0);
-    value3.SetD(0.0);
-    value4.SetD(0.0);
-    value5.SetD(0.0);
-    arg_array.AppendWide(value.GetJ());
-    arg_array.AppendWide(value2.GetJ());
-    arg_array.AppendWide(value3.GetJ());
-    arg_array.AppendWide(value4.GetJ());
-    arg_array.AppendWide(value5.GetJ());
-    result.SetD(-1.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(0.0, result.GetD());
-
-    value.SetD(1.0);
-    value2.SetD(2.0);
-    value3.SetD(3.0);
-    value4.SetD(4.0);
-    value5.SetD(5.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    args[4] = value3.GetJ();
-    args[5] = value3.GetJ() >> 32;
-    args[6] = value4.GetJ();
-    args[7] = value4.GetJ() >> 32;
-    args[8] = value5.GetJ();
-    args[9] = value5.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(15.0, result.GetD());
-
-    value.SetD(1.0);
-    value2.SetD(-2.0);
-    value3.SetD(3.0);
-    value4.SetD(-4.0);
-    value5.SetD(5.0);
-    args[0] = value.GetJ();
-    args[1] = value.GetJ() >> 32;
-    args[2] = value2.GetJ();
-    args[3] = value2.GetJ() >> 32;
-    args[4] = value3.GetJ();
-    args[5] = value3.GetJ() >> 32;
-    args[6] = value4.GetJ();
-    args[7] = value4.GetJ() >> 32;
-    args[8] = value5.GetJ();
-    args[9] = value5.GetJ() >> 32;
-    result.SetD(0.0);
-    method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'D');
-    EXPECT_EQ(3.0, result.GetD());
+  jclass GetPrimitiveClass(char descriptor) {
+    ScopedObjectAccess soa(env_);
+    mirror::Class* c = class_linker_->FindPrimitiveClass(descriptor);
+    CHECK(c != nullptr);
+    return soa.AddLocalReference<jclass>(c);
   }
 
   JavaVMExt* vm_;
@@ -725,9 +107,9 @@ class JniInternalTest : public CommonTest {
 
 TEST_F(JniInternalTest, AllocObject) {
   jclass c = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(c != NULL);
+  ASSERT_NE(c, nullptr);
   jobject o = env_->AllocObject(c);
-  ASSERT_TRUE(o != NULL);
+  ASSERT_NE(o, nullptr);
 
   // We have an instance of the class we asked for...
   ASSERT_TRUE(env_->IsInstanceOf(o, c));
@@ -735,170 +117,217 @@ TEST_F(JniInternalTest, AllocObject) {
   // we didn't call a constructor.
   ASSERT_EQ(0, env_->GetIntField(o, env_->GetFieldID(c, "count", "I")));
   ASSERT_EQ(0, env_->GetIntField(o, env_->GetFieldID(c, "offset", "I")));
-  ASSERT_TRUE(env_->GetObjectField(o, env_->GetFieldID(c, "value", "[C")) == NULL);
+  ASSERT_TRUE(env_->GetObjectField(o, env_->GetFieldID(c, "value", "[C")) == nullptr);
 }
 
 TEST_F(JniInternalTest, GetVersion) {
   ASSERT_EQ(JNI_VERSION_1_6, env_->GetVersion());
 }
 
-#define EXPECT_CLASS_FOUND(NAME) \
-  EXPECT_TRUE(env_->FindClass(NAME) != NULL); \
-  EXPECT_FALSE(env_->ExceptionCheck())
-
-#define EXPECT_CLASS_NOT_FOUND(NAME) \
-  EXPECT_TRUE(env_->FindClass(NAME) == NULL); \
-  EXPECT_TRUE(env_->ExceptionCheck()); \
-  env_->ExceptionClear()
-
 TEST_F(JniInternalTest, FindClass) {
   // Reference types...
-  EXPECT_CLASS_FOUND("java/lang/String");
+  ExpectClassFound("java/lang/String");
   // ...for arrays too, where you must include "L;".
-  EXPECT_CLASS_FOUND("[Ljava/lang/String;");
+  ExpectClassFound("[Ljava/lang/String;");
   // Primitive arrays are okay too, if the primitive type is valid.
-  EXPECT_CLASS_FOUND("[C");
+  ExpectClassFound("[C");
 
   {
-    // We support . as well as / for compatibility, if -Xcheck:jni is off.
     CheckJniAbortCatcher check_jni_abort_catcher;
-    EXPECT_CLASS_FOUND("java.lang.String");
+    env_->FindClass(nullptr);
+    check_jni_abort_catcher.Check("name == null");
+
+    // We support . as well as / for compatibility, if -Xcheck:jni is off.
+    ExpectClassFound("java.lang.String");
     check_jni_abort_catcher.Check("illegal class name 'java.lang.String'");
-    EXPECT_CLASS_NOT_FOUND("Ljava.lang.String;");
+    ExpectClassNotFound("Ljava.lang.String;");
     check_jni_abort_catcher.Check("illegal class name 'Ljava.lang.String;'");
-    EXPECT_CLASS_FOUND("[Ljava.lang.String;");
+    ExpectClassFound("[Ljava.lang.String;");
     check_jni_abort_catcher.Check("illegal class name '[Ljava.lang.String;'");
-    EXPECT_CLASS_NOT_FOUND("[java.lang.String");
+    ExpectClassNotFound("[java.lang.String");
     check_jni_abort_catcher.Check("illegal class name '[java.lang.String'");
 
     // You can't include the "L;" in a JNI class descriptor.
-    EXPECT_CLASS_NOT_FOUND("Ljava/lang/String;");
+    ExpectClassNotFound("Ljava/lang/String;");
     check_jni_abort_catcher.Check("illegal class name 'Ljava/lang/String;'");
 
     // But you must include it for an array of any reference type.
-    EXPECT_CLASS_NOT_FOUND("[java/lang/String");
+    ExpectClassNotFound("[java/lang/String");
     check_jni_abort_catcher.Check("illegal class name '[java/lang/String'");
 
-    EXPECT_CLASS_NOT_FOUND("[K");
+    ExpectClassNotFound("[K");
     check_jni_abort_catcher.Check("illegal class name '[K'");
+
+    // Void arrays aren't allowed.
+    ExpectClassNotFound("[V");
+    check_jni_abort_catcher.Check("illegal class name '[V'");
   }
 
   // But primitive types aren't allowed...
-  EXPECT_CLASS_NOT_FOUND("C");
-  EXPECT_CLASS_NOT_FOUND("K");
+  ExpectClassNotFound("C");
+  ExpectClassNotFound("V");
+  ExpectClassNotFound("K");
 }
-
-#define EXPECT_EXCEPTION(exception_class) \
-  do { \
-    EXPECT_TRUE(env_->ExceptionCheck()); \
-    jthrowable exception = env_->ExceptionOccurred(); \
-    EXPECT_NE(static_cast<jthrowable>(NULL), exception); \
-    env_->ExceptionClear(); \
-    EXPECT_TRUE(env_->IsInstanceOf(exception, exception_class)); \
-  } while (false)
 
 TEST_F(JniInternalTest, GetFieldID) {
   jclass jlnsfe = env_->FindClass("java/lang/NoSuchFieldError");
-  ASSERT_TRUE(jlnsfe != NULL);
+  ASSERT_NE(jlnsfe, nullptr);
   jclass c = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(c != NULL);
+  ASSERT_NE(c, nullptr);
 
   // Wrong type.
   jfieldID fid = env_->GetFieldID(c, "count", "J");
-  EXPECT_EQ(static_cast<jfieldID>(NULL), fid);
-  EXPECT_EXCEPTION(jlnsfe);
+  EXPECT_EQ(nullptr, fid);
+  ExpectException(jlnsfe);
 
   // Wrong type where type doesn't exist.
   fid = env_->GetFieldID(c, "count", "Lrod/jane/freddy;");
-  EXPECT_EQ(static_cast<jfieldID>(NULL), fid);
-  EXPECT_EXCEPTION(jlnsfe);
+  EXPECT_EQ(nullptr, fid);
+  ExpectException(jlnsfe);
 
   // Wrong name.
   fid = env_->GetFieldID(c, "Count", "I");
-  EXPECT_EQ(static_cast<jfieldID>(NULL), fid);
-  EXPECT_EXCEPTION(jlnsfe);
+  EXPECT_EQ(nullptr, fid);
+  ExpectException(jlnsfe);
 
   // Good declared field lookup.
   fid = env_->GetFieldID(c, "count", "I");
-  EXPECT_NE(static_cast<jfieldID>(NULL), fid);
-  EXPECT_TRUE(fid != NULL);
+  EXPECT_NE(nullptr, fid);
   EXPECT_FALSE(env_->ExceptionCheck());
 
   // Good superclass field lookup.
   c = env_->FindClass("java/lang/StringBuilder");
   fid = env_->GetFieldID(c, "count", "I");
-  EXPECT_NE(static_cast<jfieldID>(NULL), fid);
-  EXPECT_TRUE(fid != NULL);
+  EXPECT_NE(nullptr, fid);
+  EXPECT_NE(fid, nullptr);
   EXPECT_FALSE(env_->ExceptionCheck());
 
   // Not instance.
   fid = env_->GetFieldID(c, "CASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;");
-  EXPECT_EQ(static_cast<jfieldID>(NULL), fid);
-  EXPECT_EXCEPTION(jlnsfe);
+  EXPECT_EQ(nullptr, fid);
+  ExpectException(jlnsfe);
+
+  // Bad arguments.
+  CheckJniAbortCatcher check_jni_abort_catcher;
+  fid = env_->GetFieldID(nullptr, "count", "I");
+  EXPECT_EQ(nullptr, fid);
+  check_jni_abort_catcher.Check("java_class == null");
+  fid = env_->GetFieldID(c, nullptr, "I");
+  EXPECT_EQ(nullptr, fid);
+  check_jni_abort_catcher.Check("name == null");
+  fid = env_->GetFieldID(c, "count", nullptr);
+  EXPECT_EQ(nullptr, fid);
+  check_jni_abort_catcher.Check("sig == null");
 }
 
 TEST_F(JniInternalTest, GetStaticFieldID) {
   jclass jlnsfe = env_->FindClass("java/lang/NoSuchFieldError");
-  ASSERT_TRUE(jlnsfe != NULL);
+  ASSERT_NE(jlnsfe, nullptr);
   jclass c = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(c != NULL);
+  ASSERT_NE(c, nullptr);
 
   // Wrong type.
   jfieldID fid = env_->GetStaticFieldID(c, "CASE_INSENSITIVE_ORDER", "J");
-  EXPECT_EQ(static_cast<jfieldID>(NULL), fid);
-  EXPECT_EXCEPTION(jlnsfe);
+  EXPECT_EQ(nullptr, fid);
+  ExpectException(jlnsfe);
 
   // Wrong type where type doesn't exist.
   fid = env_->GetStaticFieldID(c, "CASE_INSENSITIVE_ORDER", "Lrod/jane/freddy;");
-  EXPECT_EQ(static_cast<jfieldID>(NULL), fid);
-  EXPECT_EXCEPTION(jlnsfe);
+  EXPECT_EQ(nullptr, fid);
+  ExpectException(jlnsfe);
 
   // Wrong name.
   fid = env_->GetStaticFieldID(c, "cASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;");
-  EXPECT_EQ(static_cast<jfieldID>(NULL), fid);
-  EXPECT_EXCEPTION(jlnsfe);
+  EXPECT_EQ(nullptr, fid);
+  ExpectException(jlnsfe);
 
   // Good declared field lookup.
   fid = env_->GetStaticFieldID(c, "CASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;");
-  EXPECT_NE(static_cast<jfieldID>(NULL), fid);
-  EXPECT_TRUE(fid != NULL);
+  EXPECT_NE(nullptr, fid);
+  EXPECT_NE(fid, nullptr);
   EXPECT_FALSE(env_->ExceptionCheck());
 
   // Not static.
   fid = env_->GetStaticFieldID(c, "count", "I");
-  EXPECT_EQ(static_cast<jfieldID>(NULL), fid);
-  EXPECT_EXCEPTION(jlnsfe);
+  EXPECT_EQ(nullptr, fid);
+  ExpectException(jlnsfe);
+
+  // Bad arguments.
+  CheckJniAbortCatcher check_jni_abort_catcher;
+  fid = env_->GetStaticFieldID(nullptr, "CASE_INSENSITIVE_ORDER", "Ljava/util/Comparator;");
+  EXPECT_EQ(nullptr, fid);
+  check_jni_abort_catcher.Check("java_class == null");
+  fid = env_->GetStaticFieldID(c, nullptr, "Ljava/util/Comparator;");
+  EXPECT_EQ(nullptr, fid);
+  check_jni_abort_catcher.Check("name == null");
+  fid = env_->GetStaticFieldID(c, "CASE_INSENSITIVE_ORDER", nullptr);
+  EXPECT_EQ(nullptr, fid);
+  check_jni_abort_catcher.Check("sig == null");
 }
 
 TEST_F(JniInternalTest, GetMethodID) {
   jclass jlobject = env_->FindClass("java/lang/Object");
   jclass jlstring = env_->FindClass("java/lang/String");
   jclass jlnsme = env_->FindClass("java/lang/NoSuchMethodError");
+  jclass jncrbc = env_->FindClass("java/nio/channels/ReadableByteChannel");
 
-  // Sanity check that no exceptions are pending
+  // Sanity check that no exceptions are pending.
   ASSERT_FALSE(env_->ExceptionCheck());
 
   // Check that java.lang.Object.foo() doesn't exist and NoSuchMethodError is
-  // a pending exception
+  // a pending exception.
   jmethodID method = env_->GetMethodID(jlobject, "foo", "()V");
-  EXPECT_EQ(static_cast<jmethodID>(NULL), method);
-  EXPECT_EXCEPTION(jlnsme);
+  EXPECT_EQ(nullptr, method);
+  ExpectException(jlnsme);
 
-  // Check that java.lang.Object.equals() does exist
+  // Check that java.lang.Object.equals() does exist.
   method = env_->GetMethodID(jlobject, "equals", "(Ljava/lang/Object;)Z");
-  EXPECT_NE(static_cast<jmethodID>(NULL), method);
+  EXPECT_NE(nullptr, method);
   EXPECT_FALSE(env_->ExceptionCheck());
 
   // Check that GetMethodID for java.lang.String.valueOf(int) fails as the
-  // method is static
+  // method is static.
   method = env_->GetMethodID(jlstring, "valueOf", "(I)Ljava/lang/String;");
-  EXPECT_EQ(static_cast<jmethodID>(NULL), method);
-  EXPECT_EXCEPTION(jlnsme);
+  EXPECT_EQ(nullptr, method);
+  ExpectException(jlnsme);
 
-  // Check that GetMethodID for java.lang.NoSuchMethodError.<init>(String) finds the constructor
+  // Check that GetMethodID for java.lang.NoSuchMethodError.<init>(String) finds the constructor.
   method = env_->GetMethodID(jlnsme, "<init>", "(Ljava/lang/String;)V");
-  EXPECT_NE(static_cast<jmethodID>(NULL), method);
+  EXPECT_NE(nullptr, method);
   EXPECT_FALSE(env_->ExceptionCheck());
+
+  // Check that GetMethodID can find a interface method inherited from another interface.
+  method = env_->GetMethodID(jncrbc, "close", "()V");
+  EXPECT_NE(nullptr, method);
+  EXPECT_FALSE(env_->ExceptionCheck());
+
+  // Bad arguments.
+  CheckJniAbortCatcher check_jni_abort_catcher;
+  method = env_->GetMethodID(nullptr, "<init>", "(Ljava/lang/String;)V");
+  EXPECT_EQ(nullptr, method);
+  check_jni_abort_catcher.Check("java_class == null");
+  method = env_->GetMethodID(jlnsme, nullptr, "(Ljava/lang/String;)V");
+  EXPECT_EQ(nullptr, method);
+  check_jni_abort_catcher.Check("name == null");
+  method = env_->GetMethodID(jlnsme, "<init>", nullptr);
+  EXPECT_EQ(nullptr, method);
+  check_jni_abort_catcher.Check("sig == null");
+}
+
+TEST_F(JniInternalTest, CallVoidMethodNullReceiver) {
+  jclass jlobject = env_->FindClass("java/lang/Object");
+  jmethodID method;
+
+  // Check that GetMethodID for java.lang.NoSuchMethodError.<init>(String) finds the constructor.
+  method = env_->GetMethodID(jlobject, "<init>", "()V");
+  EXPECT_NE(nullptr, method);
+  EXPECT_FALSE(env_->ExceptionCheck());
+
+  // Null object to CallVoidMethod.
+  CheckJniAbortCatcher check_jni_abort_catcher;
+  method = env_->GetMethodID(nullptr, "<init>", "(Ljava/lang/String;)V");
+  env_->CallVoidMethod(nullptr, method);
+  check_jni_abort_catcher.Check("null");
 }
 
 TEST_F(JniInternalTest, GetStaticMethodID) {
@@ -911,97 +340,197 @@ TEST_F(JniInternalTest, GetStaticMethodID) {
   // Check that java.lang.Object.foo() doesn't exist and NoSuchMethodError is
   // a pending exception
   jmethodID method = env_->GetStaticMethodID(jlobject, "foo", "()V");
-  EXPECT_EQ(static_cast<jmethodID>(NULL), method);
-  EXPECT_EXCEPTION(jlnsme);
+  EXPECT_EQ(nullptr, method);
+  ExpectException(jlnsme);
 
   // Check that GetStaticMethodID for java.lang.Object.equals(Object) fails as
   // the method is not static
   method = env_->GetStaticMethodID(jlobject, "equals", "(Ljava/lang/Object;)Z");
-  EXPECT_EQ(static_cast<jmethodID>(NULL), method);
-  EXPECT_EXCEPTION(jlnsme);
+  EXPECT_EQ(nullptr, method);
+  ExpectException(jlnsme);
 
   // Check that java.lang.String.valueOf(int) does exist
   jclass jlstring = env_->FindClass("java/lang/String");
-  method = env_->GetStaticMethodID(jlstring, "valueOf",
-                                   "(I)Ljava/lang/String;");
-  EXPECT_NE(static_cast<jmethodID>(NULL), method);
+  method = env_->GetStaticMethodID(jlstring, "valueOf", "(I)Ljava/lang/String;");
+  EXPECT_NE(nullptr, method);
   EXPECT_FALSE(env_->ExceptionCheck());
+
+  // Bad arguments.
+  CheckJniAbortCatcher check_jni_abort_catcher;
+  method = env_->GetStaticMethodID(nullptr, "valueOf", "(I)Ljava/lang/String;");
+  EXPECT_EQ(nullptr, method);
+  check_jni_abort_catcher.Check("java_class == null");
+  method = env_->GetStaticMethodID(jlstring, nullptr, "(I)Ljava/lang/String;");
+  EXPECT_EQ(nullptr, method);
+  check_jni_abort_catcher.Check("name == null");
+  method = env_->GetStaticMethodID(jlstring, "valueOf", nullptr);
+  EXPECT_EQ(nullptr, method);
+  check_jni_abort_catcher.Check("sig == null");
 }
 
 TEST_F(JniInternalTest, FromReflectedField_ToReflectedField) {
   jclass jlrField = env_->FindClass("java/lang/reflect/Field");
   jclass c = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(c != NULL);
+  ASSERT_NE(c, nullptr);
   jfieldID fid = env_->GetFieldID(c, "count", "I");
-  ASSERT_TRUE(fid != NULL);
+  ASSERT_NE(fid, nullptr);
   // Turn the fid into a java.lang.reflect.Field...
   jobject field = env_->ToReflectedField(c, fid, JNI_FALSE);
-  ASSERT_TRUE(c != NULL);
+  ASSERT_NE(c, nullptr);
   ASSERT_TRUE(env_->IsInstanceOf(field, jlrField));
   // ...and back again.
   jfieldID fid2 = env_->FromReflectedField(field);
-  ASSERT_TRUE(fid2 != NULL);
+  ASSERT_NE(fid2, nullptr);
   // Make sure we can actually use it.
   jstring s = env_->NewStringUTF("poop");
   ASSERT_EQ(4, env_->GetIntField(s, fid2));
+
+  // Bad arguments.
+  CheckJniAbortCatcher check_jni_abort_catcher;
+  field = env_->ToReflectedField(c, nullptr, JNI_FALSE);
+  EXPECT_EQ(field, nullptr);
+  check_jni_abort_catcher.Check("fid == null");
+  fid2 = env_->FromReflectedField(nullptr);
+  ASSERT_EQ(fid2, nullptr);
+  check_jni_abort_catcher.Check("jlr_field == null");
 }
 
 TEST_F(JniInternalTest, FromReflectedMethod_ToReflectedMethod) {
   jclass jlrMethod = env_->FindClass("java/lang/reflect/Method");
+  ASSERT_NE(jlrMethod, nullptr);
+  jclass jlrConstructor = env_->FindClass("java/lang/reflect/Constructor");
+  ASSERT_NE(jlrConstructor, nullptr);
   jclass c = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(c != NULL);
-  jmethodID mid = env_->GetMethodID(c, "length", "()I");
-  ASSERT_TRUE(mid != NULL);
-  // Turn the mid into a java.lang.reflect.Method...
+  ASSERT_NE(c, nullptr);
+
+  jmethodID mid = env_->GetMethodID(c, "<init>", "()V");
+  ASSERT_NE(mid, nullptr);
+  // Turn the mid into a java.lang.reflect.Constructor...
   jobject method = env_->ToReflectedMethod(c, mid, JNI_FALSE);
-  ASSERT_TRUE(c != NULL);
-  ASSERT_TRUE(env_->IsInstanceOf(method, jlrMethod));
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(env_->IsInstanceOf(method, jlrConstructor));
   // ...and back again.
   jmethodID mid2 = env_->FromReflectedMethod(method);
-  ASSERT_TRUE(mid2 != NULL);
+  ASSERT_NE(mid2, nullptr);
   // Make sure we can actually use it.
-  jstring s = env_->NewStringUTF("poop");
-  // TODO: this should return 4, but the runtime skips the method
-  // invoke because the runtime isn't started. In the future it would
-  // be nice to use interpretter for things like this. This still does
-  // validate that we have a sane jmethodID value.
-  ASSERT_EQ(0, env_->CallIntMethod(s, mid2));
+  jstring s = reinterpret_cast<jstring>(env_->AllocObject(c));
+  ASSERT_NE(s, nullptr);
+  env_->CallVoidMethod(s, mid2);
+  ASSERT_EQ(JNI_FALSE, env_->ExceptionCheck());
+
+  mid = env_->GetMethodID(c, "length", "()I");
+  ASSERT_NE(mid, nullptr);
+  // Turn the mid into a java.lang.reflect.Method...
+  method = env_->ToReflectedMethod(c, mid, JNI_FALSE);
+  ASSERT_NE(method, nullptr);
+  ASSERT_TRUE(env_->IsInstanceOf(method, jlrMethod));
+  // ...and back again.
+  mid2 = env_->FromReflectedMethod(method);
+  ASSERT_NE(mid2, nullptr);
+  // Make sure we can actually use it.
+  s = env_->NewStringUTF("poop");
+  ASSERT_NE(s, nullptr);
+  ASSERT_EQ(4, env_->CallIntMethod(s, mid2));
+
+  // Bad arguments.
+  CheckJniAbortCatcher check_jni_abort_catcher;
+  method = env_->ToReflectedMethod(c, nullptr, JNI_FALSE);
+  EXPECT_EQ(method, nullptr);
+  check_jni_abort_catcher.Check("mid == null");
+  mid2 = env_->FromReflectedMethod(method);
+  ASSERT_EQ(mid2, nullptr);
+  check_jni_abort_catcher.Check("jlr_method == null");
 }
 
-void BogusMethod() {
-  // You can't pass NULL function pointers to RegisterNatives.
+static void BogusMethod() {
+  // You can't pass nullptr function pointers to RegisterNatives.
 }
 
-TEST_F(JniInternalTest, RegisterNatives) {
+TEST_F(JniInternalTest, RegisterAndUnregisterNatives) {
   jclass jlobject = env_->FindClass("java/lang/Object");
   jclass jlnsme = env_->FindClass("java/lang/NoSuchMethodError");
+  void* native_function = reinterpret_cast<void*>(BogusMethod);
 
-  // Sanity check that no exceptions are pending
+  // Sanity check that no exceptions are pending.
   ASSERT_FALSE(env_->ExceptionCheck());
 
-  // Check that registering to a non-existent java.lang.Object.foo() causes a
-  // NoSuchMethodError
+  // Check that registering method without name causes a NoSuchMethodError.
   {
-    JNINativeMethod methods[] = { { "foo", "()V", NULL } };
-    env_->RegisterNatives(jlobject, methods, 1);
+    JNINativeMethod methods[] = { { nullptr, "()V", native_function } };
+    EXPECT_EQ(env_->RegisterNatives(jlobject, methods, 1), JNI_ERR);
   }
-  EXPECT_EXCEPTION(jlnsme);
+  ExpectException(jlnsme);
 
-  // Check that registering non-native methods causes a NoSuchMethodError
+  // Check that registering method without signature causes a NoSuchMethodError.
   {
-    JNINativeMethod methods[] = { { "equals", "(Ljava/lang/Object;)Z", NULL } };
-    env_->RegisterNatives(jlobject, methods, 1);
+    JNINativeMethod methods[] = { { "notify", nullptr, native_function } };
+    EXPECT_EQ(env_->RegisterNatives(jlobject, methods, 1), JNI_ERR);
   }
-  EXPECT_EXCEPTION(jlnsme);
+  ExpectException(jlnsme);
 
-  // Check that registering native methods is successful
+  // Check that registering method without function causes a NoSuchMethodError.
   {
-    JNINativeMethod methods[] = { { "notify", "()V", reinterpret_cast<void*>(BogusMethod) } };
-    env_->RegisterNatives(jlobject, methods, 1);
+    JNINativeMethod methods[] = { { "notify", "()V", nullptr } };
+    EXPECT_EQ(env_->RegisterNatives(jlobject, methods, 1), JNI_ERR);
+  }
+  ExpectException(jlnsme);
+
+  // Check that registering to a non-existent java.lang.Object.foo() causes a NoSuchMethodError.
+  {
+    JNINativeMethod methods[] = { { "foo", "()V", native_function } };
+    EXPECT_EQ(env_->RegisterNatives(jlobject, methods, 1), JNI_ERR);
+  }
+  ExpectException(jlnsme);
+
+  // Check that registering non-native methods causes a NoSuchMethodError.
+  {
+    JNINativeMethod methods[] = { { "equals", "(Ljava/lang/Object;)Z", native_function } };
+    EXPECT_EQ(env_->RegisterNatives(jlobject, methods, 1), JNI_ERR);
+  }
+  ExpectException(jlnsme);
+
+  // Check that registering native methods is successful.
+  {
+    JNINativeMethod methods[] = { { "notify", "()V", native_function } };
+    EXPECT_EQ(env_->RegisterNatives(jlobject, methods, 1), JNI_OK);
+  }
+  EXPECT_FALSE(env_->ExceptionCheck());
+  EXPECT_EQ(env_->UnregisterNatives(jlobject), JNI_OK);
+
+  // Check that registering no methods isn't a failure.
+  {
+    JNINativeMethod methods[] = { };
+    EXPECT_EQ(env_->RegisterNatives(jlobject, methods, 0), JNI_OK);
+  }
+  EXPECT_FALSE(env_->ExceptionCheck());
+  EXPECT_EQ(env_->UnregisterNatives(jlobject), JNI_OK);
+
+  // Check that registering a -ve number of methods is a failure.
+  CheckJniAbortCatcher check_jni_abort_catcher;
+  for (int i = -10; i < 0; ++i) {
+    JNINativeMethod methods[] = { };
+    EXPECT_EQ(env_->RegisterNatives(jlobject, methods, i), JNI_ERR);
+    check_jni_abort_catcher.Check("negative method count: ");
   }
   EXPECT_FALSE(env_->ExceptionCheck());
 
-  env_->UnregisterNatives(jlobject);
+  // Passing a class of null is a failure.
+  {
+    JNINativeMethod methods[] = { };
+    EXPECT_EQ(env_->RegisterNatives(nullptr, methods, 0), JNI_ERR);
+    check_jni_abort_catcher.Check("java_class == null");
+  }
+
+  // Passing methods as null is a failure.
+  EXPECT_EQ(env_->RegisterNatives(jlobject, nullptr, 1), JNI_ERR);
+  check_jni_abort_catcher.Check("methods == null");
+
+  // Unregisters null is a failure.
+  EXPECT_EQ(env_->UnregisterNatives(nullptr), JNI_ERR);
+  check_jni_abort_catcher.Check("java_class == null");
+
+  // Unregistering a class with no natives is a warning.
+  EXPECT_EQ(env_->UnregisterNatives(jlnsme), JNI_OK);
 }
 
 #define EXPECT_PRIMITIVE_ARRAY(new_fn, \
@@ -1012,31 +541,75 @@ TEST_F(JniInternalTest, RegisterNatives) {
                                scalar_type, \
                                expected_class_descriptor) \
   jsize size = 4; \
+  \
+  { \
+    CheckJniAbortCatcher jni_abort_catcher; \
+    /* Allocate an negative sized array and check it has the right failure type. */ \
+    EXPECT_EQ(env_->new_fn(-1), nullptr); \
+    jni_abort_catcher.Check("negative array length: -1"); \
+    EXPECT_EQ(env_->new_fn(std::numeric_limits<jint>::min()), nullptr); \
+    jni_abort_catcher.Check("negative array length: -2147483648"); \
+    /* Pass the array as null. */ \
+    EXPECT_EQ(0, env_->GetArrayLength(nullptr)); \
+    jni_abort_catcher.Check("java_array == null"); \
+    env_->get_region_fn(nullptr, 0, 0, nullptr); \
+    jni_abort_catcher.Check("java_array == null"); \
+    env_->set_region_fn(nullptr, 0, 0, nullptr); \
+    jni_abort_catcher.Check("java_array == null"); \
+    env_->get_elements_fn(nullptr, nullptr); \
+    jni_abort_catcher.Check("java_array == null"); \
+    env_->release_elements_fn(nullptr, nullptr, 0); \
+    jni_abort_catcher.Check("java_array == null"); \
+    /* Pass the elements for region as null. */ \
+    scalar_type ## Array a = env_->new_fn(size); \
+    env_->get_region_fn(a, 0, size, nullptr); \
+    jni_abort_catcher.Check("buf == null"); \
+    env_->set_region_fn(a, 0, size, nullptr); \
+    jni_abort_catcher.Check("buf == null"); \
+  } \
   /* Allocate an array and check it has the right type and length. */ \
   scalar_type ## Array a = env_->new_fn(size); \
-  EXPECT_TRUE(a != NULL); \
+  EXPECT_NE(a, nullptr); \
   EXPECT_TRUE(env_->IsInstanceOf(a, env_->FindClass(expected_class_descriptor))); \
   EXPECT_EQ(size, env_->GetArrayLength(a)); \
+  \
+  /* GetPrimitiveArrayRegion/SetPrimitiveArrayRegion */ \
   /* AIOOBE for negative start offset. */ \
-  env_->get_region_fn(a, -1, 1, NULL); \
-  EXPECT_EXCEPTION(aioobe_); \
-  env_->set_region_fn(a, -1, 1, NULL); \
-  EXPECT_EXCEPTION(aioobe_); \
+  env_->get_region_fn(a, -1, 1, nullptr); \
+  ExpectException(aioobe_); \
+  env_->set_region_fn(a, -1, 1, nullptr); \
+  ExpectException(aioobe_); \
+  \
   /* AIOOBE for negative length. */ \
-  env_->get_region_fn(a, 0, -1, NULL); \
-  EXPECT_EXCEPTION(aioobe_); \
-  env_->set_region_fn(a, 0, -1, NULL); \
-  EXPECT_EXCEPTION(aioobe_); \
+  env_->get_region_fn(a, 0, -1, nullptr); \
+  ExpectException(aioobe_); \
+  env_->set_region_fn(a, 0, -1, nullptr); \
+  ExpectException(aioobe_); \
+  \
   /* AIOOBE for buffer overrun. */ \
-  env_->get_region_fn(a, size - 1, size, NULL); \
-  EXPECT_EXCEPTION(aioobe_); \
-  env_->set_region_fn(a, size - 1, size, NULL); \
-  EXPECT_EXCEPTION(aioobe_); \
+  env_->get_region_fn(a, size - 1, size, nullptr); \
+  ExpectException(aioobe_); \
+  env_->set_region_fn(a, size - 1, size, nullptr); \
+  ExpectException(aioobe_); \
+  \
+  /* It's okay for the buffer to be nullptr as long as the length is 0. */ \
+  env_->get_region_fn(a, 2, 0, nullptr); \
+  /* Even if the offset is invalid... */ \
+  env_->get_region_fn(a, 123, 0, nullptr); \
+  ExpectException(aioobe_); \
+  \
+  /* It's okay for the buffer to be nullptr as long as the length is 0. */ \
+  env_->set_region_fn(a, 2, 0, nullptr); \
+  /* Even if the offset is invalid... */ \
+  env_->set_region_fn(a, 123, 0, nullptr); \
+  ExpectException(aioobe_); \
+  \
   /* Prepare a couple of buffers. */ \
-  UniquePtr<scalar_type[]> src_buf(new scalar_type[size]); \
-  UniquePtr<scalar_type[]> dst_buf(new scalar_type[size]); \
+  std::unique_ptr<scalar_type[]> src_buf(new scalar_type[size]); \
+  std::unique_ptr<scalar_type[]> dst_buf(new scalar_type[size]); \
   for (jsize i = 0; i < size; ++i) { src_buf[i] = scalar_type(i); } \
   for (jsize i = 0; i < size; ++i) { dst_buf[i] = scalar_type(-1); } \
+  \
   /* Copy all of src_buf onto the heap. */ \
   env_->set_region_fn(a, 0, size, &src_buf[0]); \
   /* Copy back only part. */ \
@@ -1053,16 +626,15 @@ TEST_F(JniInternalTest, RegisterNatives) {
   EXPECT_EQ(memcmp(&src_buf[0], &dst_buf[0], size * sizeof(scalar_type)), 0) \
     << "full copy not equal"; \
   /* GetPrimitiveArrayCritical */ \
-  void* v = env_->GetPrimitiveArrayCritical(a, NULL); \
+  void* v = env_->GetPrimitiveArrayCritical(a, nullptr); \
   EXPECT_EQ(memcmp(&src_buf[0], v, size * sizeof(scalar_type)), 0) \
     << "GetPrimitiveArrayCritical not equal"; \
   env_->ReleasePrimitiveArrayCritical(a, v, 0); \
   /* GetXArrayElements */ \
-  scalar_type* xs = env_->get_elements_fn(a, NULL); \
+  scalar_type* xs = env_->get_elements_fn(a, nullptr); \
   EXPECT_EQ(memcmp(&src_buf[0], xs, size * sizeof(scalar_type)), 0) \
     << # get_elements_fn " not equal"; \
   env_->release_elements_fn(a, xs, 0); \
-  EXPECT_EQ(reinterpret_cast<uintptr_t>(v), reinterpret_cast<uintptr_t>(xs))
 
 TEST_F(JniInternalTest, BooleanArrays) {
   EXPECT_PRIMITIVE_ARRAY(NewBooleanArray, GetBooleanArrayRegion, SetBooleanArrayRegion,
@@ -1097,36 +669,255 @@ TEST_F(JniInternalTest, ShortArrays) {
                          GetShortArrayElements, ReleaseShortArrayElements, jshort, "[S");
 }
 
+TEST_F(JniInternalTest, GetPrimitiveArrayElementsOfWrongType) {
+  CheckJniAbortCatcher jni_abort_catcher;
+  jbooleanArray array = env_->NewBooleanArray(10);
+  jboolean is_copy;
+  EXPECT_EQ(env_->GetByteArrayElements(reinterpret_cast<jbyteArray>(array), &is_copy), nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get byte primitive array elements with an object of type boolean[]");
+  EXPECT_EQ(env_->GetShortArrayElements(reinterpret_cast<jshortArray>(array), &is_copy), nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get short primitive array elements with an object of type boolean[]");
+  EXPECT_EQ(env_->GetCharArrayElements(reinterpret_cast<jcharArray>(array), &is_copy), nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get char primitive array elements with an object of type boolean[]");
+  EXPECT_EQ(env_->GetIntArrayElements(reinterpret_cast<jintArray>(array), &is_copy), nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get int primitive array elements with an object of type boolean[]");
+  EXPECT_EQ(env_->GetLongArrayElements(reinterpret_cast<jlongArray>(array), &is_copy), nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get long primitive array elements with an object of type boolean[]");
+  EXPECT_EQ(env_->GetFloatArrayElements(reinterpret_cast<jfloatArray>(array), &is_copy), nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get float primitive array elements with an object of type boolean[]");
+  EXPECT_EQ(env_->GetDoubleArrayElements(reinterpret_cast<jdoubleArray>(array), &is_copy), nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get double primitive array elements with an object of type boolean[]");
+  jbyteArray array2 = env_->NewByteArray(10);
+  EXPECT_EQ(env_->GetBooleanArrayElements(reinterpret_cast<jbooleanArray>(array2), &is_copy),
+            nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get boolean primitive array elements with an object of type byte[]");
+  jobject object = env_->NewStringUTF("Test String");
+  EXPECT_EQ(env_->GetBooleanArrayElements(reinterpret_cast<jbooleanArray>(object), &is_copy),
+            nullptr);
+  jni_abort_catcher.Check(
+      "attempt to get boolean primitive array elements with an object of type java.lang.String");
+}
+
+TEST_F(JniInternalTest, ReleasePrimitiveArrayElementsOfWrongType) {
+  CheckJniAbortCatcher jni_abort_catcher;
+  jbooleanArray array = env_->NewBooleanArray(10);
+  ASSERT_TRUE(array != nullptr);
+  jboolean is_copy;
+  jboolean* elements = env_->GetBooleanArrayElements(array, &is_copy);
+  ASSERT_TRUE(elements != nullptr);
+  env_->ReleaseByteArrayElements(reinterpret_cast<jbyteArray>(array),
+                                 reinterpret_cast<jbyte*>(elements), 0);
+  jni_abort_catcher.Check(
+      "attempt to release byte primitive array elements with an object of type boolean[]");
+  env_->ReleaseShortArrayElements(reinterpret_cast<jshortArray>(array),
+                                  reinterpret_cast<jshort*>(elements), 0);
+  jni_abort_catcher.Check(
+      "attempt to release short primitive array elements with an object of type boolean[]");
+  env_->ReleaseCharArrayElements(reinterpret_cast<jcharArray>(array),
+                                 reinterpret_cast<jchar*>(elements), 0);
+  jni_abort_catcher.Check(
+      "attempt to release char primitive array elements with an object of type boolean[]");
+  env_->ReleaseIntArrayElements(reinterpret_cast<jintArray>(array),
+                                reinterpret_cast<jint*>(elements), 0);
+  jni_abort_catcher.Check(
+      "attempt to release int primitive array elements with an object of type boolean[]");
+  env_->ReleaseLongArrayElements(reinterpret_cast<jlongArray>(array),
+                                 reinterpret_cast<jlong*>(elements), 0);
+  jni_abort_catcher.Check(
+      "attempt to release long primitive array elements with an object of type boolean[]");
+  env_->ReleaseFloatArrayElements(reinterpret_cast<jfloatArray>(array),
+                                  reinterpret_cast<jfloat*>(elements), 0);
+  jni_abort_catcher.Check(
+      "attempt to release float primitive array elements with an object of type boolean[]");
+  env_->ReleaseDoubleArrayElements(reinterpret_cast<jdoubleArray>(array),
+                                  reinterpret_cast<jdouble*>(elements), 0);
+  jni_abort_catcher.Check(
+      "attempt to release double primitive array elements with an object of type boolean[]");
+  jbyteArray array2 = env_->NewByteArray(10);
+  env_->ReleaseBooleanArrayElements(reinterpret_cast<jbooleanArray>(array2), elements, 0);
+  jni_abort_catcher.Check(
+      "attempt to release boolean primitive array elements with an object of type byte[]");
+  jobject object = env_->NewStringUTF("Test String");
+  env_->ReleaseBooleanArrayElements(reinterpret_cast<jbooleanArray>(object), elements, 0);
+  jni_abort_catcher.Check(
+      "attempt to release boolean primitive array elements with an object of type "
+      "java.lang.String");
+}
+TEST_F(JniInternalTest, GetReleasePrimitiveArrayCriticalOfWrongType) {
+  CheckJniAbortCatcher jni_abort_catcher;
+  jobject object = env_->NewStringUTF("Test String");
+  jboolean is_copy;
+  void* elements = env_->GetPrimitiveArrayCritical(reinterpret_cast<jarray>(object), &is_copy);
+  jni_abort_catcher.Check("expected primitive array, given java.lang.String");
+  env_->ReleasePrimitiveArrayCritical(reinterpret_cast<jarray>(object), elements, 0);
+  jni_abort_catcher.Check("expected primitive array, given java.lang.String");
+}
+
+TEST_F(JniInternalTest, GetPrimitiveArrayRegionElementsOfWrongType) {
+  CheckJniAbortCatcher jni_abort_catcher;
+  constexpr size_t kLength = 10;
+  jbooleanArray array = env_->NewBooleanArray(kLength);
+  ASSERT_TRUE(array != nullptr);
+  jboolean elements[kLength];
+  env_->GetByteArrayRegion(reinterpret_cast<jbyteArray>(array), 0, kLength,
+                           reinterpret_cast<jbyte*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of byte primitive array elements with an object of type boolean[]");
+  env_->GetShortArrayRegion(reinterpret_cast<jshortArray>(array), 0, kLength,
+                            reinterpret_cast<jshort*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of short primitive array elements with an object of type boolean[]");
+  env_->GetCharArrayRegion(reinterpret_cast<jcharArray>(array), 0, kLength,
+                           reinterpret_cast<jchar*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of char primitive array elements with an object of type boolean[]");
+  env_->GetIntArrayRegion(reinterpret_cast<jintArray>(array), 0, kLength,
+                          reinterpret_cast<jint*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of int primitive array elements with an object of type boolean[]");
+  env_->GetLongArrayRegion(reinterpret_cast<jlongArray>(array), 0, kLength,
+                           reinterpret_cast<jlong*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of long primitive array elements with an object of type boolean[]");
+  env_->GetFloatArrayRegion(reinterpret_cast<jfloatArray>(array), 0, kLength,
+                            reinterpret_cast<jfloat*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of float primitive array elements with an object of type boolean[]");
+  env_->GetDoubleArrayRegion(reinterpret_cast<jdoubleArray>(array), 0, kLength,
+                           reinterpret_cast<jdouble*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of double primitive array elements with an object of type boolean[]");
+  jbyteArray array2 = env_->NewByteArray(10);
+  env_->GetBooleanArrayRegion(reinterpret_cast<jbooleanArray>(array2), 0, kLength,
+                              reinterpret_cast<jboolean*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of boolean primitive array elements with an object of type byte[]");
+  jobject object = env_->NewStringUTF("Test String");
+  env_->GetBooleanArrayRegion(reinterpret_cast<jbooleanArray>(object), 0, kLength,
+                              reinterpret_cast<jboolean*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to get region of boolean primitive array elements with an object of type "
+      "java.lang.String");
+}
+
+TEST_F(JniInternalTest, SetPrimitiveArrayRegionElementsOfWrongType) {
+  CheckJniAbortCatcher jni_abort_catcher;
+  constexpr size_t kLength = 10;
+  jbooleanArray array = env_->NewBooleanArray(kLength);
+  ASSERT_TRUE(array != nullptr);
+  jboolean elements[kLength];
+  env_->SetByteArrayRegion(reinterpret_cast<jbyteArray>(array), 0, kLength,
+                           reinterpret_cast<jbyte*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of byte primitive array elements with an object of type boolean[]");
+  env_->SetShortArrayRegion(reinterpret_cast<jshortArray>(array), 0, kLength,
+                            reinterpret_cast<jshort*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of short primitive array elements with an object of type boolean[]");
+  env_->SetCharArrayRegion(reinterpret_cast<jcharArray>(array), 0, kLength,
+                           reinterpret_cast<jchar*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of char primitive array elements with an object of type boolean[]");
+  env_->SetIntArrayRegion(reinterpret_cast<jintArray>(array), 0, kLength,
+                          reinterpret_cast<jint*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of int primitive array elements with an object of type boolean[]");
+  env_->SetLongArrayRegion(reinterpret_cast<jlongArray>(array), 0, kLength,
+                           reinterpret_cast<jlong*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of long primitive array elements with an object of type boolean[]");
+  env_->SetFloatArrayRegion(reinterpret_cast<jfloatArray>(array), 0, kLength,
+                            reinterpret_cast<jfloat*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of float primitive array elements with an object of type boolean[]");
+  env_->SetDoubleArrayRegion(reinterpret_cast<jdoubleArray>(array), 0, kLength,
+                           reinterpret_cast<jdouble*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of double primitive array elements with an object of type boolean[]");
+  jbyteArray array2 = env_->NewByteArray(10);
+  env_->SetBooleanArrayRegion(reinterpret_cast<jbooleanArray>(array2), 0, kLength,
+                              reinterpret_cast<jboolean*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of boolean primitive array elements with an object of type byte[]");
+  jobject object = env_->NewStringUTF("Test String");
+  env_->SetBooleanArrayRegion(reinterpret_cast<jbooleanArray>(object), 0, kLength,
+                              reinterpret_cast<jboolean*>(elements));
+  jni_abort_catcher.Check(
+      "attempt to set region of boolean primitive array elements with an object of type "
+      "java.lang.String");
+}
+
 TEST_F(JniInternalTest, NewObjectArray) {
-  // TODO: death tests for negative array sizes.
-
-  // TODO: check non-NULL initial elements.
-
   jclass element_class = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(element_class != NULL);
+  ASSERT_NE(element_class, nullptr);
   jclass array_class = env_->FindClass("[Ljava/lang/String;");
-  ASSERT_TRUE(array_class != NULL);
+  ASSERT_NE(array_class, nullptr);
 
-  jobjectArray a;
-
-  a = env_->NewObjectArray(0, element_class, NULL);
-  EXPECT_TRUE(a != NULL);
+  jobjectArray a = env_->NewObjectArray(0, element_class, nullptr);
+  EXPECT_NE(a, nullptr);
   EXPECT_TRUE(env_->IsInstanceOf(a, array_class));
   EXPECT_EQ(0, env_->GetArrayLength(a));
 
-  a = env_->NewObjectArray(1, element_class, NULL);
-  EXPECT_TRUE(a != NULL);
+  a = env_->NewObjectArray(1, element_class, nullptr);
+  EXPECT_NE(a, nullptr);
   EXPECT_TRUE(env_->IsInstanceOf(a, array_class));
   EXPECT_EQ(1, env_->GetArrayLength(a));
-  EXPECT_TRUE(env_->IsSameObject(env_->GetObjectArrayElement(a, 0), NULL));
+  EXPECT_TRUE(env_->IsSameObject(env_->GetObjectArrayElement(a, 0), nullptr));
+
+  // Negative array length checks.
+  CheckJniAbortCatcher jni_abort_catcher;
+  env_->NewObjectArray(-1, element_class, nullptr);
+  jni_abort_catcher.Check("negative array length: -1");
+
+  env_->NewObjectArray(std::numeric_limits<jint>::min(), element_class, nullptr);
+  jni_abort_catcher.Check("negative array length: -2147483648");
+}
+
+TEST_F(JniInternalTest, NewObjectArrayWithPrimitiveClasses) {
+  const char* primitive_descriptors = "VZBSCIJFD";
+  const char* primitive_names[] = {
+      "void", "boolean", "byte", "short", "char", "int", "long", "float", "double"
+  };
+  ASSERT_EQ(strlen(primitive_descriptors), arraysize(primitive_names));
+
+  CheckJniAbortCatcher jni_abort_catcher;
+  for (size_t i = 0; i < strlen(primitive_descriptors); ++i) {
+    env_->NewObjectArray(0, nullptr, nullptr);
+    jni_abort_catcher.Check("element_jclass == null");
+    jclass primitive_class = GetPrimitiveClass(primitive_descriptors[i]);
+    env_->NewObjectArray(1, primitive_class, nullptr);
+    std::string error_msg(StringPrintf("not an object type: %s", primitive_names[i]));
+    jni_abort_catcher.Check(error_msg.c_str());
+  }
+}
+
+TEST_F(JniInternalTest, NewObjectArrayWithInitialValue) {
+  jclass element_class = env_->FindClass("java/lang/String");
+  ASSERT_NE(element_class, nullptr);
+  jclass array_class = env_->FindClass("[Ljava/lang/String;");
+  ASSERT_NE(array_class, nullptr);
 
   jstring s = env_->NewStringUTF("poop");
-  a = env_->NewObjectArray(2, element_class, s);
-  EXPECT_TRUE(a != NULL);
+  jobjectArray a = env_->NewObjectArray(2, element_class, s);
+  EXPECT_NE(a, nullptr);
   EXPECT_TRUE(env_->IsInstanceOf(a, array_class));
   EXPECT_EQ(2, env_->GetArrayLength(a));
   EXPECT_TRUE(env_->IsSameObject(env_->GetObjectArrayElement(a, 0), s));
   EXPECT_TRUE(env_->IsSameObject(env_->GetObjectArrayElement(a, 1), s));
+
+  // Attempt to incorrect create an array of strings with initial value of string arrays.
+  CheckJniAbortCatcher jni_abort_catcher;
+  env_->NewObjectArray(2, element_class, a);
+  jni_abort_catcher.Check("cannot assign object of type 'java.lang.String[]' to array with element "
+                          "type of 'java.lang.String'");
 }
 
 TEST_F(JniInternalTest, GetArrayLength) {
@@ -1135,9 +926,9 @@ TEST_F(JniInternalTest, GetArrayLength) {
 
 TEST_F(JniInternalTest, GetObjectClass) {
   jclass string_class = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(string_class != NULL);
+  ASSERT_NE(string_class, nullptr);
   jclass class_class = env_->FindClass("java/lang/Class");
-  ASSERT_TRUE(class_class != NULL);
+  ASSERT_NE(class_class, nullptr);
 
   jstring s = env_->NewStringUTF("poop");
   jclass c = env_->GetObjectClass(s);
@@ -1145,33 +936,70 @@ TEST_F(JniInternalTest, GetObjectClass) {
 
   jclass c2 = env_->GetObjectClass(c);
   ASSERT_TRUE(env_->IsSameObject(class_class, env_->GetObjectClass(c2)));
+
+  // Null as object should fail.
+  CheckJniAbortCatcher jni_abort_catcher;
+  EXPECT_EQ(env_->GetObjectClass(nullptr), nullptr);
+  jni_abort_catcher.Check("java_object == null");
 }
 
 TEST_F(JniInternalTest, GetSuperclass) {
   jclass object_class = env_->FindClass("java/lang/Object");
-  ASSERT_TRUE(object_class != NULL);
+  ASSERT_NE(object_class, nullptr);
   jclass string_class = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(string_class != NULL);
+  ASSERT_NE(string_class, nullptr);
   jclass runnable_interface = env_->FindClass("java/lang/Runnable");
-  ASSERT_TRUE(runnable_interface != NULL);
+  ASSERT_NE(runnable_interface, nullptr);
   ASSERT_TRUE(env_->IsSameObject(object_class, env_->GetSuperclass(string_class)));
-  ASSERT_TRUE(env_->GetSuperclass(object_class) == NULL);
+  ASSERT_EQ(env_->GetSuperclass(object_class), nullptr);
   ASSERT_TRUE(env_->IsSameObject(object_class, env_->GetSuperclass(runnable_interface)));
+
+  // Null as class should fail.
+  CheckJniAbortCatcher jni_abort_catcher;
+  EXPECT_EQ(env_->GetSuperclass(nullptr), nullptr);
+  jni_abort_catcher.Check("java_class == null");
 }
 
 TEST_F(JniInternalTest, IsAssignableFrom) {
   jclass object_class = env_->FindClass("java/lang/Object");
-  ASSERT_TRUE(object_class != NULL);
+  ASSERT_NE(object_class, nullptr);
   jclass string_class = env_->FindClass("java/lang/String");
-  ASSERT_TRUE(string_class != NULL);
+  ASSERT_NE(string_class, nullptr);
 
-  ASSERT_TRUE(env_->IsAssignableFrom(object_class, string_class));
-  ASSERT_FALSE(env_->IsAssignableFrom(string_class, object_class));
+  // A superclass is assignable from an instance of its
+  // subclass but not vice versa.
+  ASSERT_TRUE(env_->IsAssignableFrom(string_class, object_class));
+  ASSERT_FALSE(env_->IsAssignableFrom(object_class, string_class));
+
+  jclass charsequence_interface = env_->FindClass("java/lang/CharSequence");
+  ASSERT_NE(charsequence_interface, nullptr);
+
+  // An interface is assignable from an instance of an implementing
+  // class but not vice versa.
+  ASSERT_TRUE(env_->IsAssignableFrom(string_class, charsequence_interface));
+  ASSERT_FALSE(env_->IsAssignableFrom(charsequence_interface, string_class));
+
+  // Check that arrays are covariant.
+  jclass string_array_class = env_->FindClass("[Ljava/lang/String;");
+  ASSERT_NE(string_array_class, nullptr);
+  jclass object_array_class = env_->FindClass("[Ljava/lang/Object;");
+  ASSERT_NE(object_array_class, nullptr);
+  ASSERT_TRUE(env_->IsAssignableFrom(string_array_class, object_array_class));
+  ASSERT_FALSE(env_->IsAssignableFrom(object_array_class, string_array_class));
+
+  // Primitive types are tested in 004-JniTest.
+
+  // Null as either class should fail.
+  CheckJniAbortCatcher jni_abort_catcher;
+  EXPECT_EQ(env_->IsAssignableFrom(nullptr, string_class), JNI_FALSE);
+  jni_abort_catcher.Check("java_class1 == null");
+  EXPECT_EQ(env_->IsAssignableFrom(object_class, nullptr), JNI_FALSE);
+  jni_abort_catcher.Check("java_class2 == null");
 }
 
 TEST_F(JniInternalTest, GetObjectRefType) {
   jclass local = env_->FindClass("java/lang/Object");
-  ASSERT_TRUE(local != NULL);
+  ASSERT_TRUE(local != nullptr);
   EXPECT_EQ(JNILocalRefType, env_->GetObjectRefType(local));
 
   jobject global = env_->NewGlobalRef(local);
@@ -1184,18 +1012,38 @@ TEST_F(JniInternalTest, GetObjectRefType) {
   EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(invalid));
 
   // TODO: invoke a native method and test that its arguments are considered local references.
+
+  // Null as object should fail.
+  CheckJniAbortCatcher jni_abort_catcher;
+  EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(nullptr));
+  jni_abort_catcher.Check("java_object == null");
+}
+
+TEST_F(JniInternalTest, StaleWeakGlobal) {
+  jclass java_lang_Class = env_->FindClass("java/lang/Class");
+  ASSERT_NE(java_lang_Class, nullptr);
+  jobjectArray local_ref = env_->NewObjectArray(1, java_lang_Class, nullptr);
+  ASSERT_NE(local_ref, nullptr);
+  jweak weak_global = env_->NewWeakGlobalRef(local_ref);
+  ASSERT_NE(weak_global, nullptr);
+  env_->DeleteLocalRef(local_ref);
+  Runtime::Current()->GetHeap()->CollectGarbage(false);  // GC should clear the weak global.
+  jobject new_global_ref = env_->NewGlobalRef(weak_global);
+  EXPECT_EQ(new_global_ref, nullptr);
+  jobject new_local_ref = env_->NewLocalRef(weak_global);
+  EXPECT_EQ(new_local_ref, nullptr);
 }
 
 TEST_F(JniInternalTest, NewStringUTF) {
-  EXPECT_TRUE(env_->NewStringUTF(NULL) == NULL);
+  EXPECT_EQ(env_->NewStringUTF(nullptr), nullptr);
   jstring s;
 
   s = env_->NewStringUTF("");
-  EXPECT_TRUE(s != NULL);
+  EXPECT_NE(s, nullptr);
   EXPECT_EQ(0, env_->GetStringLength(s));
   EXPECT_EQ(0, env_->GetStringUTFLength(s));
   s = env_->NewStringUTF("hello");
-  EXPECT_TRUE(s != NULL);
+  EXPECT_NE(s, nullptr);
   EXPECT_EQ(5, env_->GetStringLength(s));
   EXPECT_EQ(5, env_->GetStringUTFLength(s));
 
@@ -1206,11 +1054,11 @@ TEST_F(JniInternalTest, NewString) {
   jchar chars[] = { 'h', 'i' };
   jstring s;
   s = env_->NewString(chars, 0);
-  EXPECT_TRUE(s != NULL);
+  EXPECT_NE(s, nullptr);
   EXPECT_EQ(0, env_->GetStringLength(s));
   EXPECT_EQ(0, env_->GetStringUTFLength(s));
   s = env_->NewString(chars, 2);
-  EXPECT_TRUE(s != NULL);
+  EXPECT_NE(s, nullptr);
   EXPECT_EQ(2, env_->GetStringLength(s));
   EXPECT_EQ(2, env_->GetStringUTFLength(s));
 
@@ -1218,14 +1066,23 @@ TEST_F(JniInternalTest, NewString) {
 }
 
 TEST_F(JniInternalTest, NewStringNullCharsZeroLength) {
-  jstring s = env_->NewString(NULL, 0);
-  EXPECT_TRUE(s != NULL);
+  jstring s = env_->NewString(nullptr, 0);
+  EXPECT_NE(s, nullptr);
   EXPECT_EQ(0, env_->GetStringLength(s));
 }
 
-// TODO: fix gtest death tests on host http://b/5690440 (and target)
-TEST_F(JniInternalTest, DISABLED_NewStringNullCharsNonzeroLength) {
-  ASSERT_DEATH(env_->NewString(NULL, 1), "");
+TEST_F(JniInternalTest, NewStringNullCharsNonzeroLength) {
+  CheckJniAbortCatcher jni_abort_catcher;
+  env_->NewString(nullptr, 1);
+  jni_abort_catcher.Check("chars == null && char_count > 0");
+}
+
+TEST_F(JniInternalTest, NewStringNegativeLength) {
+  CheckJniAbortCatcher jni_abort_catcher;
+  env_->NewString(nullptr, -1);
+  jni_abort_catcher.Check("char_count < 0: -1");
+  env_->NewString(nullptr, std::numeric_limits<jint>::min());
+  jni_abort_catcher.Check("char_count < 0: -2147483648");
 }
 
 TEST_F(JniInternalTest, GetStringLength_GetStringUTFLength) {
@@ -1234,16 +1091,16 @@ TEST_F(JniInternalTest, GetStringLength_GetStringUTFLength) {
 
 TEST_F(JniInternalTest, GetStringRegion_GetStringUTFRegion) {
   jstring s = env_->NewStringUTF("hello");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_TRUE(s != nullptr);
 
-  env_->GetStringRegion(s, -1, 0, NULL);
-  EXPECT_EXCEPTION(sioobe_);
-  env_->GetStringRegion(s, 0, -1, NULL);
-  EXPECT_EXCEPTION(sioobe_);
-  env_->GetStringRegion(s, 0, 10, NULL);
-  EXPECT_EXCEPTION(sioobe_);
-  env_->GetStringRegion(s, 10, 1, NULL);
-  EXPECT_EXCEPTION(sioobe_);
+  env_->GetStringRegion(s, -1, 0, nullptr);
+  ExpectException(sioobe_);
+  env_->GetStringRegion(s, 0, -1, nullptr);
+  ExpectException(sioobe_);
+  env_->GetStringRegion(s, 0, 10, nullptr);
+  ExpectException(sioobe_);
+  env_->GetStringRegion(s, 10, 1, nullptr);
+  ExpectException(sioobe_);
 
   jchar chars[4] = { 'x', 'x', 'x', 'x' };
   env_->GetStringRegion(s, 1, 2, &chars[1]);
@@ -1252,14 +1109,20 @@ TEST_F(JniInternalTest, GetStringRegion_GetStringUTFRegion) {
   EXPECT_EQ('l', chars[2]);
   EXPECT_EQ('x', chars[3]);
 
-  env_->GetStringUTFRegion(s, -1, 0, NULL);
-  EXPECT_EXCEPTION(sioobe_);
-  env_->GetStringUTFRegion(s, 0, -1, NULL);
-  EXPECT_EXCEPTION(sioobe_);
-  env_->GetStringUTFRegion(s, 0, 10, NULL);
-  EXPECT_EXCEPTION(sioobe_);
-  env_->GetStringUTFRegion(s, 10, 1, NULL);
-  EXPECT_EXCEPTION(sioobe_);
+  // It's okay for the buffer to be nullptr as long as the length is 0.
+  env_->GetStringRegion(s, 2, 0, nullptr);
+  // Even if the offset is invalid...
+  env_->GetStringRegion(s, 123, 0, nullptr);
+  ExpectException(sioobe_);
+
+  env_->GetStringUTFRegion(s, -1, 0, nullptr);
+  ExpectException(sioobe_);
+  env_->GetStringUTFRegion(s, 0, -1, nullptr);
+  ExpectException(sioobe_);
+  env_->GetStringUTFRegion(s, 0, 10, nullptr);
+  ExpectException(sioobe_);
+  env_->GetStringUTFRegion(s, 10, 1, nullptr);
+  ExpectException(sioobe_);
 
   char bytes[4] = { 'x', 'x', 'x', 'x' };
   env_->GetStringUTFRegion(s, 1, 2, &bytes[1]);
@@ -1267,20 +1130,26 @@ TEST_F(JniInternalTest, GetStringRegion_GetStringUTFRegion) {
   EXPECT_EQ('e', bytes[1]);
   EXPECT_EQ('l', bytes[2]);
   EXPECT_EQ('x', bytes[3]);
+
+  // It's okay for the buffer to be nullptr as long as the length is 0.
+  env_->GetStringUTFRegion(s, 2, 0, nullptr);
+  // Even if the offset is invalid...
+  env_->GetStringUTFRegion(s, 123, 0, nullptr);
+  ExpectException(sioobe_);
 }
 
 TEST_F(JniInternalTest, GetStringUTFChars_ReleaseStringUTFChars) {
-  // Passing in a NULL jstring is ignored normally, but caught by -Xcheck:jni.
+  // Passing in a nullptr jstring is ignored normally, but caught by -Xcheck:jni.
   {
     CheckJniAbortCatcher check_jni_abort_catcher;
-    EXPECT_TRUE(env_->GetStringUTFChars(NULL, NULL) == NULL);
+    EXPECT_EQ(env_->GetStringUTFChars(nullptr, nullptr), nullptr);
     check_jni_abort_catcher.Check("GetStringUTFChars received null jstring");
   }
 
   jstring s = env_->NewStringUTF("hello");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_TRUE(s != nullptr);
 
-  const char* utf = env_->GetStringUTFChars(s, NULL);
+  const char* utf = env_->GetStringUTFChars(s, nullptr);
   EXPECT_STREQ("hello", utf);
   env_->ReleaseStringUTFChars(s, utf);
 
@@ -1293,10 +1162,12 @@ TEST_F(JniInternalTest, GetStringUTFChars_ReleaseStringUTFChars) {
 
 TEST_F(JniInternalTest, GetStringChars_ReleaseStringChars) {
   jstring s = env_->NewStringUTF("hello");
-  ASSERT_TRUE(s != NULL);
+  ScopedObjectAccess soa(env_);
+  mirror::String* s_m = soa.Decode<mirror::String*>(s);
+  ASSERT_TRUE(s != nullptr);
 
   jchar expected[] = { 'h', 'e', 'l', 'l', 'o' };
-  const jchar* chars = env_->GetStringChars(s, NULL);
+  const jchar* chars = env_->GetStringChars(s, nullptr);
   EXPECT_EQ(expected[0], chars[0]);
   EXPECT_EQ(expected[1], chars[1]);
   EXPECT_EQ(expected[2], chars[2]);
@@ -1306,7 +1177,11 @@ TEST_F(JniInternalTest, GetStringChars_ReleaseStringChars) {
 
   jboolean is_copy = JNI_FALSE;
   chars = env_->GetStringChars(s, &is_copy);
-  EXPECT_EQ(JNI_FALSE, is_copy);
+  if (Runtime::Current()->GetHeap()->IsMovableObject(s_m->GetCharArray())) {
+    EXPECT_EQ(JNI_TRUE, is_copy);
+  } else {
+    EXPECT_EQ(JNI_FALSE, is_copy);
+  }
   EXPECT_EQ(expected[0], chars[0]);
   EXPECT_EQ(expected[1], chars[1]);
   EXPECT_EQ(expected[2], chars[2]);
@@ -1317,10 +1192,10 @@ TEST_F(JniInternalTest, GetStringChars_ReleaseStringChars) {
 
 TEST_F(JniInternalTest, GetStringCritical_ReleaseStringCritical) {
   jstring s = env_->NewStringUTF("hello");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_TRUE(s != nullptr);
 
   jchar expected[] = { 'h', 'e', 'l', 'l', 'o' };
-  const jchar* chars = env_->GetStringCritical(s, NULL);
+  const jchar* chars = env_->GetStringCritical(s, nullptr);
   EXPECT_EQ(expected[0], chars[0]);
   EXPECT_EQ(expected[1], chars[1]);
   EXPECT_EQ(expected[2], chars[2]);
@@ -1328,7 +1203,7 @@ TEST_F(JniInternalTest, GetStringCritical_ReleaseStringCritical) {
   EXPECT_EQ(expected[4], chars[4]);
   env_->ReleaseStringCritical(s, chars);
 
-  jboolean is_copy = JNI_FALSE;
+  jboolean is_copy = JNI_TRUE;
   chars = env_->GetStringCritical(s, &is_copy);
   EXPECT_EQ(JNI_FALSE, is_copy);
   EXPECT_EQ(expected[0], chars[0]);
@@ -1341,61 +1216,88 @@ TEST_F(JniInternalTest, GetStringCritical_ReleaseStringCritical) {
 
 TEST_F(JniInternalTest, GetObjectArrayElement_SetObjectArrayElement) {
   jclass java_lang_Class = env_->FindClass("java/lang/Class");
-  ASSERT_TRUE(java_lang_Class != NULL);
+  ASSERT_TRUE(java_lang_Class != nullptr);
 
-  jobjectArray array = env_->NewObjectArray(1, java_lang_Class, NULL);
-  EXPECT_TRUE(array != NULL);
-  EXPECT_TRUE(env_->GetObjectArrayElement(array, 0) == NULL);
+  jobjectArray array = env_->NewObjectArray(1, java_lang_Class, nullptr);
+  EXPECT_NE(array, nullptr);
+  EXPECT_EQ(env_->GetObjectArrayElement(array, 0), nullptr);
   env_->SetObjectArrayElement(array, 0, java_lang_Class);
   EXPECT_TRUE(env_->IsSameObject(env_->GetObjectArrayElement(array, 0), java_lang_Class));
 
   // ArrayIndexOutOfBounds for negative index.
   env_->SetObjectArrayElement(array, -1, java_lang_Class);
-  EXPECT_EXCEPTION(aioobe_);
+  ExpectException(aioobe_);
 
   // ArrayIndexOutOfBounds for too-large index.
   env_->SetObjectArrayElement(array, 1, java_lang_Class);
-  EXPECT_EXCEPTION(aioobe_);
+  ExpectException(aioobe_);
 
   // ArrayStoreException thrown for bad types.
   env_->SetObjectArrayElement(array, 0, env_->NewStringUTF("not a jclass!"));
-  EXPECT_EXCEPTION(ase_);
+  ExpectException(ase_);
+
+  // Null as array should fail.
+  CheckJniAbortCatcher jni_abort_catcher;
+  EXPECT_EQ(nullptr, env_->GetObjectArrayElement(nullptr, 0));
+  jni_abort_catcher.Check("java_array == null");
+  env_->SetObjectArrayElement(nullptr, 0, nullptr);
+  jni_abort_catcher.Check("java_array == null");
 }
 
 #define EXPECT_STATIC_PRIMITIVE_FIELD(type, field_name, sig, value1, value2) \
   do { \
     jfieldID fid = env_->GetStaticFieldID(c, field_name, sig); \
-    EXPECT_TRUE(fid != NULL); \
+    EXPECT_NE(fid, nullptr); \
     env_->SetStatic ## type ## Field(c, fid, value1); \
-    EXPECT_TRUE(value1 == env_->GetStatic ## type ## Field(c, fid)); \
+    EXPECT_EQ(value1, env_->GetStatic ## type ## Field(c, fid)); \
     env_->SetStatic ## type ## Field(c, fid, value2); \
-    EXPECT_TRUE(value2 == env_->GetStatic ## type ## Field(c, fid)); \
+    EXPECT_EQ(value2, env_->GetStatic ## type ## Field(c, fid)); \
+    \
+    CheckJniAbortCatcher jni_abort_catcher; \
+    env_->GetStatic ## type ## Field(nullptr, fid); \
+    jni_abort_catcher.Check("received null jclass"); \
+    env_->SetStatic ## type ## Field(nullptr, fid, value1); \
+    jni_abort_catcher.Check("received null jclass"); \
+    env_->GetStatic ## type ## Field(c, nullptr); \
+    jni_abort_catcher.Check("fid == null"); \
+    env_->SetStatic ## type ## Field(c, nullptr, value1); \
+    jni_abort_catcher.Check("fid == null"); \
   } while (false)
 
 #define EXPECT_PRIMITIVE_FIELD(instance, type, field_name, sig, value1, value2) \
   do { \
     jfieldID fid = env_->GetFieldID(c, field_name, sig); \
-    EXPECT_TRUE(fid != NULL); \
+    EXPECT_NE(fid, nullptr); \
     env_->Set ## type ## Field(instance, fid, value1); \
-    EXPECT_TRUE(value1 == env_->Get ## type ## Field(instance, fid)); \
+    EXPECT_EQ(value1, env_->Get ## type ## Field(instance, fid)); \
     env_->Set ## type ## Field(instance, fid, value2); \
-    EXPECT_TRUE(value2 == env_->Get ## type ## Field(instance, fid)); \
+    EXPECT_EQ(value2, env_->Get ## type ## Field(instance, fid)); \
+    \
+    CheckJniAbortCatcher jni_abort_catcher; \
+    env_->Get ## type ## Field(nullptr, fid); \
+    jni_abort_catcher.Check("obj == null"); \
+    env_->Set ## type ## Field(nullptr, fid, value1); \
+    jni_abort_catcher.Check("obj == null"); \
+    env_->Get ## type ## Field(instance, nullptr); \
+    jni_abort_catcher.Check("fid == null"); \
+    env_->Set ## type ## Field(instance, nullptr, value1); \
+    jni_abort_catcher.Check("fid == null"); \
   } while (false)
 
 
-#if !defined(ART_USE_PORTABLE_COMPILER)
 TEST_F(JniInternalTest, GetPrimitiveField_SetPrimitiveField) {
+  TEST_DISABLED_FOR_PORTABLE();
   Thread::Current()->TransitionFromSuspendedToRunnable();
   LoadDex("AllFields");
   bool started = runtime_->Start();
-  CHECK(started);
+  ASSERT_TRUE(started);
 
   jclass c = env_->FindClass("AllFields");
-  ASSERT_TRUE(c != NULL);
+  ASSERT_NE(c, nullptr);
   jobject o = env_->AllocObject(c);
-  ASSERT_TRUE(o != NULL);
+  ASSERT_NE(o, nullptr);
 
-  EXPECT_STATIC_PRIMITIVE_FIELD(Boolean, "sZ", "Z", true, false);
+  EXPECT_STATIC_PRIMITIVE_FIELD(Boolean, "sZ", "Z", JNI_TRUE, JNI_FALSE);
   EXPECT_STATIC_PRIMITIVE_FIELD(Byte, "sB", "B", 1, 2);
   EXPECT_STATIC_PRIMITIVE_FIELD(Char, "sC", "C", 'a', 'b');
   EXPECT_STATIC_PRIMITIVE_FIELD(Double, "sD", "D", 1.0, 2.0);
@@ -1404,7 +1306,7 @@ TEST_F(JniInternalTest, GetPrimitiveField_SetPrimitiveField) {
   EXPECT_STATIC_PRIMITIVE_FIELD(Long, "sJ", "J", 1, 2);
   EXPECT_STATIC_PRIMITIVE_FIELD(Short, "sS", "S", 1, 2);
 
-  EXPECT_PRIMITIVE_FIELD(o, Boolean, "iZ", "Z", true, false);
+  EXPECT_PRIMITIVE_FIELD(o, Boolean, "iZ", "Z", JNI_TRUE, JNI_FALSE);
   EXPECT_PRIMITIVE_FIELD(o, Byte, "iB", "B", 1, 2);
   EXPECT_PRIMITIVE_FIELD(o, Char, "iC", "C", 'a', 'b');
   EXPECT_PRIMITIVE_FIELD(o, Double, "iD", "D", 1.0, 2.0);
@@ -1415,24 +1317,25 @@ TEST_F(JniInternalTest, GetPrimitiveField_SetPrimitiveField) {
 }
 
 TEST_F(JniInternalTest, GetObjectField_SetObjectField) {
+  TEST_DISABLED_FOR_PORTABLE();
   Thread::Current()->TransitionFromSuspendedToRunnable();
   LoadDex("AllFields");
   runtime_->Start();
 
   jclass c = env_->FindClass("AllFields");
-  ASSERT_TRUE(c != NULL);
+  ASSERT_NE(c, nullptr);
   jobject o = env_->AllocObject(c);
-  ASSERT_TRUE(o != NULL);
+  ASSERT_NE(o, nullptr);
 
   jstring s1 = env_->NewStringUTF("hello");
-  ASSERT_TRUE(s1 != NULL);
+  ASSERT_NE(s1, nullptr);
   jstring s2 = env_->NewStringUTF("world");
-  ASSERT_TRUE(s2 != NULL);
+  ASSERT_NE(s2, nullptr);
 
   jfieldID s_fid = env_->GetStaticFieldID(c, "sObject", "Ljava/lang/Object;");
-  ASSERT_TRUE(s_fid != NULL);
+  ASSERT_NE(s_fid, nullptr);
   jfieldID i_fid = env_->GetFieldID(c, "iObject", "Ljava/lang/Object;");
-  ASSERT_TRUE(i_fid != NULL);
+  ASSERT_NE(i_fid, nullptr);
 
   env_->SetStaticObjectField(c, s_fid, s1);
   ASSERT_TRUE(env_->IsSameObject(s1, env_->GetStaticObjectField(c, s_fid)));
@@ -1444,29 +1347,28 @@ TEST_F(JniInternalTest, GetObjectField_SetObjectField) {
   env_->SetObjectField(o, i_fid, s2);
   ASSERT_TRUE(env_->IsSameObject(s2, env_->GetObjectField(o, i_fid)));
 }
-#endif
 
-TEST_F(JniInternalTest, NewLocalRef_NULL) {
-  EXPECT_TRUE(env_->NewLocalRef(NULL) == NULL);
+TEST_F(JniInternalTest, NewLocalRef_nullptr) {
+  EXPECT_EQ(env_->NewLocalRef(nullptr), nullptr);
 }
 
 TEST_F(JniInternalTest, NewLocalRef) {
   jstring s = env_->NewStringUTF("");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_NE(s, nullptr);
   jobject o = env_->NewLocalRef(s);
-  EXPECT_TRUE(o != NULL);
-  EXPECT_TRUE(o != s);
+  EXPECT_NE(o, nullptr);
+  EXPECT_NE(o, s);
 
   EXPECT_EQ(JNILocalRefType, env_->GetObjectRefType(o));
 }
 
-TEST_F(JniInternalTest, DeleteLocalRef_NULL) {
-  env_->DeleteLocalRef(NULL);
+TEST_F(JniInternalTest, DeleteLocalRef_nullptr) {
+  env_->DeleteLocalRef(nullptr);
 }
 
 TEST_F(JniInternalTest, DeleteLocalRef) {
   jstring s = env_->NewStringUTF("");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_NE(s, nullptr);
   env_->DeleteLocalRef(s);
 
   // Currently, deleting an already-deleted reference is just a CheckJNI warning.
@@ -1480,9 +1382,9 @@ TEST_F(JniInternalTest, DeleteLocalRef) {
   }
 
   s = env_->NewStringUTF("");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_NE(s, nullptr);
   jobject o = env_->NewLocalRef(s);
-  ASSERT_TRUE(o != NULL);
+  ASSERT_NE(o, nullptr);
 
   env_->DeleteLocalRef(s);
   env_->DeleteLocalRef(o);
@@ -1494,7 +1396,7 @@ TEST_F(JniInternalTest, PushLocalFrame_10395422) {
   // Android historically treated it, and it's how the RI treats it. It's also the more useful
   // interpretation!
   ASSERT_EQ(JNI_OK, env_->PushLocalFrame(0));
-  env_->PopLocalFrame(NULL);
+  env_->PopLocalFrame(nullptr);
 
   // Negative capacities are not allowed.
   ASSERT_EQ(JNI_ERR, env_->PushLocalFrame(-1));
@@ -1505,7 +1407,7 @@ TEST_F(JniInternalTest, PushLocalFrame_10395422) {
 
 TEST_F(JniInternalTest, PushLocalFrame_PopLocalFrame) {
   jobject original = env_->NewStringUTF("");
-  ASSERT_TRUE(original != NULL);
+  ASSERT_NE(original, nullptr);
 
   jobject outer;
   jobject inner1, inner2;
@@ -1530,11 +1432,8 @@ TEST_F(JniInternalTest, PushLocalFrame_PopLocalFrame) {
     // Our local reference for the survivor is invalid because the survivor
     // gets a new local reference...
     EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(inner2));
-    // ...but the survivor should be in the local reference table.
-    JNIEnvExt* env = reinterpret_cast<JNIEnvExt*>(env_);
-    EXPECT_TRUE(env->locals.ContainsDirectPointer(inner2_direct_pointer));
 
-    env_->PopLocalFrame(NULL);
+    env_->PopLocalFrame(nullptr);
   }
   EXPECT_EQ(JNILocalRefType, env_->GetObjectRefType(original));
   EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(outer));
@@ -1542,30 +1441,30 @@ TEST_F(JniInternalTest, PushLocalFrame_PopLocalFrame) {
   EXPECT_EQ(JNIInvalidRefType, env_->GetObjectRefType(inner2));
 }
 
-TEST_F(JniInternalTest, NewGlobalRef_NULL) {
-  EXPECT_TRUE(env_->NewGlobalRef(NULL) == NULL);
+TEST_F(JniInternalTest, NewGlobalRef_nullptr) {
+  EXPECT_EQ(env_->NewGlobalRef(nullptr), nullptr);
 }
 
 TEST_F(JniInternalTest, NewGlobalRef) {
   jstring s = env_->NewStringUTF("");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_NE(s, nullptr);
   jobject o = env_->NewGlobalRef(s);
-  EXPECT_TRUE(o != NULL);
-  EXPECT_TRUE(o != s);
+  EXPECT_NE(o, nullptr);
+  EXPECT_NE(o, s);
 
-  // TODO: check that o is a global reference.
+  EXPECT_EQ(env_->GetObjectRefType(o), JNIGlobalRefType);
 }
 
-TEST_F(JniInternalTest, DeleteGlobalRef_NULL) {
-  env_->DeleteGlobalRef(NULL);
+TEST_F(JniInternalTest, DeleteGlobalRef_nullptr) {
+  env_->DeleteGlobalRef(nullptr);
 }
 
 TEST_F(JniInternalTest, DeleteGlobalRef) {
   jstring s = env_->NewStringUTF("");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_NE(s, nullptr);
 
   jobject o = env_->NewGlobalRef(s);
-  ASSERT_TRUE(o != NULL);
+  ASSERT_NE(o, nullptr);
   env_->DeleteGlobalRef(o);
 
   // Currently, deleting an already-deleted reference is just a CheckJNI warning.
@@ -1579,38 +1478,38 @@ TEST_F(JniInternalTest, DeleteGlobalRef) {
   }
 
   jobject o1 = env_->NewGlobalRef(s);
-  ASSERT_TRUE(o1 != NULL);
+  ASSERT_NE(o1, nullptr);
   jobject o2 = env_->NewGlobalRef(s);
-  ASSERT_TRUE(o2 != NULL);
+  ASSERT_NE(o2, nullptr);
 
   env_->DeleteGlobalRef(o1);
   env_->DeleteGlobalRef(o2);
 }
 
-TEST_F(JniInternalTest, NewWeakGlobalRef_NULL) {
-  EXPECT_TRUE(env_->NewWeakGlobalRef(NULL) == NULL);
+TEST_F(JniInternalTest, NewWeakGlobalRef_nullptr) {
+  EXPECT_EQ(env_->NewWeakGlobalRef(nullptr),   nullptr);
 }
 
 TEST_F(JniInternalTest, NewWeakGlobalRef) {
   jstring s = env_->NewStringUTF("");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_NE(s, nullptr);
   jobject o = env_->NewWeakGlobalRef(s);
-  EXPECT_TRUE(o != NULL);
-  EXPECT_TRUE(o != s);
+  EXPECT_NE(o, nullptr);
+  EXPECT_NE(o, s);
 
-  // TODO: check that o is a weak global reference.
+  EXPECT_EQ(env_->GetObjectRefType(o), JNIWeakGlobalRefType);
 }
 
-TEST_F(JniInternalTest, DeleteWeakGlobalRef_NULL) {
-  env_->DeleteWeakGlobalRef(NULL);
+TEST_F(JniInternalTest, DeleteWeakGlobalRef_nullptr) {
+  env_->DeleteWeakGlobalRef(nullptr);
 }
 
 TEST_F(JniInternalTest, DeleteWeakGlobalRef) {
   jstring s = env_->NewStringUTF("");
-  ASSERT_TRUE(s != NULL);
+  ASSERT_NE(s, nullptr);
 
   jobject o = env_->NewWeakGlobalRef(s);
-  ASSERT_TRUE(o != NULL);
+  ASSERT_NE(o, nullptr);
   env_->DeleteWeakGlobalRef(o);
 
   // Currently, deleting an already-deleted reference is just a CheckJNI warning.
@@ -1624,191 +1523,27 @@ TEST_F(JniInternalTest, DeleteWeakGlobalRef) {
   }
 
   jobject o1 = env_->NewWeakGlobalRef(s);
-  ASSERT_TRUE(o1 != NULL);
+  ASSERT_NE(o1, nullptr);
   jobject o2 = env_->NewWeakGlobalRef(s);
-  ASSERT_TRUE(o2 != NULL);
+  ASSERT_NE(o2, nullptr);
 
   env_->DeleteWeakGlobalRef(o1);
   env_->DeleteWeakGlobalRef(o2);
 }
 
-TEST_F(JniInternalTest, StaticMainMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  jobject jclass_loader = LoadDex("Main");
-  SirtRef<mirror::ClassLoader>
-      class_loader(soa.Self(), soa.Decode<mirror::ClassLoader*>(jclass_loader));
-  CompileDirectMethod(class_loader.get(), "Main", "main", "([Ljava/lang/String;)V");
-
-  mirror::Class* klass = class_linker_->FindClass("LMain;", class_loader.get());
-  ASSERT_TRUE(klass != NULL);
-
-  mirror::ArtMethod* method = klass->FindDirectMethod("main", "([Ljava/lang/String;)V");
-  ASSERT_TRUE(method != NULL);
-
-  ArgArray arg_array(NULL, 0);
-  arg_array.Append(0);
-  JValue result;
-
-  // Start runtime.
-  bool started = runtime_->Start();
-  CHECK(started);
-  Thread::Current()->TransitionFromSuspendedToRunnable();
-
-  method->Invoke(Thread::Current(), arg_array.GetArray(), arg_array.GetNumBytes(), &result, 'V');
-}
-
-TEST_F(JniInternalTest, StaticNopMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeNopMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticNopMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeNopMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticIdentityByteMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeIdentityByteMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticIdentityByteMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeIdentityByteMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticIdentityIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeIdentityIntMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticIdentityIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeIdentityIntMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticIdentityDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeIdentityDoubleMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticIdentityDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeIdentityDoubleMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticSumIntIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumIntIntMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticSumIntIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumIntIntMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticSumIntIntIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumIntIntIntMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticSumIntIntIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumIntIntIntMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticSumIntIntIntIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumIntIntIntIntMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticSumIntIntIntIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumIntIntIntIntMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticSumIntIntIntIntIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumIntIntIntIntIntMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticSumIntIntIntIntIntMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumIntIntIntIntIntMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticSumDoubleDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumDoubleDoubleMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticSumDoubleDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumDoubleDoubleMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticSumDoubleDoubleDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumDoubleDoubleDoubleMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticSumDoubleDoubleDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumDoubleDoubleDoubleMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticSumDoubleDoubleDoubleDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumDoubleDoubleDoubleDoubleMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticSumDoubleDoubleDoubleDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumDoubleDoubleDoubleDoubleMethod(false);
-}
-
-TEST_F(JniInternalTest, StaticSumDoubleDoubleDoubleDoubleDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumDoubleDoubleDoubleDoubleDoubleMethod(true);
-}
-
-TEST_F(JniInternalTest, NonStaticSumDoubleDoubleDoubleDoubleDoubleMethod) {
-  TEST_DISABLED_FOR_PORTABLE();
-  ScopedObjectAccess soa(Thread::Current());
-  InvokeSumDoubleDoubleDoubleDoubleDoubleMethod(false);
+TEST_F(JniInternalTest, ExceptionDescribe) {
+  // This checks how ExceptionDescribe handles call without exception.
+  env_->ExceptionClear();
+  env_->ExceptionDescribe();
 }
 
 TEST_F(JniInternalTest, Throw) {
-  EXPECT_EQ(JNI_ERR, env_->Throw(NULL));
+  EXPECT_EQ(JNI_ERR, env_->Throw(nullptr));
 
   jclass exception_class = env_->FindClass("java/lang/RuntimeException");
-  ASSERT_TRUE(exception_class != NULL);
+  ASSERT_TRUE(exception_class != nullptr);
   jthrowable exception = reinterpret_cast<jthrowable>(env_->AllocObject(exception_class));
-  ASSERT_TRUE(exception != NULL);
+  ASSERT_TRUE(exception != nullptr);
 
   EXPECT_EQ(JNI_OK, env_->Throw(exception));
   EXPECT_TRUE(env_->ExceptionCheck());
@@ -1818,10 +1553,10 @@ TEST_F(JniInternalTest, Throw) {
 }
 
 TEST_F(JniInternalTest, ThrowNew) {
-  EXPECT_EQ(JNI_ERR, env_->Throw(NULL));
+  EXPECT_EQ(JNI_ERR, env_->Throw(nullptr));
 
   jclass exception_class = env_->FindClass("java/lang/RuntimeException");
-  ASSERT_TRUE(exception_class != NULL);
+  ASSERT_TRUE(exception_class != nullptr);
 
   jthrowable thrown_exception;
 
@@ -1831,36 +1566,58 @@ TEST_F(JniInternalTest, ThrowNew) {
   env_->ExceptionClear();
   EXPECT_TRUE(env_->IsInstanceOf(thrown_exception, exception_class));
 
-  EXPECT_EQ(JNI_OK, env_->ThrowNew(exception_class, NULL));
+  EXPECT_EQ(JNI_OK, env_->ThrowNew(exception_class, nullptr));
   EXPECT_TRUE(env_->ExceptionCheck());
   thrown_exception = env_->ExceptionOccurred();
   env_->ExceptionClear();
   EXPECT_TRUE(env_->IsInstanceOf(thrown_exception, exception_class));
 }
 
-// TODO: this test is DISABLED until we can actually run java.nio.Buffer's <init>.
-TEST_F(JniInternalTest, DISABLED_NewDirectBuffer_GetDirectBufferAddress_GetDirectBufferCapacity) {
+TEST_F(JniInternalTest, NewDirectBuffer_GetDirectBufferAddress_GetDirectBufferCapacity) {
+  // Start runtime.
+  Thread* self = Thread::Current();
+  self->TransitionFromSuspendedToRunnable();
+  MakeExecutable(nullptr, "java.lang.Class");
+  MakeExecutable(nullptr, "java.lang.Object");
+  MakeExecutable(nullptr, "java.nio.DirectByteBuffer");
+  MakeExecutable(nullptr, "java.nio.MemoryBlock");
+  MakeExecutable(nullptr, "java.nio.MemoryBlock$UnmanagedBlock");
+  MakeExecutable(nullptr, "java.nio.MappedByteBuffer");
+  MakeExecutable(nullptr, "java.nio.ByteBuffer");
+  MakeExecutable(nullptr, "java.nio.Buffer");
+  // TODO: we only load a dex file here as starting the runtime relies upon it.
+  const char* class_name = "StaticLeafMethods";
+  LoadDex(class_name);
+  bool started = runtime_->Start();
+  ASSERT_TRUE(started);
+
   jclass buffer_class = env_->FindClass("java/nio/Buffer");
-  ASSERT_TRUE(buffer_class != NULL);
+  ASSERT_NE(buffer_class, nullptr);
 
   char bytes[1024];
   jobject buffer = env_->NewDirectByteBuffer(bytes, sizeof(bytes));
-  ASSERT_TRUE(buffer != NULL);
+  ASSERT_NE(buffer, nullptr);
   ASSERT_TRUE(env_->IsInstanceOf(buffer, buffer_class));
-  ASSERT_TRUE(env_->GetDirectBufferAddress(buffer) == bytes);
-  ASSERT_TRUE(env_->GetDirectBufferCapacity(buffer) == sizeof(bytes));
+  ASSERT_EQ(env_->GetDirectBufferAddress(buffer), bytes);
+  ASSERT_EQ(env_->GetDirectBufferCapacity(buffer), static_cast<jlong>(sizeof(bytes)));
+
+  {
+    CheckJniAbortCatcher check_jni_abort_catcher;
+    env_->NewDirectByteBuffer(bytes, static_cast<jlong>(INT_MAX) + 1);
+    check_jni_abort_catcher.Check("in call to NewDirectByteBuffer");
+  }
 }
 
 TEST_F(JniInternalTest, MonitorEnterExit) {
-  // Create an object to torture
+  // Create an object to torture.
   jclass object_class = env_->FindClass("java/lang/Object");
-  ASSERT_TRUE(object_class != NULL);
+  ASSERT_NE(object_class, nullptr);
   jobject object = env_->AllocObject(object_class);
-  ASSERT_TRUE(object != NULL);
+  ASSERT_NE(object, nullptr);
 
   // Expected class of exceptions
   jclass imse_class = env_->FindClass("java/lang/IllegalMonitorStateException");
-  ASSERT_TRUE(imse_class != NULL);
+  ASSERT_NE(imse_class, nullptr);
 
   jthrowable thrown_exception;
 
@@ -1897,13 +1654,12 @@ TEST_F(JniInternalTest, MonitorEnterExit) {
   env_->ExceptionClear();
   EXPECT_TRUE(env_->IsInstanceOf(thrown_exception, imse_class));
 
-  // It's an error to call MonitorEnter or MonitorExit on NULL.
+  // It's an error to call MonitorEnter or MonitorExit on nullptr.
   {
     CheckJniAbortCatcher check_jni_abort_catcher;
-    env_->MonitorEnter(NULL);
+    env_->MonitorEnter(nullptr);
     check_jni_abort_catcher.Check("in call to MonitorEnter");
-
-    env_->MonitorExit(NULL);
+    env_->MonitorExit(nullptr);
     check_jni_abort_catcher.Check("in call to MonitorExit");
   }
 }
@@ -1915,7 +1671,7 @@ TEST_F(JniInternalTest, DetachCurrentThread) {
 
   jint err = vm_->DetachCurrentThread();
   EXPECT_EQ(JNI_ERR, err);
-  vm_->AttachCurrentThread(&env_, NULL);  // need attached thread for CommonTest::TearDown
+  vm_->AttachCurrentThread(&env_, nullptr);  // need attached thread for CommonRuntimeTest::TearDown
 }
 
 }  // namespace art

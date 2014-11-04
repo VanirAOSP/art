@@ -24,6 +24,7 @@
 #include "arm/constants_arm.h"
 #include "mips/constants_mips.h"
 #include "x86/constants_x86.h"
+#include "x86_64/constants_x86_64.h"
 #include "instruction_set.h"
 #include "managed_register.h"
 #include "memory_region.h"
@@ -37,6 +38,11 @@ class AssemblerFixup;
 
 namespace arm {
   class ArmAssembler;
+  class Arm32Assembler;
+  class Thumb2Assembler;
+}
+namespace arm64 {
+  class Arm64Assembler;
 }
 namespace mips {
   class MipsAssembler;
@@ -44,6 +50,26 @@ namespace mips {
 namespace x86 {
   class X86Assembler;
 }
+namespace x86_64 {
+  class X86_64Assembler;
+}
+
+class ExternalLabel {
+ public:
+  ExternalLabel(const char* name, uword address)
+      : name_(name), address_(address) {
+    DCHECK(name != nullptr);
+  }
+
+  const char* name() const { return name_; }
+  uword address() const {
+    return address_;
+  }
+
+ private:
+  const char* name_;
+  const uword address_;
+};
 
 class Label {
  public:
@@ -63,7 +89,7 @@ class Label {
 
   int LinkPosition() const {
     CHECK(IsLinked());
-    return position_ - kWordSize;
+    return position_ - kPointerSize;
   }
 
   bool IsBound() const { return position_ < 0; }
@@ -90,8 +116,11 @@ class Label {
   }
 
   friend class arm::ArmAssembler;
+  friend class arm::Arm32Assembler;
+  friend class arm::Thumb2Assembler;
   friend class mips::MipsAssembler;
   friend class x86::X86Assembler;
+  friend class x86_64::X86_64Assembler;
 
   DISALLOW_COPY_AND_ASSIGN(Label);
 };
@@ -162,6 +191,15 @@ class AssemblerBuffer {
   template<typename T> void Store(size_t position, T value) {
     CHECK_LE(position, Size() - static_cast<int>(sizeof(T)));
     *reinterpret_cast<T*>(contents_ + position) = value;
+  }
+
+  void Move(size_t newposition, size_t oldposition) {
+    CHECK(HasEnsuredCapacity());
+    // Move the contents of the buffer from oldposition to
+    // newposition by nbytes.
+    size_t nbytes = Size() - oldposition;
+    memmove(contents_ + newposition, contents_ + oldposition, nbytes);
+    cursor_ += newposition - oldposition;
   }
 
   // Emit a fixup at the current location.
@@ -282,7 +320,9 @@ class AssemblerBuffer {
   byte* cursor_;
   byte* limit_;
   AssemblerFixup* fixup_;
+#ifndef NDEBUG
   bool fixups_processed_;
+#endif
 
   // Head of linked list of slow paths
   SlowPath* slow_path_;
@@ -314,20 +354,23 @@ class Assembler {
   static Assembler* Create(InstructionSet instruction_set);
 
   // Emit slow paths queued during assembly
-  void EmitSlowPaths() { buffer_.EmitSlowPaths(this); }
+  virtual void EmitSlowPaths() { buffer_.EmitSlowPaths(this); }
 
   // Size of generated code
-  size_t CodeSize() const { return buffer_.Size(); }
+  virtual size_t CodeSize() const { return buffer_.Size(); }
 
   // Copy instructions out of assembly buffer into the given region of memory
-  void FinalizeInstructions(const MemoryRegion& region) {
+  virtual void FinalizeInstructions(const MemoryRegion& region) {
     buffer_.FinalizeInstructions(region);
   }
+
+  // TODO: Implement with disassembler.
+  virtual void Comment(const char* format, ...) { }
 
   // Emit code that will create an activation on the stack
   virtual void BuildFrame(size_t frame_size, ManagedRegister method_reg,
                           const std::vector<ManagedRegister>& callee_save_regs,
-                          const std::vector<ManagedRegister>& entry_spills) = 0;
+                          const ManagedRegisterEntrySpills& entry_spills) = 0;
 
   // Emit code that will remove an activation from the stack
   virtual void RemoveFrame(size_t frame_size,
@@ -344,14 +387,20 @@ class Assembler {
   virtual void StoreImmediateToFrame(FrameOffset dest, uint32_t imm,
                                      ManagedRegister scratch) = 0;
 
-  virtual void StoreImmediateToThread(ThreadOffset dest, uint32_t imm,
-                                      ManagedRegister scratch) = 0;
+  virtual void StoreImmediateToThread32(ThreadOffset<4> dest, uint32_t imm,
+                                        ManagedRegister scratch);
+  virtual void StoreImmediateToThread64(ThreadOffset<8> dest, uint32_t imm,
+                                        ManagedRegister scratch);
 
-  virtual void StoreStackOffsetToThread(ThreadOffset thr_offs,
-                                        FrameOffset fr_offs,
-                                        ManagedRegister scratch) = 0;
+  virtual void StoreStackOffsetToThread32(ThreadOffset<4> thr_offs,
+                                          FrameOffset fr_offs,
+                                          ManagedRegister scratch);
+  virtual void StoreStackOffsetToThread64(ThreadOffset<8> thr_offs,
+                                          FrameOffset fr_offs,
+                                          ManagedRegister scratch);
 
-  virtual void StoreStackPointerToThread(ThreadOffset thr_offs) = 0;
+  virtual void StoreStackPointerToThread32(ThreadOffset<4> thr_offs);
+  virtual void StoreStackPointerToThread64(ThreadOffset<8> thr_offs);
 
   virtual void StoreSpanning(FrameOffset dest, ManagedRegister src,
                              FrameOffset in_off, ManagedRegister scratch) = 0;
@@ -359,27 +408,29 @@ class Assembler {
   // Load routines
   virtual void Load(ManagedRegister dest, FrameOffset src, size_t size) = 0;
 
-  virtual void Load(ManagedRegister dest, ThreadOffset src, size_t size) = 0;
+  virtual void LoadFromThread32(ManagedRegister dest, ThreadOffset<4> src, size_t size);
+  virtual void LoadFromThread64(ManagedRegister dest, ThreadOffset<8> src, size_t size);
 
   virtual void LoadRef(ManagedRegister dest, FrameOffset  src) = 0;
+  virtual void LoadRef(ManagedRegister dest, ManagedRegister base, MemberOffset offs) = 0;
 
-  virtual void LoadRef(ManagedRegister dest, ManagedRegister base,
-                       MemberOffset offs) = 0;
+  virtual void LoadRawPtr(ManagedRegister dest, ManagedRegister base, Offset offs) = 0;
 
-  virtual void LoadRawPtr(ManagedRegister dest, ManagedRegister base,
-                          Offset offs) = 0;
-
-  virtual void LoadRawPtrFromThread(ManagedRegister dest,
-                                    ThreadOffset offs) = 0;
+  virtual void LoadRawPtrFromThread32(ManagedRegister dest, ThreadOffset<4> offs);
+  virtual void LoadRawPtrFromThread64(ManagedRegister dest, ThreadOffset<8> offs);
 
   // Copying routines
   virtual void Move(ManagedRegister dest, ManagedRegister src, size_t size) = 0;
 
-  virtual void CopyRawPtrFromThread(FrameOffset fr_offs, ThreadOffset thr_offs,
-                                    ManagedRegister scratch) = 0;
+  virtual void CopyRawPtrFromThread32(FrameOffset fr_offs, ThreadOffset<4> thr_offs,
+                                      ManagedRegister scratch);
+  virtual void CopyRawPtrFromThread64(FrameOffset fr_offs, ThreadOffset<8> thr_offs,
+                                      ManagedRegister scratch);
 
-  virtual void CopyRawPtrToThread(ThreadOffset thr_offs, FrameOffset fr_offs,
-                                  ManagedRegister scratch) = 0;
+  virtual void CopyRawPtrToThread32(ThreadOffset<4> thr_offs, FrameOffset fr_offs,
+                                    ManagedRegister scratch);
+  virtual void CopyRawPtrToThread64(ThreadOffset<8> thr_offs, FrameOffset fr_offs,
+                                    ManagedRegister scratch);
 
   virtual void CopyRef(FrameOffset dest, FrameOffset src,
                        ManagedRegister scratch) = 0;
@@ -415,20 +466,20 @@ class Assembler {
   virtual void GetCurrentThread(FrameOffset dest_offset,
                                 ManagedRegister scratch) = 0;
 
-  // Set up out_reg to hold a Object** into the SIRT, or to be NULL if the
+  // Set up out_reg to hold a Object** into the handle scope, or to be NULL if the
   // value is null and null_allowed. in_reg holds a possibly stale reference
-  // that can be used to avoid loading the SIRT entry to see if the value is
+  // that can be used to avoid loading the handle scope entry to see if the value is
   // NULL.
-  virtual void CreateSirtEntry(ManagedRegister out_reg, FrameOffset sirt_offset,
+  virtual void CreateHandleScopeEntry(ManagedRegister out_reg, FrameOffset handlescope_offset,
                                ManagedRegister in_reg, bool null_allowed) = 0;
 
-  // Set up out_off to hold a Object** into the SIRT, or to be NULL if the
+  // Set up out_off to hold a Object** into the handle scope, or to be NULL if the
   // value is null and null_allowed.
-  virtual void CreateSirtEntry(FrameOffset out_off, FrameOffset sirt_offset,
+  virtual void CreateHandleScopeEntry(FrameOffset out_off, FrameOffset handlescope_offset,
                                ManagedRegister scratch, bool null_allowed) = 0;
 
-  // src holds a SIRT entry (Object**) load this into dst
-  virtual void LoadReferenceFromSirt(ManagedRegister dst,
+  // src holds a handle scope entry (Object**) load this into dst
+  virtual void LoadReferenceFromHandleScope(ManagedRegister dst,
                                      ManagedRegister src) = 0;
 
   // Heap::VerifyObject on src. In some cases (such as a reference to this) we
@@ -441,7 +492,8 @@ class Assembler {
                     ManagedRegister scratch) = 0;
   virtual void Call(FrameOffset base, Offset offset,
                     ManagedRegister scratch) = 0;
-  virtual void Call(ThreadOffset offset, ManagedRegister scratch) = 0;
+  virtual void CallFromThread32(ThreadOffset<4> offset, ManagedRegister scratch);
+  virtual void CallFromThread64(ThreadOffset<8> offset, ManagedRegister scratch);
 
   // Generate code to check if Thread::Current()->exception_ is non-null
   // and branch to a ExceptionSlowPath if it is.

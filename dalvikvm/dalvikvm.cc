@@ -15,16 +15,16 @@
  */
 
 #include <signal.h>
-
-#include <cstdio>
-#include <cstring>
-#include <string>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <algorithm>
+#include <memory>
 
 #include "jni.h"
 #include "JniInvocation.h"
 #include "ScopedLocalRef.h"
 #include "toStringArray.h"
-#include "UniquePtr.h"
 
 namespace art {
 
@@ -117,7 +117,7 @@ static int dalvikvm(int argc, char** argv) {
   // We're over-allocating, because this includes the options to the runtime
   // plus the options to the program.
   int option_count = argc;
-  UniquePtr<JavaVMOption[]> options(new JavaVMOption[option_count]());
+  std::unique_ptr<JavaVMOption[]> options(new JavaVMOption[option_count]());
 
   // Copy options over.  Everything up to the name of the class starts
   // with a '-' (the function hook stuff is strictly internal).
@@ -151,15 +151,7 @@ static int dalvikvm(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  // Make sure they provided a class name.
-  if (arg_idx == argc) {
-    fprintf(stderr, "Class name required\n");
-    return EXIT_FAILURE;
-  }
-
-  // insert additional internal options here
-
-  if (curr_opt >= option_count) {
+  if (curr_opt > option_count) {
     fprintf(stderr, "curr_opt(%d) >= option_count(%d)\n", curr_opt, option_count);
     abort();
     return EXIT_FAILURE;
@@ -183,6 +175,14 @@ static int dalvikvm(int argc, char** argv) {
   JNIEnv* env = NULL;
   if (JNI_CreateJavaVM(&vm, &env, &init_args) != JNI_OK) {
     fprintf(stderr, "Failed to initialize runtime (check log for details)\n");
+    return EXIT_FAILURE;
+  }
+
+  // Make sure they provided a class name. We do this after
+  // JNI_CreateJavaVM so that things like "-help" have the opportunity
+  // to emit a usage statement.
+  if (arg_idx == argc) {
+    fprintf(stderr, "Class name required\n");
     return EXIT_FAILURE;
   }
 

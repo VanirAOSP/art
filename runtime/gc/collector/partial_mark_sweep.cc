@@ -19,14 +19,14 @@
 #include "gc/heap.h"
 #include "gc/space/space.h"
 #include "partial_mark_sweep.h"
-#include "thread.h"
+#include "thread-inl.h"
 
 namespace art {
 namespace gc {
 namespace collector {
 
 PartialMarkSweep::PartialMarkSweep(Heap* heap, bool is_concurrent, const std::string& name_prefix)
-    : MarkSweep(heap, is_concurrent, name_prefix + (name_prefix.empty() ? "" : " ") + "partial") {
+    : MarkSweep(heap, is_concurrent, name_prefix.empty() ? "partial " : name_prefix) {
   cumulative_timings_.SetName(GetName());
 }
 
@@ -39,7 +39,7 @@ void PartialMarkSweep::BindBitmaps() {
   for (const auto& space : GetHeap()->GetContinuousSpaces()) {
     if (space->GetGcRetentionPolicy() == space::kGcRetentionPolicyFullCollect) {
       CHECK(space->IsZygoteSpace());
-      ImmuneSpace(space);
+      CHECK(immune_region_.AddContinuousSpace(space)) << "Failed to add space " << *space;
     }
   }
 }

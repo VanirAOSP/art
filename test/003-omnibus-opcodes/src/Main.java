@@ -26,7 +26,7 @@ public class Main {
         main.run();
 
         /* run through the heap to see if we trashed something */
-        System.gc();
+        Runtime.getRuntime().gc();
 
         System.out.println("Done!");
     }
@@ -70,6 +70,7 @@ public class Main {
             th.printStackTrace();
         }
         InternedString.run();
+        GenSelect.run();
     }
 
     public static void assertTrue(boolean condition) {

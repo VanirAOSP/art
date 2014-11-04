@@ -21,55 +21,63 @@
 
 namespace art {
 namespace mips {
-class MipsManagedRuntimeCallingConvention : public ManagedRuntimeCallingConvention {
+
+constexpr size_t kFramePointerSize = 4;
+
+class MipsManagedRuntimeCallingConvention FINAL : public ManagedRuntimeCallingConvention {
  public:
   MipsManagedRuntimeCallingConvention(bool is_static, bool is_synchronized, const char* shorty)
-      : ManagedRuntimeCallingConvention(is_static, is_synchronized, shorty) {}
-  virtual ~MipsManagedRuntimeCallingConvention() {}
+      : ManagedRuntimeCallingConvention(is_static, is_synchronized, shorty, kFramePointerSize) {}
+  ~MipsManagedRuntimeCallingConvention() OVERRIDE {}
   // Calling convention
-  virtual ManagedRegister ReturnRegister();
-  virtual ManagedRegister InterproceduralScratchRegister();
+  ManagedRegister ReturnRegister() OVERRIDE;
+  ManagedRegister InterproceduralScratchRegister() OVERRIDE;
   // Managed runtime calling convention
-  virtual ManagedRegister MethodRegister();
-  virtual bool IsCurrentParamInRegister();
-  virtual bool IsCurrentParamOnStack();
-  virtual ManagedRegister CurrentParamRegister();
-  virtual FrameOffset CurrentParamStackOffset();
-  virtual const std::vector<ManagedRegister>& EntrySpills();
+  ManagedRegister MethodRegister() OVERRIDE;
+  bool IsCurrentParamInRegister() OVERRIDE;
+  bool IsCurrentParamOnStack() OVERRIDE;
+  ManagedRegister CurrentParamRegister() OVERRIDE;
+  FrameOffset CurrentParamStackOffset() OVERRIDE;
+  const ManagedRegisterEntrySpills& EntrySpills() OVERRIDE;
 
  private:
-  std::vector<ManagedRegister> entry_spills_;
+  ManagedRegisterEntrySpills entry_spills_;
 
   DISALLOW_COPY_AND_ASSIGN(MipsManagedRuntimeCallingConvention);
 };
 
-class MipsJniCallingConvention : public JniCallingConvention {
+class MipsJniCallingConvention FINAL : public JniCallingConvention {
  public:
   explicit MipsJniCallingConvention(bool is_static, bool is_synchronized, const char* shorty);
-  virtual ~MipsJniCallingConvention() {}
+  ~MipsJniCallingConvention() OVERRIDE {}
   // Calling convention
-  virtual ManagedRegister ReturnRegister();
-  virtual ManagedRegister IntReturnRegister();
-  virtual ManagedRegister InterproceduralScratchRegister();
+  ManagedRegister ReturnRegister() OVERRIDE;
+  ManagedRegister IntReturnRegister() OVERRIDE;
+  ManagedRegister InterproceduralScratchRegister() OVERRIDE;
   // JNI calling convention
-  virtual void Next();  // Override default behavior for AAPCS
-  virtual size_t FrameSize();
-  virtual size_t OutArgSize();
-  virtual const std::vector<ManagedRegister>& CalleeSaveRegisters() const {
+  void Next() OVERRIDE;  // Override default behavior for AAPCS
+  size_t FrameSize() OVERRIDE;
+  size_t OutArgSize() OVERRIDE;
+  const std::vector<ManagedRegister>& CalleeSaveRegisters() const OVERRIDE {
     return callee_save_regs_;
   }
-  virtual ManagedRegister ReturnScratchRegister() const;
-  virtual uint32_t CoreSpillMask() const;
-  virtual uint32_t FpSpillMask() const {
+  ManagedRegister ReturnScratchRegister() const OVERRIDE;
+  uint32_t CoreSpillMask() const OVERRIDE;
+  uint32_t FpSpillMask() const OVERRIDE {
     return 0;  // Floats aren't spilled in JNI down call
   }
-  virtual bool IsCurrentParamInRegister();
-  virtual bool IsCurrentParamOnStack();
-  virtual ManagedRegister CurrentParamRegister();
-  virtual FrameOffset CurrentParamStackOffset();
+  bool IsCurrentParamInRegister() OVERRIDE;
+  bool IsCurrentParamOnStack() OVERRIDE;
+  ManagedRegister CurrentParamRegister() OVERRIDE;
+  FrameOffset CurrentParamStackOffset() OVERRIDE;
+
+  // Mips does not need to extend small return types.
+  bool RequiresSmallResultTypeExtension() const OVERRIDE {
+    return false;
+  }
 
  protected:
-  virtual size_t NumberOfOutgoingStackArgs();
+  size_t NumberOfOutgoingStackArgs() OVERRIDE;
 
  private:
   // TODO: these values aren't unique and can be shared amongst instances
@@ -80,6 +88,7 @@ class MipsJniCallingConvention : public JniCallingConvention {
 
   DISALLOW_COPY_AND_ASSIGN(MipsJniCallingConvention);
 };
+
 }  // namespace mips
 }  // namespace art
 
