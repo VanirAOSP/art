@@ -19,7 +19,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <zlib.h>
 
 #include "UniquePtr.h"
 #include "common_test.h"
@@ -32,9 +31,8 @@ class ZipArchiveTest : public CommonTest {};
 TEST_F(ZipArchiveTest, FindAndExtract) {
   UniquePtr<ZipArchive> zip_archive(ZipArchive::Open(GetLibCoreDexFileName()));
   ASSERT_TRUE(zip_archive.get() != false);
-  UniquePtr<ZipEntry> zip_entry(zip_archive->Find("classes.dex", &error_msg));
+  UniquePtr<ZipEntry> zip_entry(zip_archive->Find("classes.dex"));
   ASSERT_TRUE(zip_entry.get() != false);
-  ASSERT_TRUE(error_msg.empty());
 
   ScratchFile tmp;
   ASSERT_NE(-1, tmp.GetFd());

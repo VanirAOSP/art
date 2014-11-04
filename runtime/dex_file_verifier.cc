@@ -16,8 +16,6 @@
 
 #include "dex_file_verifier.h"
 
-#include <zlib.h>
-
 #include "base/stringprintf.h"
 #include "dex_file-inl.h"
 #include "leb128.h"
@@ -25,6 +23,7 @@
 #include "UniquePtr.h"
 #include "utf.h"
 #include "utils.h"
+#include "zip_archive.h"
 
 namespace art {
 
