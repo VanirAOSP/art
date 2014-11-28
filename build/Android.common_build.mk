@@ -309,7 +309,11 @@ define set-target-local-cflags-vars
   LOCAL_LDFLAGS += $(ART_TARGET_LDFLAGS)
   art_target_cflags_ndebug_or_debug := $(1)
   ifeq ($$(art_target_cflags_ndebug_or_debug),debug)
-    LOCAL_CFLAGS += $(ART_TARGET_DEBUG_CFLAGS)
+    ifeq ($$(BONE_STOCK),true)
+      LOCAL_CFLAGS += $(ART_TARGET_DEBUG_CFLAGS)
+    else
+      LOCAL_CFLAGS += $(ART_TARGET_NON_DEBUG_CFLAGS)
+    endif
   else
     LOCAL_CFLAGS += $(ART_TARGET_NON_DEBUG_CFLAGS)
   endif
