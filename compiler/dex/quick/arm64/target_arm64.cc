@@ -138,9 +138,8 @@ RegStorage Arm64Mir2Lir::TargetReg(SpecialTargetRegister reg) {
   return res_reg;
 }
 
-void Arm64Mir2Lir::CompilerPostInitializeRegAlloc()
-{
-    //nothing here
+void Arm64Mir2Lir::CompilerPostInitializeRegAlloc() {
+    // nothing here
 }
 
 /*

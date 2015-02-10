@@ -139,9 +139,8 @@ ResourceMask ArmMir2Lir::GetRegMaskCommon(const RegStorage& reg) const {
   return GetRegMaskArm(reg);
 }
 
-void ArmMir2Lir::CompilerPostInitializeRegAlloc()
-{
-    //nothing here
+void ArmMir2Lir::CompilerPostInitializeRegAlloc() {
+    // nothing here
 }
 
 constexpr ResourceMask ArmMir2Lir::GetRegMaskArm(RegStorage reg) {
@@ -838,12 +837,11 @@ RegStorage ArmMir2Lir::AllocPreservedSingle(int s_reg) {
   return res;
 }
 
-void ArmMir2Lir::GenMoreMachineSpecificExtendedMethodMIR(BasicBlock* bb, MIR* mir){
+void ArmMir2Lir::GenMoreMachineSpecificExtendedMethodMIR(BasicBlock* bb, MIR* mir) {
     // nothing here
 }
 
 void ArmMir2Lir::GenMachineSpecificExtendedMethodMIR(BasicBlock* bb, MIR* mir) {
-
     GenMoreMachineSpecificExtendedMethodMIR(bb,  mir);
 }
 
