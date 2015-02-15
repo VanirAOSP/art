@@ -86,7 +86,7 @@ endif
 #
 # Used to enable optimizing compiler
 #
-ART_USE_OPTIMIZING_COMPILER := true
+ART_USE_OPTIMIZING_COMPILER := false
 ifneq ($(wildcard art/USE_OPTIMIZING_COMPILER),)
 $(info Enabling ART_USE_OPTIMIZING_COMPILER because of existence of art/USE_OPTIMIZING_COMPILER)
 ART_USE_OPTIMIZING_COMPILER := true
