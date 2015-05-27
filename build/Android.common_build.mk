@@ -29,9 +29,9 @@ include art/build/Android.common.mk
 # Beware that tests may use the non-debug build for performance, notable 055-enum-performance
 #
 ART_BUILD_TARGET_NDEBUG ?= true
-ART_BUILD_TARGET_DEBUG ?= false
+ART_BUILD_TARGET_DEBUG ?= true
 ART_BUILD_HOST_NDEBUG ?= true
-ART_BUILD_HOST_DEBUG ?= false
+ART_BUILD_HOST_DEBUG ?= true
 
 ifeq ($(ART_BUILD_TARGET_NDEBUG),false)
 $(info Disabling ART_BUILD_TARGET_NDEBUG)
@@ -317,11 +317,7 @@ define set-target-local-cflags-vars
   LOCAL_LDFLAGS += $(ART_TARGET_LDFLAGS)
   art_target_cflags_ndebug_or_debug := $(1)
   ifeq ($$(art_target_cflags_ndebug_or_debug),debug)
-    ifeq ($$(BONE_STOCK),true)
-      LOCAL_CFLAGS += $(ART_TARGET_DEBUG_CFLAGS)
-    else
-      LOCAL_CFLAGS += $(ART_TARGET_NON_DEBUG_CFLAGS)
-    endif
+    LOCAL_CFLAGS += $(ART_TARGET_DEBUG_CFLAGS)
   else
     LOCAL_CFLAGS += $(ART_TARGET_NON_DEBUG_CFLAGS)
   endif
