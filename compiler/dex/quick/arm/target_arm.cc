@@ -569,12 +569,10 @@ ArmMir2Lir::ArmMir2Lir(CompilationUnit* cu, MIRGraph* mir_graph, ArenaAllocator*
   ArmMir2LirPostInit(this);
 }
 
-void ArmMir2Lir::Cleanup()
-{
+void ArmMir2Lir::Cleanup() {
 }
 
-ArmMir2Lir::~ArmMir2Lir()
-{
+ArmMir2Lir::~ArmMir2Lir() {
   Cleanup();
 }
 

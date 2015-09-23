@@ -136,8 +136,7 @@ MIRGraph::~MIRGraph() {
   CleanupGraphData();
 }
 
-void MIRGraph::CleanupGraphData()
-{
+void MIRGraph::CleanupGraphData() {
 }
 
 /*

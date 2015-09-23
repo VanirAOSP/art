@@ -596,12 +596,10 @@ Arm64Mir2Lir::Arm64Mir2Lir(CompilationUnit* cu, MIRGraph* mir_graph, ArenaAlloca
   Arm64Mir2LirPostInit(this);
 }
 
-void Arm64Mir2Lir::Cleanup()
-{
+void Arm64Mir2Lir::Cleanup() {
 }
 
-Arm64Mir2Lir::~Arm64Mir2Lir()
-{
+Arm64Mir2Lir::~Arm64Mir2Lir() {
   Cleanup();
 }
 
