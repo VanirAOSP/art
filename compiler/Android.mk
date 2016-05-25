@@ -163,7 +163,7 @@ LIBART_COMPILER_SRC_FILES := \
 	output_stream.cc \
 	vector_output_stream.cc
 
-LIBART_COMPILER_CFLAGS :=
+LIBART_COMPILER_CFLAGS := $(VANIR_ART_FLAGS)
 
 LIBART_COMPILER_ENUM_OPERATOR_OUT_HEADER_FILES := \
   dex/quick/arm/arm_lir.h \
@@ -227,6 +227,8 @@ $$(ENUM_OPERATOR_OUT_GEN): $$(GENERATED_SRC_DIR)/%_operator_out.cc : $(LOCAL_PAT
 	$$(transform-generated-source)
 
   LOCAL_GENERATED_SOURCES += $$(ENUM_OPERATOR_OUT_GEN)
+
+include $(CLEAR_VARS)
 
   LOCAL_CFLAGS := $$(LIBART_COMPILER_CFLAGS)
   ifeq ($$(art_target_or_host),target)
