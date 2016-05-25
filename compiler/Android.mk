@@ -228,6 +228,13 @@ $$(ENUM_OPERATOR_OUT_GEN): $$(GENERATED_SRC_DIR)/%_operator_out.cc : $(LOCAL_PAT
 
   LOCAL_GENERATED_SOURCES += $$(ENUM_OPERATOR_OUT_GEN)
 
+include $(CLEAR_VARS)
+
+# ============== 
+# VANIR_FLAGS
+# ============== 
+LOCAL_CFLAGS += $(VANIR_ART_FLAGS)
+
   LOCAL_CFLAGS := $$(LIBART_COMPILER_CFLAGS)
   ifeq ($$(art_target_or_host),target)
     $(call set-target-local-clang-vars)

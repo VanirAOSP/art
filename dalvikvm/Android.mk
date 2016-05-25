@@ -38,6 +38,11 @@ LOCAL_MODULE_STEM_64 := dalvikvm64
 LOCAL_NATIVE_COVERAGE := $(ART_COVERAGE)
 include $(BUILD_EXECUTABLE)
 
+# ==============
+# VANIR_FLAGS
+# ==============
+LOCAL_CFLAGS += $(VANIR_ART_FLAGS)
+
 # Create symlink for the primary version target.
 include  $(BUILD_SYSTEM)/executable_prefer_symlink.mk
 
