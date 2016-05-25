@@ -16,6 +16,8 @@
 
 LOCAL_PATH := $(call my-dir)
 
+LOCAL_CFLAGS += $(VANIR_ART_FLAGS)
+
 art_path := $(LOCAL_PATH)
 
 ########################################################################
