@@ -192,6 +192,8 @@ void InitTimeSpec(bool absolute, int clock, int64_t ms, int32_t ns, timespec* ts
   }
   endSec = ts->tv_sec + ms / 1000;
   if (UNLIKELY(endSec >= 0x7fffffff)) {
+    std::ostringstream ss;
+    LOG(INFO) << "Note: end time exceeds epoch: " << ss.str();
     endSec = 0x7ffffffe;
   }
   ts->tv_sec = endSec;
