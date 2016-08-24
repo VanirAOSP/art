@@ -632,10 +632,8 @@ JValue ExecuteSwitchImpl(Thread* self, const DexFile::CodeItem* code_item,
         break;
       }
 
-#if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wfloat-equal"
-#endif
 
       case Instruction::CMPL_FLOAT: {
         PREAMBLE();
@@ -703,9 +701,7 @@ JValue ExecuteSwitchImpl(Thread* self, const DexFile::CodeItem* code_item,
         break;
       }
 
-#if defined(__clang__)
 #pragma clang diagnostic pop
-#endif
 
       case Instruction::CMP_LONG: {
         PREAMBLE();
