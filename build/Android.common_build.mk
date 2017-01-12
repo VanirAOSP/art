@@ -228,10 +228,9 @@ else
   art_cflags += -DIMT_SIZE=64
 endif
 
-ifeq ($(ART_HEAP_POISONING),true)
-  art_cflags += -DART_HEAP_POISONING=1
-  art_asflags += -DART_HEAP_POISONING=1
-endif
+ART_HEAP_POISONING := true
+art_cflags += -DART_HEAP_POISONING=1
+art_asflags += -DART_HEAP_POISONING=1
 
 #
 # Used to change the read barrier type. Valid values are BAKER, BROOKS, TABLELOOKUP.
