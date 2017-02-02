@@ -19,6 +19,7 @@
 
 #include "arch/instruction_set.h"
 #include "cfi_test.h"
+#include "driver/compiler_options.h"
 #include "gtest/gtest.h"
 #include "optimizing/code_generator.h"
 #include "optimizing/optimizing_unit_test.h"
@@ -51,7 +52,7 @@ class OptimizingCFITest : public CFITest {
   void SetUpFrame(InstructionSet isa) {
     // Setup simple context.
     std::string error;
-    isa_features_.reset(InstructionSetFeatures::FromVariant(isa, "default", &error));
+    isa_features_ = InstructionSetFeatures::FromVariant(isa, "default", &error);
     graph_ = CreateGraph(&allocator_);
     // Generate simple frame with some spills.
     code_gen_ = CodeGenerator::Create(graph_, isa, *isa_features_, opts_);

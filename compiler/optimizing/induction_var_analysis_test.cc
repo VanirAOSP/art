@@ -107,7 +107,7 @@ class InductionVarAnalysisTest : public CommonCompilerTest {
   }
 
   // Builds if-statement at depth d.
-  HPhi* BuildIf(int d, HBasicBlock** ifT, HBasicBlock **ifF) {
+  HPhi* BuildIf(int d, HBasicBlock** ifT, HBasicBlock** ifF) {
     HBasicBlock* cond = new (&allocator_) HBasicBlock(graph_);
     HBasicBlock* ifTrue = new (&allocator_) HBasicBlock(graph_);
     HBasicBlock* ifFalse = new (&allocator_) HBasicBlock(graph_);
@@ -155,6 +155,13 @@ class InductionVarAnalysisTest : public CommonCompilerTest {
   std::string GetInductionInfo(HInstruction* instruction, int d) {
     return HInductionVarAnalysis::InductionToString(
         iva_->LookupInfo(loop_body_[d]->GetLoopInformation(), instruction));
+  }
+
+  // Returns induction information of the trip-count of loop at depth d.
+  std::string GetTripCount(int d) {
+    HInstruction* control = loop_header_[d]->GetLastInstruction();
+    DCHECK(control->IsIf());
+    return GetInductionInfo(control, d);
   }
 
   // Returns true if instructions have identical induction.
@@ -239,8 +246,7 @@ TEST_F(InductionVarAnalysisTest, FindBasicInduction) {
   EXPECT_FALSE(HaveSameInduction(store->InputAt(1), increment_[0]));
 
   // Trip-count.
-  EXPECT_STREQ("((100) (TC-loop) ((0) < (100)))",
-               GetInductionInfo(loop_header_[0]->GetLastInstruction(), 0).c_str());
+  EXPECT_STREQ("((100) (TC-loop) ((0) < (100)))", GetTripCount(0).c_str());
 }
 
 TEST_F(InductionVarAnalysisTest, FindDerivedInduction) {
@@ -253,15 +259,15 @@ TEST_F(InductionVarAnalysisTest, FindDerivedInduction) {
   //   k = - i;
   // }
   BuildLoopNest(1);
-  HInstruction *add = InsertInstruction(
+  HInstruction* add = InsertInstruction(
       new (&allocator_) HAdd(Primitive::kPrimInt, constant100_, basic_[0]), 0);
-  HInstruction *sub = InsertInstruction(
+  HInstruction* sub = InsertInstruction(
       new (&allocator_) HSub(Primitive::kPrimInt, constant100_, basic_[0]), 0);
-  HInstruction *mul = InsertInstruction(
+  HInstruction* mul = InsertInstruction(
       new (&allocator_) HMul(Primitive::kPrimInt, constant100_, basic_[0]), 0);
-  HInstruction *shl = InsertInstruction(
+  HInstruction* shl = InsertInstruction(
       new (&allocator_) HShl(Primitive::kPrimInt, basic_[0], constant1_), 0);
-  HInstruction *neg = InsertInstruction(
+  HInstruction* neg = InsertInstruction(
       new (&allocator_) HNeg(Primitive::kPrimInt, basic_[0]), 0);
   PerformInductionVarAnalysis();
 
@@ -285,10 +291,10 @@ TEST_F(InductionVarAnalysisTest, FindChainInduction) {
   HPhi* k = InsertLoopPhi(0, 0);
   k->AddInput(constant0_);
 
-  HInstruction *add = InsertInstruction(
+  HInstruction* add = InsertInstruction(
       new (&allocator_) HAdd(Primitive::kPrimInt, k, constant100_), 0);
   HInstruction* store1 = InsertArrayStore(add, 0);
-  HInstruction *sub = InsertInstruction(
+  HInstruction* sub = InsertInstruction(
       new (&allocator_) HSub(Primitive::kPrimInt, add, constant1_), 0);
   HInstruction* store2 = InsertArrayStore(sub, 0);
   k->AddInput(sub);
@@ -375,7 +381,7 @@ TEST_F(InductionVarAnalysisTest, FindFirstOrderWrapAroundInduction) {
   k->AddInput(constant0_);
 
   HInstruction* store = InsertArrayStore(k, 0);
-  HInstruction *sub = InsertInstruction(
+  HInstruction* sub = InsertInstruction(
       new (&allocator_) HSub(Primitive::kPrimInt, constant100_, basic_[0]), 0);
   k->AddInput(sub);
   PerformInductionVarAnalysis();
@@ -401,7 +407,7 @@ TEST_F(InductionVarAnalysisTest, FindSecondOrderWrapAroundInduction) {
 
   HInstruction* store = InsertArrayStore(k, 0);
   k->AddInput(t);
-  HInstruction *sub = InsertInstruction(
+  HInstruction* sub = InsertInstruction(
       new (&allocator_) HSub(Primitive::kPrimInt, constant100_, basic_[0], 0), 0);
   t->AddInput(sub);
   PerformInductionVarAnalysis();
@@ -425,15 +431,15 @@ TEST_F(InductionVarAnalysisTest, FindWrapAroundDerivedInduction) {
   HPhi* k = InsertLoopPhi(0, 0);
   k->AddInput(constant0_);
 
-  HInstruction *add = InsertInstruction(
+  HInstruction* add = InsertInstruction(
       new (&allocator_) HAdd(Primitive::kPrimInt, k, constant100_), 0);
-  HInstruction *sub = InsertInstruction(
+  HInstruction* sub = InsertInstruction(
       new (&allocator_) HSub(Primitive::kPrimInt, k, constant100_), 0);
-  HInstruction *mul = InsertInstruction(
+  HInstruction* mul = InsertInstruction(
       new (&allocator_) HMul(Primitive::kPrimInt, k, constant100_), 0);
-  HInstruction *shl = InsertInstruction(
+  HInstruction* shl = InsertInstruction(
       new (&allocator_) HShl(Primitive::kPrimInt, k, constant1_), 0);
-  HInstruction *neg = InsertInstruction(
+  HInstruction* neg = InsertInstruction(
       new (&allocator_) HNeg(Primitive::kPrimInt, k), 0);
   k->AddInput(
       InsertInstruction(new (&allocator_) HShl(Primitive::kPrimInt, basic_[0], constant1_), 0));
@@ -491,13 +497,52 @@ TEST_F(InductionVarAnalysisTest, FindIdiomaticPeriodicInduction) {
   k->AddInput(constant0_);
 
   HInstruction* store = InsertArrayStore(k, 0);
-  HInstruction *sub = InsertInstruction(
+  HInstruction* sub = InsertInstruction(
       new (&allocator_) HSub(Primitive::kPrimInt, constant1_, k), 0);
   k->AddInput(sub);
   PerformInductionVarAnalysis();
 
   EXPECT_STREQ("periodic((0), (1)):PrimInt", GetInductionInfo(store->InputAt(1), 0).c_str());
   EXPECT_STREQ("periodic((1), (0)):PrimInt", GetInductionInfo(sub, 0).c_str());
+}
+
+TEST_F(InductionVarAnalysisTest, FindXorPeriodicInduction) {
+  // Setup:
+  // k = 0;
+  // for (int i = 0; i < 100; i++) {
+  //   a[k] = 0;
+  //   k = k ^ 1;
+  // }
+  BuildLoopNest(1);
+  HPhi* k = InsertLoopPhi(0, 0);
+  k->AddInput(constant0_);
+
+  HInstruction* store = InsertArrayStore(k, 0);
+  HInstruction* x = InsertInstruction(
+      new (&allocator_) HXor(Primitive::kPrimInt, k, constant1_), 0);
+  k->AddInput(x);
+  PerformInductionVarAnalysis();
+
+  EXPECT_STREQ("periodic((0), (1)):PrimInt", GetInductionInfo(store->InputAt(1), 0).c_str());
+  EXPECT_STREQ("periodic((1), (0)):PrimInt", GetInductionInfo(x, 0).c_str());
+}
+
+TEST_F(InductionVarAnalysisTest, FindXor100PeriodicInduction) {
+  // Setup:
+  // k = 100;
+  // for (int i = 0; i < 100; i++) {
+  //   k = k ^ 100;
+  // }
+  BuildLoopNest(1);
+  HPhi* k = InsertLoopPhi(0, 0);
+  k->AddInput(constant100_);
+
+  HInstruction* x = InsertInstruction(
+      new (&allocator_) HXor(Primitive::kPrimInt, k, constant100_), 0);
+  k->AddInput(x);
+  PerformInductionVarAnalysis();
+
+  EXPECT_STREQ("periodic(((100) ^ (100)), (100)):PrimInt", GetInductionInfo(x, 0).c_str());
 }
 
 TEST_F(InductionVarAnalysisTest, FindDerivedPeriodicInduction) {
@@ -520,15 +565,15 @@ TEST_F(InductionVarAnalysisTest, FindDerivedPeriodicInduction) {
   k_header->AddInput(k_body);
 
   // Derived expressions.
-  HInstruction *add = InsertInstruction(
+  HInstruction* add = InsertInstruction(
       new (&allocator_) HAdd(Primitive::kPrimInt, k_body, constant100_), 0);
-  HInstruction *sub = InsertInstruction(
+  HInstruction* sub = InsertInstruction(
       new (&allocator_) HSub(Primitive::kPrimInt, k_body, constant100_), 0);
-  HInstruction *mul = InsertInstruction(
+  HInstruction* mul = InsertInstruction(
       new (&allocator_) HMul(Primitive::kPrimInt, k_body, constant100_), 0);
-  HInstruction *shl = InsertInstruction(
+  HInstruction* shl = InsertInstruction(
       new (&allocator_) HShl(Primitive::kPrimInt, k_body, constant1_), 0);
-  HInstruction *neg = InsertInstruction(
+  HInstruction* neg = InsertInstruction(
       new (&allocator_) HNeg(Primitive::kPrimInt, k_body), 0);
   PerformInductionVarAnalysis();
 
@@ -557,7 +602,7 @@ TEST_F(InductionVarAnalysisTest, FindDeepLoopInduction) {
     k[d] = InsertLoopPhi(0, d);
   }
 
-  HInstruction *inc = InsertInstruction(
+  HInstruction* inc = InsertInstruction(
       new (&allocator_) HAdd(Primitive::kPrimInt, constant1_, k[9]), 9);
   HInstruction* store = InsertArrayStore(inc, 9);
 
@@ -579,8 +624,7 @@ TEST_F(InductionVarAnalysisTest, FindDeepLoopInduction) {
     }
     EXPECT_STREQ("((1) * i + (1)):PrimInt", GetInductionInfo(increment_[d], d).c_str());
     // Trip-count.
-    EXPECT_STREQ("((100) (TC-loop) ((0) < (100)))",
-                 GetInductionInfo(loop_header_[d]->GetLastInstruction(), d).c_str());
+    EXPECT_STREQ("((100) (TC-loop) ((0) < (100)))", GetTripCount(d).c_str());
   }
 }
 
@@ -592,7 +636,7 @@ TEST_F(InductionVarAnalysisTest, ByteInductionIntLoopControl) {
   //   a[i] = 0;
   // }
   BuildLoopNest(1);
-  HInstruction *conv = InsertInstruction(
+  HInstruction* conv = InsertInstruction(
       new (&allocator_) HTypeConversion(Primitive::kPrimByte, basic_[0], -1), 0);
   HInstruction* store1 = InsertArrayStore(conv, 0);
   HInstruction* store2 = InsertArrayStore(basic_[0], 0);
@@ -607,8 +651,7 @@ TEST_F(InductionVarAnalysisTest, ByteInductionIntLoopControl) {
   EXPECT_FALSE(HaveSameInduction(store1->InputAt(1), store2->InputAt(1)));
 
   // Trip-count.
-  EXPECT_STREQ("((100) (TC-loop) ((0) < (100)))",
-               GetInductionInfo(loop_header_[0]->GetLastInstruction(), 0).c_str());
+  EXPECT_STREQ("((100) (TC-loop) ((0) < (100)))", GetTripCount(0).c_str());
 }
 
 TEST_F(InductionVarAnalysisTest, ByteLoopControl1) {
@@ -626,8 +669,7 @@ TEST_F(InductionVarAnalysisTest, ByteLoopControl1) {
 
   EXPECT_STREQ("((1) * i + ((-128) + (1))):PrimByte", GetInductionInfo(increment_[0], 0).c_str());
   // Trip-count.
-  EXPECT_STREQ("(((127) - (-128)) (TC-loop) ((-128) < (127)))",
-               GetInductionInfo(loop_header_[0]->GetLastInstruction(), 0).c_str());
+  EXPECT_STREQ("(((127) - (-128)) (TC-loop) ((-128) < (127)))", GetTripCount(0).c_str());
 }
 
 TEST_F(InductionVarAnalysisTest, ByteLoopControl2) {
@@ -645,7 +687,7 @@ TEST_F(InductionVarAnalysisTest, ByteLoopControl2) {
 
   EXPECT_STREQ("((1) * i + ((-128) + (1))):PrimByte", GetInductionInfo(increment_[0], 0).c_str());
   // Trip-count undefined.
-  EXPECT_STREQ("", GetInductionInfo(loop_header_[0]->GetLastInstruction(), 0).c_str());
+  EXPECT_STREQ("", GetTripCount(0).c_str());
 }
 
 TEST_F(InductionVarAnalysisTest, ShortLoopControl1) {
@@ -664,8 +706,7 @@ TEST_F(InductionVarAnalysisTest, ShortLoopControl1) {
   EXPECT_STREQ("((1) * i + ((-32768) + (1))):PrimShort",
                GetInductionInfo(increment_[0], 0).c_str());
   // Trip-count.
-  EXPECT_STREQ("(((32767) - (-32768)) (TC-loop) ((-32768) < (32767)))",
-               GetInductionInfo(loop_header_[0]->GetLastInstruction(), 0).c_str());
+  EXPECT_STREQ("(((32767) - (-32768)) (TC-loop) ((-32768) < (32767)))", GetTripCount(0).c_str());
 }
 
 TEST_F(InductionVarAnalysisTest, ShortLoopControl2) {
@@ -684,7 +725,7 @@ TEST_F(InductionVarAnalysisTest, ShortLoopControl2) {
   EXPECT_STREQ("((1) * i + ((-32768) + (1))):PrimShort",
                GetInductionInfo(increment_[0], 0).c_str());
   // Trip-count undefined.
-  EXPECT_STREQ("", GetInductionInfo(loop_header_[0]->GetLastInstruction(), 0).c_str());
+  EXPECT_STREQ("", GetTripCount(0).c_str());
 }
 
 TEST_F(InductionVarAnalysisTest, CharLoopControl1) {
@@ -701,8 +742,7 @@ TEST_F(InductionVarAnalysisTest, CharLoopControl1) {
 
   EXPECT_STREQ("((1) * i + (1)):PrimChar", GetInductionInfo(increment_[0], 0).c_str());
   // Trip-count.
-  EXPECT_STREQ("((65535) (TC-loop) ((0) < (65535)))",
-               GetInductionInfo(loop_header_[0]->GetLastInstruction(), 0).c_str());
+  EXPECT_STREQ("((65535) (TC-loop) ((0) < (65535)))", GetTripCount(0).c_str());
 }
 
 TEST_F(InductionVarAnalysisTest, CharLoopControl2) {
@@ -719,7 +759,7 @@ TEST_F(InductionVarAnalysisTest, CharLoopControl2) {
 
   EXPECT_STREQ("((1) * i + (1)):PrimChar", GetInductionInfo(increment_[0], 0).c_str());
   // Trip-count undefined.
-  EXPECT_STREQ("", GetInductionInfo(loop_header_[0]->GetLastInstruction(), 0).c_str());
+  EXPECT_STREQ("", GetTripCount(0).c_str());
 }
 
 }  // namespace art

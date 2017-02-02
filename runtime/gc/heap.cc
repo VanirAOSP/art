@@ -121,6 +121,10 @@ static constexpr bool kDumpRosAllocStatsOnSigQuit = false;
 
 static constexpr size_t kNativeAllocationHistogramBuckets = 16;
 
+// Extra added to the heap growth multiplier. Used to adjust the GC ergonomics for the read barrier
+// config.
+static constexpr double kExtraHeapGrowthMultiplier = kUseReadBarrier ? 1.0 : 0.0;
+
 static inline bool CareAboutPauseTimes() {
   return Runtime::Current()->InJankPerceptibleProcessState();
 }
@@ -220,10 +224,14 @@ Heap::Heap(size_t initial_size,
       min_free_(min_free),
       max_free_(max_free),
       target_utilization_(target_utilization),
-      foreground_heap_growth_multiplier_(foreground_heap_growth_multiplier),
+      foreground_heap_growth_multiplier_(
+          foreground_heap_growth_multiplier + kExtraHeapGrowthMultiplier),
       total_wait_time_(0),
       verify_object_mode_(kVerifyObjectModeDisabled),
       disable_moving_gc_count_(0),
+      semi_space_collector_(nullptr),
+      mark_compact_collector_(nullptr),
+      concurrent_copying_collector_(nullptr),
       is_running_on_memory_tool_(Runtime::Current()->IsRunningOnMemoryTool()),
       use_tlab_(use_tlab),
       main_space_backup_(nullptr),
@@ -718,6 +726,7 @@ void Heap::ChangeAllocator(AllocatorType allocator) {
 }
 
 void Heap::DisableMovingGc() {
+  CHECK(!kUseReadBarrier);
   if (IsMovingGc(foreground_collector_type_)) {
     foreground_collector_type_ = kCollectorTypeCMS;
   }
@@ -865,9 +874,13 @@ void Heap::IncrementDisableThreadFlip(Thread* self) {
   MutexLock mu(self, *thread_flip_lock_);
   bool has_waited = false;
   uint64_t wait_start = NanoTime();
-  while (thread_flip_running_) {
-    has_waited = true;
-    thread_flip_cond_->Wait(self);
+  if (thread_flip_running_) {
+    ATRACE_BEGIN("IncrementDisableThreadFlip");
+    while (thread_flip_running_) {
+      has_waited = true;
+      thread_flip_cond_->Wait(self);
+    }
+    ATRACE_END();
   }
   ++disable_thread_flip_count_;
   if (has_waited) {
@@ -953,7 +966,8 @@ void Heap::UpdateProcessState(ProcessState old_process_state, ProcessState new_p
       // Don't delay for debug builds since we may want to stress test the GC.
       // If background_collector_type_ is kCollectorTypeHomogeneousSpaceCompact then we have
       // special handling which does a homogenous space compaction once but then doesn't transition
-      // the collector.
+      // the collector. Similarly, we invoke a full compaction for kCollectorTypeCC but don't
+      // transition the collector.
       RequestCollectorTransition(background_collector_type_,
                                  kIsDebugBuild ? 0 : kCollectorTransitionWait);
     }
@@ -1366,6 +1380,16 @@ void Heap::DoPendingCollectorTransition() {
       PerformHomogeneousSpaceCompact();
     } else {
       VLOG(gc) << "Homogeneous compaction ignored due to jank perceptible process state";
+    }
+  } else if (desired_collector_type == kCollectorTypeCCBackground) {
+    DCHECK(kUseReadBarrier);
+    if (!CareAboutPauseTimes()) {
+      // Invoke CC full compaction.
+      CollectGarbageInternal(collector::kGcTypeFull,
+                             kGcCauseCollectorTransition,
+                             /*clear_soft_references*/false);
+    } else {
+      VLOG(gc) << "CC background compaction ignored due to jank perceptible process state";
     }
   } else {
     TransitionCollector(desired_collector_type);
@@ -1824,6 +1848,10 @@ mirror::Object* Heap::AllocateInternalWithGc(Thread* self,
         break;
       }
       case kAllocatorTypeNonMoving: {
+        if (kUseReadBarrier) {
+          // DisableMovingGc() isn't compatible with CC.
+          break;
+        }
         // Try to transition the heap if the allocation failure was due to the space being full.
         if (!IsOutOfMemoryOnAllocation<false>(allocator, alloc_size)) {
           // If we aren't out of memory then the OOM was probably from the non moving space being
@@ -2092,6 +2120,8 @@ HomogeneousSpaceCompactResult Heap::PerformHomogeneousSpaceCompact() {
 }
 
 void Heap::TransitionCollector(CollectorType collector_type) {
+  // Collector transition must not happen with CC
+  CHECK(!kUseReadBarrier);
   if (collector_type == collector_type_) {
     return;
   }
@@ -3757,6 +3787,12 @@ void Heap::RequestCollectorTransition(CollectorType desired_collector_type, uint
   if (desired_collector_type_ == collector_type_ || !CanAddHeapTask(self)) {
     return;
   }
+  if (collector_type_ == kCollectorTypeCC) {
+    // For CC, we invoke a full compaction when going to the background, but the collector type
+    // doesn't change.
+    DCHECK_EQ(desired_collector_type_, kCollectorTypeCCBackground);
+  }
+  DCHECK_NE(collector_type_, kCollectorTypeCCBackground);
   CollectorTransitionTask* added_task = nullptr;
   const uint64_t target_time = NanoTime() + delta_time;
   {

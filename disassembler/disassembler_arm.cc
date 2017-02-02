@@ -782,23 +782,13 @@ size_t DisassemblerArm::DumpThumb32(std::ostream& os, const uint8_t* instr_ptr) 
         args << Rm;
 
         // Shift operand.
-        bool noShift = (imm5 == 0 && shift_type != 0x3);
+        bool noShift = (imm5 == 0 && shift_type == 0x0);
         if (!noShift) {
           args << ", ";
-          switch (shift_type) {
-            case 0x0: args << "lsl"; break;
-            case 0x1: args << "lsr"; break;
-            case 0x2: args << "asr"; break;
-            case 0x3:
-              if (imm5 == 0) {
-                args << "rrx";
-              } else {
-                args << "ror #" << imm5;
-              }
-              break;
-          }
-          if (shift_type != 0x3 /* rrx */) {
-            args << StringPrintf(" #%d", (0 != imm5 || 0 == shift_type) ? imm5 : 32);
+          if (shift_type == 0x3u && imm5 == 0u) {
+            args << "rrx";
+          } else {
+            args << kThumb2ShiftOperations[shift_type] << " #" << ((0 != imm5) ? imm5 : 32);
           }
         }
 
@@ -951,17 +941,11 @@ size_t DisassemblerArm::DumpThumb32(std::ostream& os, const uint8_t* instr_ptr) 
                 opcode << (op != 0 ? "vsqrt" : "vneg") << (S != 0 ? ".f64" : ".f32");
                 args << d << ", " << m;
               } else if (op5 == 4) {
-                opcode << "vcmp" << (S != 0 ? ".f64" : ".f32");
+                opcode << "vcmp" << ((op != 0) ? "e" : "") << (S != 0 ? ".f64" : ".f32");
                 args << d << ", " << m;
-                if (op != 0) {
-                  args << " (quiet nan)";
-                }
               } else if (op5 == 5) {
-                opcode << "vcmpe" << (S != 0 ? ".f64" : ".f32");
+                opcode << "vcmp" << ((op != 0) ? "e" : "") << (S != 0 ? ".f64" : ".f32");
                 args << d << ", #0.0";
-                if (op != 0) {
-                  args << " (quiet nan)";
-                }
                 if ((instr & 0x2f) != 0) {
                   args << " (UNPREDICTABLE)";
                 }
@@ -1497,82 +1481,101 @@ size_t DisassemblerArm::DumpThumb32(std::ostream& os, const uint8_t* instr_ptr) 
           }
           break;
         }
-      default:      // more formats
-        if ((op2 >> 4) == 2) {      // 010xxxx
-          // data processing (register)
-          if ((instr & 0x0080f0f0) == 0x0000f000) {
-            // LSL, LSR, ASR, ROR
-            uint32_t shift_op = (instr >> 21) & 3;
-            uint32_t S = (instr >> 20) & 1;
-            ArmRegister Rd(instr, 8);
+        case 0x7B: case 0x7F: {
+          FpRegister d(instr, 12, 22);
+          FpRegister m(instr, 0, 5);
+          uint32_t sz = (instr >> 18) & 0x3;  // Decode size bits.
+          uint32_t size = (sz == 0) ? 8 : sz << 4;
+          uint32_t opc2 = (instr >> 7) & 0xF;
+          uint32_t Q = (instr >> 6) & 1;
+          if (Q == 0 && opc2 == 0xA && size == 8) {  // 1010, VCNT
+            opcode << "vcnt." << size;
+            args << d << ", " << m;
+          } else if (Q == 0 && (opc2 == 0x4 || opc2 == 0x5) && size <= 32) {  // 010x, VPADDL
+            bool op = HasBitSet(instr, 7);
+            opcode << "vpaddl." << (op ? "u" : "s") << size;
+            args << d << ", " << m;
+          } else {
+            opcode << "UNKNOWN " << op2;
+          }
+          break;
+        }
+        default:      // more formats
+          if ((op2 >> 4) == 2) {      // 010xxxx
+            // data processing (register)
+            if ((instr & 0x0080f0f0) == 0x0000f000) {
+              // LSL, LSR, ASR, ROR
+              uint32_t shift_op = (instr >> 21) & 3;
+              uint32_t S = (instr >> 20) & 1;
+              ArmRegister Rd(instr, 8);
+              ArmRegister Rn(instr, 16);
+              ArmRegister Rm(instr, 0);
+              opcode << kThumb2ShiftOperations[shift_op] << (S != 0 ? "s" : "");
+              args << Rd << ", " << Rn << ", " << Rm;
+            }
+          } else if ((op2 >> 3) == 6) {       // 0110xxx
+            // Multiply, multiply accumulate, and absolute difference
+            op1 = (instr >> 20) & 0x7;
+            op2 = (instr >> 4) & 0x1;
+            ArmRegister Ra(instr, 12);
             ArmRegister Rn(instr, 16);
             ArmRegister Rm(instr, 0);
-            opcode << kThumb2ShiftOperations[shift_op] << (S != 0 ? "s" : "");
-            args << Rd << ", " << Rn << ", " << Rm;
-          }
-        } else if ((op2 >> 3) == 6) {       // 0110xxx
-          // Multiply, multiply accumulate, and absolute difference
-          op1 = (instr >> 20) & 0x7;
-          op2 = (instr >> 4) & 0x1;
-          ArmRegister Ra(instr, 12);
-          ArmRegister Rn(instr, 16);
-          ArmRegister Rm(instr, 0);
-          ArmRegister Rd(instr, 8);
-          switch (op1) {
-          case 0:
-            if (op2 == 0) {
-              if (Ra.r == 0xf) {
-                opcode << "mul";
-                args << Rd << ", " << Rn << ", " << Rm;
+            ArmRegister Rd(instr, 8);
+            switch (op1) {
+            case 0:
+              if (op2 == 0) {
+                if (Ra.r == 0xf) {
+                  opcode << "mul";
+                  args << Rd << ", " << Rn << ", " << Rm;
+                } else {
+                  opcode << "mla";
+                  args << Rd << ", " << Rn << ", " << Rm << ", " << Ra;
+                }
               } else {
-                opcode << "mla";
+                opcode << "mls";
                 args << Rd << ", " << Rn << ", " << Rm << ", " << Ra;
               }
-            } else {
-              opcode << "mls";
-              args << Rd << ", " << Rn << ", " << Rm << ", " << Ra;
+              break;
+            case 1:
+            case 2:
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+                break;        // do these sometime
             }
-            break;
-          case 1:
-          case 2:
-          case 3:
-          case 4:
-          case 5:
-          case 6:
-              break;        // do these sometime
+          } else if ((op2 >> 3) == 7) {       // 0111xxx
+            // Long multiply, long multiply accumulate, and divide
+            op1 = (instr >> 20) & 0x7;
+            op2 = (instr >> 4) & 0xf;
+            ArmRegister Rn(instr, 16);
+            ArmRegister Rm(instr, 0);
+            ArmRegister Rd(instr, 8);
+            ArmRegister RdHi(instr, 8);
+            ArmRegister RdLo(instr, 12);
+            switch (op1) {
+            case 0:
+              opcode << "smull";
+              args << RdLo << ", " << RdHi << ", " << Rn << ", " << Rm;
+              break;
+            case 1:
+              opcode << "sdiv";
+              args << Rd << ", " << Rn << ", " << Rm;
+              break;
+            case 2:
+              opcode << "umull";
+              args << RdLo << ", " << RdHi << ", " << Rn << ", " << Rm;
+              break;
+            case 3:
+              opcode << "udiv";
+              args << Rd << ", " << Rn << ", " << Rm;
+              break;
+            case 4:
+            case 5:
+            case 6:
+              break;      // TODO: when we generate these...
+            }
           }
-        } else if ((op2 >> 3) == 7) {       // 0111xxx
-          // Long multiply, long multiply accumulate, and divide
-          op1 = (instr >> 20) & 0x7;
-          op2 = (instr >> 4) & 0xf;
-          ArmRegister Rn(instr, 16);
-          ArmRegister Rm(instr, 0);
-          ArmRegister Rd(instr, 8);
-          ArmRegister RdHi(instr, 8);
-          ArmRegister RdLo(instr, 12);
-          switch (op1) {
-          case 0:
-            opcode << "smull";
-            args << RdLo << ", " << RdHi << ", " << Rn << ", " << Rm;
-            break;
-          case 1:
-            opcode << "sdiv";
-            args << Rd << ", " << Rn << ", " << Rm;
-            break;
-          case 2:
-            opcode << "umull";
-            args << RdLo << ", " << RdHi << ", " << Rn << ", " << Rm;
-            break;
-          case 3:
-            opcode << "udiv";
-            args << Rd << ", " << Rn << ", " << Rm;
-            break;
-          case 4:
-          case 5:
-          case 6:
-            break;      // TODO: when we generate these...
-          }
-        }
       }
       break;
     default:

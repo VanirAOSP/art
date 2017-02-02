@@ -39,6 +39,8 @@ namespace jit {
 static constexpr bool kEnableOnStackReplacement = true;
 // At what priority to schedule jit threads. 9 is the lowest foreground priority on device.
 static constexpr int kJitPoolThreadPthreadPriority = 9;
+// Should the thread-pool workers have a peer?
+static constexpr bool kUseJitPoolWithPeers = true;
 
 // JIT compiler
 void* Jit::jit_library_handle_= nullptr;
@@ -280,7 +282,7 @@ bool Jit::CompileMethod(ArtMethod* method, Thread* self, bool osr) {
 void Jit::CreateThreadPool() {
   // There is a DCHECK in the 'AddSamples' method to ensure the tread pool
   // is not null when we instrument.
-  thread_pool_.reset(new ThreadPool("Jit thread pool", 1));
+  thread_pool_.reset(new ThreadPool("Jit thread pool", 1, kUseJitPoolWithPeers));
   thread_pool_->SetPthreadPriority(kJitPoolThreadPthreadPriority);
   thread_pool_->StartWorkers(Thread::Current());
 }

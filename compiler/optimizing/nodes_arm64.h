@@ -21,7 +21,7 @@
 
 namespace art {
 
-class HArm64DataProcWithShifterOp : public HExpression<2> {
+class HArm64DataProcWithShifterOp FINAL : public HExpression<2> {
  public:
   enum OpKind {
     kLSL,   // Logical shift left.
@@ -56,8 +56,8 @@ class HArm64DataProcWithShifterOp : public HExpression<2> {
   }
 
   bool CanBeMoved() const OVERRIDE { return true; }
-  bool InstructionDataEquals(HInstruction* other_instr) const OVERRIDE {
-    HArm64DataProcWithShifterOp* other = other_instr->AsArm64DataProcWithShifterOp();
+  bool InstructionDataEquals(const HInstruction* other_instr) const OVERRIDE {
+    const HArm64DataProcWithShifterOp* other = other_instr->AsArm64DataProcWithShifterOp();
     return instr_kind_ == other->instr_kind_ &&
         op_kind_ == other->op_kind_ &&
         shift_amount_ == other->shift_amount_;
@@ -97,7 +97,7 @@ std::ostream& operator<<(std::ostream& os, const HArm64DataProcWithShifterOp::Op
 // This instruction computes an intermediate address pointing in the 'middle' of an object. The
 // result pointer cannot be handled by GC, so extra care is taken to make sure that this value is
 // never used across anything that can trigger GC.
-class HArm64IntermediateAddress : public HExpression<2> {
+class HArm64IntermediateAddress FINAL : public HExpression<2> {
  public:
   HArm64IntermediateAddress(HInstruction* base_address, HInstruction* offset, uint32_t dex_pc)
       : HExpression(Primitive::kPrimNot, SideEffects::DependsOnGC(), dex_pc) {
@@ -106,7 +106,9 @@ class HArm64IntermediateAddress : public HExpression<2> {
   }
 
   bool CanBeMoved() const OVERRIDE { return true; }
-  bool InstructionDataEquals(HInstruction* other ATTRIBUTE_UNUSED) const OVERRIDE { return true; }
+  bool InstructionDataEquals(const HInstruction* other ATTRIBUTE_UNUSED) const OVERRIDE {
+    return true;
+  }
   bool IsActualObject() const OVERRIDE { return false; }
 
   HInstruction* GetBaseAddress() const { return InputAt(0); }

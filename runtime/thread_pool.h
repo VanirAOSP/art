@@ -97,7 +97,12 @@ class ThreadPool {
   // Remove all tasks in the queue.
   void RemoveAllTasks(Thread* self) REQUIRES(!task_queue_lock_);
 
-  ThreadPool(const char* name, size_t num_threads);
+  // Create a named thread pool with the given number of threads.
+  //
+  // If create_peers is true, all worker threads will have a Java peer object. Note that if the
+  // pool is asked to do work on the current thread (see Wait), a peer may not be available. Wait
+  // will conservatively abort if create_peers and do_work are true.
+  ThreadPool(const char* name, size_t num_threads, bool create_peers = false);
   virtual ~ThreadPool();
 
   // Wait for all tasks currently on queue to get completed.
@@ -146,6 +151,7 @@ class ThreadPool {
   uint64_t total_wait_time_;
   Barrier creation_barier_;
   size_t max_active_workers_ GUARDED_BY(task_queue_lock_);
+  bool create_peers_;
 
  private:
   friend class ThreadPoolWorker;

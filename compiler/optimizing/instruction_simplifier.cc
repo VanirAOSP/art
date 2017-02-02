@@ -101,6 +101,7 @@ class InstructionSimplifierVisitor : public HGraphDelegateVisitor {
   void SimplifyCompare(HInvoke* invoke, bool is_signum, Primitive::Type type);
   void SimplifyIsNaN(HInvoke* invoke);
   void SimplifyFP2Int(HInvoke* invoke);
+  void SimplifyStringIsEmptyOrLength(HInvoke* invoke);
   void SimplifyMemBarrier(HInvoke* invoke, MemBarrierKind barrier_kind);
 
   OptimizingCompilerStats* stats_;
@@ -234,21 +235,40 @@ bool InstructionSimplifierVisitor::TryDeMorganNegationFactoring(HBinaryOperation
 
 void InstructionSimplifierVisitor::VisitShift(HBinaryOperation* instruction) {
   DCHECK(instruction->IsShl() || instruction->IsShr() || instruction->IsUShr());
-  HConstant* input_cst = instruction->GetConstantRight();
-  HInstruction* input_other = instruction->GetLeastConstantLeft();
+  HInstruction* shift_amount = instruction->GetRight();
+  HInstruction* value = instruction->GetLeft();
 
-  if (input_cst != nullptr) {
-    int64_t cst = Int64FromConstant(input_cst);
-    int64_t mask = (input_other->GetType() == Primitive::kPrimLong)
-        ? kMaxLongShiftDistance
-        : kMaxIntShiftDistance;
-    if ((cst & mask) == 0) {
+  int64_t implicit_mask = (value->GetType() == Primitive::kPrimLong)
+      ? kMaxLongShiftDistance
+      : kMaxIntShiftDistance;
+
+  if (shift_amount->IsConstant()) {
+    int64_t cst = Int64FromConstant(shift_amount->AsConstant());
+    if ((cst & implicit_mask) == 0) {
       // Replace code looking like
-      //    SHL dst, src, 0
+      //    SHL dst, value, 0
       // with
-      //    src
-      instruction->ReplaceWith(input_other);
+      //    value
+      instruction->ReplaceWith(value);
       instruction->GetBlock()->RemoveInstruction(instruction);
+      RecordSimplification();
+      return;
+    }
+  }
+
+  // Shift operations implicitly mask the shift amount according to the type width. Get rid of
+  // unnecessary explicit masking operations on the shift amount.
+  // Replace code looking like
+  //    AND masked_shift, shift, <superset of implicit mask>
+  //    SHL dst, value, masked_shift
+  // with
+  //    SHL dst, value, shift
+  if (shift_amount->IsAnd()) {
+    HAnd* and_insn = shift_amount->AsAnd();
+    HConstant* mask = and_insn->GetConstantRight();
+    if ((mask != nullptr) && ((Int64FromConstant(mask) & implicit_mask) == implicit_mask)) {
+      instruction->ReplaceInput(and_insn->GetLeastConstantLeft(), 1);
+      RecordSimplification();
     }
   }
 }
@@ -277,6 +297,7 @@ bool InstructionSimplifierVisitor::ReplaceRotateWithRor(HBinaryOperation* op,
   if (!shl->GetRight()->HasUses()) {
     shl->GetRight()->GetBlock()->RemoveInstruction(shl->GetRight());
   }
+  RecordSimplification();
   return true;
 }
 
@@ -906,6 +927,7 @@ void InstructionSimplifierVisitor::VisitAdd(HAdd* instruction) {
     if (Primitive::IsIntegralType(instruction->GetType())) {
       instruction->ReplaceWith(input_other);
       instruction->GetBlock()->RemoveInstruction(instruction);
+      RecordSimplification();
       return;
     }
   }
@@ -998,6 +1020,7 @@ void InstructionSimplifierVisitor::VisitAnd(HAnd* instruction) {
     //    src
     instruction->ReplaceWith(instruction->GetLeft());
     instruction->GetBlock()->RemoveInstruction(instruction);
+    RecordSimplification();
     return;
   }
 
@@ -1115,6 +1138,7 @@ void InstructionSimplifierVisitor::VisitDiv(HDiv* instruction) {
     //    src
     instruction->ReplaceWith(input_other);
     instruction->GetBlock()->RemoveInstruction(instruction);
+    RecordSimplification();
     return;
   }
 
@@ -1175,6 +1199,7 @@ void InstructionSimplifierVisitor::VisitMul(HMul* instruction) {
     //    src
     instruction->ReplaceWith(input_other);
     instruction->GetBlock()->RemoveInstruction(instruction);
+    RecordSimplification();
     return;
   }
 
@@ -1215,6 +1240,7 @@ void InstructionSimplifierVisitor::VisitMul(HMul* instruction) {
       //    0
       instruction->ReplaceWith(input_cst);
       instruction->GetBlock()->RemoveInstruction(instruction);
+      RecordSimplification();
     } else if (IsPowerOfTwo(factor)) {
       // Replace code looking like
       //    MUL dst, src, pow_of_2
@@ -1333,6 +1359,7 @@ void InstructionSimplifierVisitor::VisitOr(HOr* instruction) {
     //    src
     instruction->ReplaceWith(input_other);
     instruction->GetBlock()->RemoveInstruction(instruction);
+    RecordSimplification();
     return;
   }
 
@@ -1346,6 +1373,7 @@ void InstructionSimplifierVisitor::VisitOr(HOr* instruction) {
     //    src
     instruction->ReplaceWith(instruction->GetLeft());
     instruction->GetBlock()->RemoveInstruction(instruction);
+    RecordSimplification();
     return;
   }
 
@@ -1381,6 +1409,7 @@ void InstructionSimplifierVisitor::VisitSub(HSub* instruction) {
     // yields `-0.0`.
     instruction->ReplaceWith(input_other);
     instruction->GetBlock()->RemoveInstruction(instruction);
+    RecordSimplification();
     return;
   }
 
@@ -1459,6 +1488,7 @@ void InstructionSimplifierVisitor::VisitXor(HXor* instruction) {
     //    src
     instruction->ReplaceWith(input_other);
     instruction->GetBlock()->RemoveInstruction(instruction);
+    RecordSimplification();
     return;
   }
 
@@ -1538,7 +1568,7 @@ void InstructionSimplifierVisitor::SimplifyRotate(HInvoke* invoke,
   HRor* ror = new (GetGraph()->GetArena()) HRor(type, value, distance);
   invoke->GetBlock()->ReplaceAndRemoveInstructionWith(invoke, ror);
   // Remove ClinitCheck and LoadClass, if possible.
-  HInstruction* clinit = invoke->InputAt(invoke->InputCount() - 1);
+  HInstruction* clinit = invoke->GetInputs().back();
   if (clinit->IsClinitCheck() && !clinit->HasUses()) {
     clinit->GetBlock()->RemoveInstruction(clinit);
     HInstruction* ldclass = clinit->InputAt(0);
@@ -1673,6 +1703,27 @@ void InstructionSimplifierVisitor::SimplifyFP2Int(HInvoke* invoke) {
   invoke->ReplaceWithExceptInReplacementAtIndex(select, 0);  // false at index 0
 }
 
+void InstructionSimplifierVisitor::SimplifyStringIsEmptyOrLength(HInvoke* invoke) {
+  HInstruction* str = invoke->InputAt(0);
+  uint32_t dex_pc = invoke->GetDexPc();
+  // We treat String as an array to allow DCE and BCE to seamlessly work on strings,
+  // so create the HArrayLength.
+  HArrayLength* length = new (GetGraph()->GetArena()) HArrayLength(str, dex_pc);
+  length->MarkAsStringLength();
+  HInstruction* replacement;
+  if (invoke->GetIntrinsic() == Intrinsics::kStringIsEmpty) {
+    // For String.isEmpty(), create the `HEqual` representing the `length == 0`.
+    invoke->GetBlock()->InsertInstructionBefore(length, invoke);
+    HIntConstant* zero = GetGraph()->GetIntConstant(0);
+    HEqual* equal = new (GetGraph()->GetArena()) HEqual(length, zero, dex_pc);
+    replacement = equal;
+  } else {
+    DCHECK_EQ(invoke->GetIntrinsic(), Intrinsics::kStringLength);
+    replacement = length;
+  }
+  invoke->GetBlock()->ReplaceAndRemoveInstructionWith(invoke, replacement);
+}
+
 void InstructionSimplifierVisitor::SimplifyMemBarrier(HInvoke* invoke, MemBarrierKind barrier_kind) {
   uint32_t dex_pc = invoke->GetDexPc();
   HMemoryBarrier* mem_barrier = new (GetGraph()->GetArena()) HMemoryBarrier(barrier_kind, dex_pc);
@@ -1718,6 +1769,10 @@ void InstructionSimplifierVisitor::VisitInvoke(HInvoke* instruction) {
     case Intrinsics::kFloatFloatToIntBits:
     case Intrinsics::kDoubleDoubleToLongBits:
       SimplifyFP2Int(instruction);
+      break;
+    case Intrinsics::kStringIsEmpty:
+    case Intrinsics::kStringLength:
+      SimplifyStringIsEmptyOrLength(instruction);
       break;
     case Intrinsics::kUnsafeLoadFence:
       SimplifyMemBarrier(instruction, MemBarrierKind::kLoadAny);

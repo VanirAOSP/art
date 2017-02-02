@@ -286,6 +286,7 @@ COMPILER_GTEST_COMMON_SRC_FILES := \
   compiler/optimizing/induction_var_range_test.cc \
   compiler/optimizing/licm_test.cc \
   compiler/optimizing/live_interval_test.cc \
+  optimizing/loop_optimization_test.cc \
   compiler/optimizing/nodes_test.cc \
   compiler/optimizing/parallel_move_test.cc \
   compiler/optimizing/pretty_printer_test.cc \
@@ -298,6 +299,8 @@ COMPILER_GTEST_COMMON_SRC_FILES := \
   compiler/utils/intrusive_forward_list_test.cc \
   compiler/utils/swap_space_test.cc \
   compiler/utils/test_dex_file_builder_test.cc \
+  compiler/utils/transform_array_ref_test.cc \
+  compiler/utils/transform_iterator_test.cc \
 
 COMPILER_GTEST_COMMON_SRC_FILES_all := \
   compiler/jni/jni_cfi_test.cc \

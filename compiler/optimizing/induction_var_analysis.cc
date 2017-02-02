@@ -87,11 +87,12 @@ HInductionVarAnalysis::HInductionVarAnalysis(HGraph* graph)
     : HOptimization(graph, kInductionPassName),
       global_depth_(0),
       stack_(graph->GetArena()->Adapter(kArenaAllocInductionVarAnalysis)),
-      scc_(graph->GetArena()->Adapter(kArenaAllocInductionVarAnalysis)),
       map_(std::less<HInstruction*>(),
            graph->GetArena()->Adapter(kArenaAllocInductionVarAnalysis)),
+      scc_(graph->GetArena()->Adapter(kArenaAllocInductionVarAnalysis)),
       cycle_(std::less<HInstruction*>(),
              graph->GetArena()->Adapter(kArenaAllocInductionVarAnalysis)),
+      type_(Primitive::kPrimVoid),
       induction_(std::less<HLoopInformation*>(),
                  graph->GetArena()->Adapter(kArenaAllocInductionVarAnalysis)) {
 }
@@ -103,7 +104,6 @@ void HInductionVarAnalysis::Run() {
   for (HReversePostOrderIterator it_graph(*graph_); !it_graph.Done(); it_graph.Advance()) {
     HBasicBlock* graph_block = it_graph.Current();
     // Don't analyze irreducible loops.
-    // TODO(ajcbik): could/should we remove this restriction?
     if (graph_block->IsLoopHeader() && !graph_block->GetLoopInformation()->IsIrreducible()) {
       VisitLoop(graph_block->GetLoopInformation());
     }
@@ -121,7 +121,7 @@ void HInductionVarAnalysis::VisitLoop(HLoopInformation* loop) {
     HBasicBlock* loop_block = it_loop.Current();
     DCHECK(loop_block->IsInLoop());
     if (loop_block->GetLoopInformation() != loop) {
-      continue;  // Inner loops already visited.
+      continue;  // Inner loops visited later.
     }
     // Visit phi-operations and instructions.
     for (HInstructionIterator it(loop_block->GetPhis()); !it.Done(); it.Advance()) {
@@ -152,8 +152,8 @@ void HInductionVarAnalysis::VisitNode(HLoopInformation* loop, HInstruction* inst
 
   // Visit all descendants.
   uint32_t low = d1;
-  for (size_t i = 0, count = instruction->InputCount(); i < count; ++i) {
-    low = std::min(low, VisitDescendant(loop, instruction->InputAt(i)));
+  for (HInstruction* input : instruction->GetInputs()) {
+    low = std::min(low, VisitDescendant(loop, input));
   }
 
   // Lower or found SCC?
@@ -285,6 +285,9 @@ void HInductionVarAnalysis::ClassifyNonTrivial(HLoopInformation* loop) {
     } else if (instruction->IsSub()) {
       update = SolveAddSub(
           loop, phi, instruction, instruction->InputAt(0), instruction->InputAt(1), kSub, true);
+    } else if (instruction->IsXor()) {
+      update = SolveXor(
+          loop, phi, instruction, instruction->InputAt(0), instruction->InputAt(1), true);
     } else if (instruction->IsTypeConversion()) {
       update = SolveCnv(instruction->AsTypeConversion());
     }
@@ -341,11 +344,11 @@ HInductionVarAnalysis::InductionInfo* HInductionVarAnalysis::TransferPhi(HLoopIn
                                                                          HInstruction* phi,
                                                                          size_t input_index) {
   // Match all phi inputs from input_index onwards exactly.
-  const size_t count = phi->InputCount();
-  DCHECK_LT(input_index, count);
-  InductionInfo* a = LookupInfo(loop, phi->InputAt(input_index));
-  for (size_t i = input_index + 1; i < count; i++) {
-    InductionInfo* b = LookupInfo(loop, phi->InputAt(i));
+  HInputsRef inputs = phi->GetInputs();
+  DCHECK_LT(input_index, inputs.size());
+  InductionInfo* a = LookupInfo(loop, inputs[input_index]);
+  for (size_t i = input_index + 1; i < inputs.size(); i++) {
+    InductionInfo* b = LookupInfo(loop, inputs[i]);
     if (!InductionEqual(a, b)) {
       return nullptr;
     }
@@ -464,12 +467,12 @@ HInductionVarAnalysis::InductionInfo* HInductionVarAnalysis::TransferCnv(Inducti
 HInductionVarAnalysis::InductionInfo* HInductionVarAnalysis::SolvePhi(HInstruction* phi,
                                                                       size_t input_index) {
   // Match all phi inputs from input_index onwards exactly.
-  const size_t count = phi->InputCount();
-  DCHECK_LT(input_index, count);
-  auto ita = cycle_.find(phi->InputAt(input_index));
+  HInputsRef inputs = phi->GetInputs();
+  DCHECK_LT(input_index, inputs.size());
+  auto ita = cycle_.find(inputs[input_index]);
   if (ita != cycle_.end()) {
-    for (size_t i = input_index + 1; i < count; i++) {
-      auto itb = cycle_.find(phi->InputAt(i));
+    for (size_t i = input_index + 1; i < inputs.size(); i++) {
+      auto itb = cycle_.find(inputs[i]);
       if (itb == cycle_.end() ||
           !HInductionVarAnalysis::InductionEqual(ita->second, itb->second)) {
         return nullptr;
@@ -550,6 +553,27 @@ HInductionVarAnalysis::InductionInfo* HInductionVarAnalysis::SolveAddSub(HLoopIn
     }
   }
 
+  return nullptr;
+}
+
+HInductionVarAnalysis::InductionInfo* HInductionVarAnalysis::SolveXor(HLoopInformation* loop,
+                                                                      HInstruction* entry_phi,
+                                                                      HInstruction* instruction,
+                                                                      HInstruction* x,
+                                                                      HInstruction* y,
+                                                                      bool is_first_call) {
+  InductionInfo* b = LookupInfo(loop, y);
+  // Solve within a tight cycle on x = x ^ c.
+  if (b != nullptr && b->induction_class == kInvariant) {
+    if (x == entry_phi && entry_phi->InputCount() == 2 && instruction == entry_phi->InputAt(1)) {
+      InductionInfo* initial = LookupInfo(loop, entry_phi->InputAt(0));
+      return CreateInduction(kPeriodic, CreateInvariantOp(kXor, initial, b), initial, type_);
+    }
+  }
+  // Try the other way around if considered for first time.
+  if (is_first_call) {
+    return SolveXor(loop, entry_phi, instruction, y, x, false);
+  }
   return nullptr;
 }
 
@@ -714,10 +738,12 @@ void HInductionVarAnalysis::VisitTripCount(HLoopInformation* loop,
     case kCondGE: op = kGE; break;
     default:      LOG(FATAL) << "CONDITION UNREACHABLE";
   }
+  // Associate trip count with control instruction, rather than the condition (even
+  // though it's its use) since former provides a convenient use-free placeholder.
+  HInstruction* control = loop->GetHeader()->GetLastInstruction();
   InductionInfo* taken_test = CreateInvariantOp(op, lower_expr, upper_expr);
-  AssignInfo(loop,
-             loop->GetHeader()->GetLastInstruction(),
-             CreateTripCount(tcKind, trip_count, taken_test, type));
+  DCHECK(control->IsIf());
+  AssignInfo(loop, control, CreateTripCount(tcKind, trip_count, taken_test, type));
 }
 
 bool HInductionVarAnalysis::IsTaken(InductionInfo* lower_expr,
@@ -848,8 +874,8 @@ HInductionVarAnalysis::InductionInfo* HInductionVarAnalysis::CreateSimplifiedInv
   int64_t value = -1;
   if (IsExact(a, &value)) {
     if (value == 0) {
-      // Simplify 0 + b = b, 0 * b = 0.
-      if (op == kAdd) {
+      // Simplify 0 + b = b, 0 ^ b = b, 0 * b = 0.
+      if (op == kAdd || op == kXor) {
         return b;
       } else if (op == kMul) {
         return a;
@@ -865,8 +891,8 @@ HInductionVarAnalysis::InductionInfo* HInductionVarAnalysis::CreateSimplifiedInv
   }
   if (IsExact(b, &value)) {
     if (value == 0) {
-      // Simplify a + 0 = a, a - 0 = a, a * 0 = 0, -0 = 0.
-      if (op == kAdd || op == kSub) {
+      // Simplify a + 0 = a, a - 0 = a, a ^ 0 = a, a * 0 = 0, -0 = 0.
+      if (op == kAdd || op == kSub || op == kXor) {
         return a;
       } else if (op == kMul || op == kNeg) {
         return b;
@@ -937,6 +963,7 @@ std::string HInductionVarAnalysis::InductionToString(InductionInfo* info) {
         case kNeg:   inv += " - ";  break;
         case kMul:   inv += " * ";  break;
         case kDiv:   inv += " / ";  break;
+        case kXor:   inv += " ^ ";  break;
         case kLT:    inv += " < ";  break;
         case kLE:    inv += " <= "; break;
         case kGT:    inv += " > ";  break;

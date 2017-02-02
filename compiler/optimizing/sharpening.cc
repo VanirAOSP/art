@@ -19,6 +19,7 @@
 #include "base/casts.h"
 #include "class_linker.h"
 #include "code_generator.h"
+#include "driver/compiler_options.h"
 #include "driver/dex_compilation_unit.h"
 #include "utils/dex_cache_arrays_layout-inl.h"
 #include "driver/compiler_driver.h"
@@ -97,9 +98,8 @@ void HSharpening::ProcessInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) {
         ((direct_method == 0u || direct_code == static_cast<uintptr_t>(-1))) &&
         ContainsElement(compiler_driver_->GetDexFilesForOatFile(), target_method.dex_file);
     if (direct_method != 0u) {  // Should we use a direct pointer to the method?
-      // Note: For JIT, kDirectAddressWithFixup doesn't make sense at all and while
-      // kDirectAddress would be fine for image methods, we don't support it at the moment.
-      DCHECK(!Runtime::Current()->UseJitCompilation());
+      // Note: For JIT, kDirectAddressWithFixup doesn't make sense at all, while
+      // kDirectAddress is fine for all methods which had been resolved.
       if (direct_method != static_cast<uintptr_t>(-1)) {  // Is the method pointer known now?
         method_load_kind = HInvokeStaticOrDirect::MethodLoadKind::kDirectAddress;
         method_load_data = direct_method;

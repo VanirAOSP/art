@@ -168,8 +168,10 @@ void ConcurrentCopying::InitializePhase() {
   immune_spaces_.Reset();
   bytes_moved_.StoreRelaxed(0);
   objects_moved_.StoreRelaxed(0);
-  if (GetCurrentIteration()->GetGcCause() == kGcCauseExplicit ||
-      GetCurrentIteration()->GetGcCause() == kGcCauseForNativeAlloc ||
+  GcCause gc_cause = GetCurrentIteration()->GetGcCause();
+  if (gc_cause == kGcCauseExplicit ||
+      gc_cause == kGcCauseForNativeAlloc ||
+      gc_cause == kGcCauseCollectorTransition ||
       GetCurrentIteration()->GetClearSoftReferences()) {
     force_evacuate_all_ = true;
   } else {
@@ -1617,11 +1619,18 @@ class ConcurrentCopying::RefFieldsVisitor {
 
 // Scan ref fields of an object.
 inline void ConcurrentCopying::Scan(mirror::Object* to_ref) {
+  if (kIsDebugBuild) {
+    // Avoid all read barriers during visit references to help performance.
+    Thread::Current()->ModifyDebugDisallowReadBarrier(1);
+  }
   DCHECK(!region_space_->IsInFromSpace(to_ref));
   RefFieldsVisitor visitor(this);
   // Disable the read barrier for a performance reason.
   to_ref->VisitReferences</*kVisitNativeRoots*/true, kDefaultVerifyFlags, kWithoutReadBarrier>(
       visitor, visitor);
+  if (kIsDebugBuild) {
+    Thread::Current()->ModifyDebugDisallowReadBarrier(-1);
+  }
 }
 
 // Process a field.
@@ -1704,7 +1713,7 @@ void ConcurrentCopying::FillWithDummyObject(mirror::Object* dummy_obj, size_t by
   mirror::Class* int_array_class = mirror::IntArray::GetArrayClass();
   CHECK(int_array_class != nullptr);
   AssertToSpaceInvariant(nullptr, MemberOffset(0), int_array_class);
-  size_t component_size = int_array_class->GetComponentSize();
+  size_t component_size = int_array_class->GetComponentSize<kWithoutReadBarrier>();
   CHECK_EQ(component_size, sizeof(int32_t));
   size_t data_offset = mirror::Array::DataOffset(component_size).SizeValue();
   if (data_offset > byte_size) {
@@ -1717,13 +1726,14 @@ void ConcurrentCopying::FillWithDummyObject(mirror::Object* dummy_obj, size_t by
   } else {
     // Use an int array.
     dummy_obj->SetClass(int_array_class);
-    CHECK(dummy_obj->IsArrayInstance());
+    CHECK((dummy_obj->IsArrayInstance<kVerifyNone, kWithoutReadBarrier>()));
     int32_t length = (byte_size - data_offset) / component_size;
-    dummy_obj->AsArray()->SetLength(length);
-    CHECK_EQ(dummy_obj->AsArray()->GetLength(), length)
+    mirror::Array* dummy_arr = dummy_obj->AsArray<kVerifyNone, kWithoutReadBarrier>();
+    dummy_arr->SetLength(length);
+    CHECK_EQ(dummy_arr->GetLength(), length)
         << "byte_size=" << byte_size << " length=" << length
         << " component_size=" << component_size << " data_offset=" << data_offset;
-    CHECK_EQ(byte_size, dummy_obj->SizeOf())
+    CHECK_EQ(byte_size, (dummy_obj->SizeOf<kVerifyNone, kWithoutReadBarrier>()))
         << "byte_size=" << byte_size << " length=" << length
         << " component_size=" << component_size << " data_offset=" << data_offset;
   }
@@ -1830,13 +1840,23 @@ mirror::Object* ConcurrentCopying::Copy(mirror::Object* from_ref) {
   }
   DCHECK(to_ref != nullptr);
 
+  // Copy the object excluding the lock word since that is handled in the loop.
+  to_ref->SetClass(from_ref->GetClass<kVerifyNone, kWithoutReadBarrier>());
+  const size_t kObjectHeaderSize = sizeof(mirror::Object);
+  DCHECK_GE(obj_size, kObjectHeaderSize);
+  static_assert(kObjectHeaderSize == sizeof(mirror::HeapReference<mirror::Class>) +
+                    sizeof(LockWord),
+                "Object header size does not match");
+  // Memcpy can tear for words since it may do byte copy. It is only safe to do this since the
+  // object in the from space is immutable other than the lock word. b/31423258
+  memcpy(reinterpret_cast<uint8_t*>(to_ref) + kObjectHeaderSize,
+         reinterpret_cast<const uint8_t*>(from_ref) + kObjectHeaderSize,
+         obj_size - kObjectHeaderSize);
+
   // Attempt to install the forward pointer. This is in a loop as the
   // lock word atomic write can fail.
   while (true) {
-    // Copy the object. TODO: copy only the lockword in the second iteration and on?
-    memcpy(to_ref, from_ref, obj_size);
-
-    LockWord old_lock_word = to_ref->GetLockWord(false);
+    LockWord old_lock_word = from_ref->GetLockWord(false);
 
     if (old_lock_word.GetState() == LockWord::kForwardingAddress) {
       // Lost the race. Another thread (either GC or mutator) stored
@@ -1879,6 +1899,8 @@ mirror::Object* ConcurrentCopying::Copy(mirror::Object* from_ref) {
       return to_ref;
     }
 
+    // Copy the old lock word over since we did not copy it yet.
+    to_ref->SetLockWord(old_lock_word, false);
     // Set the gray ptr.
     if (kUseBakerReadBarrier) {
       to_ref->SetReadBarrierPointer(ReadBarrier::GrayPtr());

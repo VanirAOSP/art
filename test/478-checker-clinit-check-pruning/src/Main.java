@@ -103,10 +103,8 @@ public class Main {
     static boolean doThrow = false;
 
     static void $noinline$staticMethod() {
-      if (doThrow) {
-        // Try defeating inlining.
-        throw new Error();
-      }
+      // Try defeating inlining.
+      if (doThrow) { throw new Error(); }
     }
   }
 
@@ -181,10 +179,8 @@ public class Main {
     static boolean doThrow = false;
 
     static void $noinline$staticMethod() {
-      if (doThrow) {
         // Try defeating inlining.
-        throw new Error();
-      }
+      if (doThrow) { throw new Error(); }
     }
   }
 
@@ -245,10 +241,8 @@ public class Main {
     static boolean doThrow = false;
 
     static void $noinline$staticMethod() {
-      if (doThrow) {
         // Try defeating inlining.
-        throw new Error();
-      }
+      if (doThrow) { throw new Error(); }
     }
 
     static {
@@ -314,7 +308,7 @@ public class Main {
 
   static void constClassAndInvokeStatic(Iterable<?> it) {
     $opt$inline$ignoreClass(ClassWithClinit7.class);
-    ClassWithClinit7.someStaticMethod(it);
+    ClassWithClinit7.$noinline$someStaticMethod(it);
   }
 
   static void $opt$inline$ignoreClass(Class<?> c) {
@@ -325,10 +319,10 @@ public class Main {
       System.out.println("Main$ClassWithClinit7's static initializer");
     }
 
-    // Note: not inlined from constClassAndInvokeStatic() but fully inlined from main().
-    static void someStaticMethod(Iterable<?> it) {
-      // We're not inlining invoke-interface at the moment.
+    static void $noinline$someStaticMethod(Iterable<?> it) {
       it.iterator();
+      // We're not inlining throw at the moment.
+      if (doThrow) { throw new Error(""); }
     }
   }
 
@@ -345,7 +339,7 @@ public class Main {
 
   static void sgetAndInvokeStatic(Iterable<?> it) {
     $opt$inline$ignoreInt(ClassWithClinit8.value);
-    ClassWithClinit8.someStaticMethod(it);
+    ClassWithClinit8.$noinline$someStaticMethod(it);
   }
 
   static void $opt$inline$ignoreInt(int i) {
@@ -357,10 +351,10 @@ public class Main {
       System.out.println("Main$ClassWithClinit8's static initializer");
     }
 
-    // Note: not inlined from sgetAndInvokeStatic() but fully inlined from main().
-    static void someStaticMethod(Iterable<?> it) {
-      // We're not inlining invoke-interface at the moment.
+    static void $noinline$someStaticMethod(Iterable<?> it) {
       it.iterator();
+      // We're not inlining throw at the moment.
+      if (doThrow) { throw new Error(""); }
     }
   }
 
@@ -377,7 +371,7 @@ public class Main {
   static void constClassSgetAndInvokeStatic(Iterable<?> it) {
     $opt$inline$ignoreClass(ClassWithClinit9.class);
     $opt$inline$ignoreInt(ClassWithClinit9.value);
-    ClassWithClinit9.someStaticMethod(it);
+    ClassWithClinit9.$noinline$someStaticMethod(it);
   }
 
   static class ClassWithClinit9 {
@@ -386,16 +380,16 @@ public class Main {
       System.out.println("Main$ClassWithClinit9's static initializer");
     }
 
-    // Note: not inlined from constClassSgetAndInvokeStatic() but fully inlined from main().
-    static void someStaticMethod(Iterable<?> it) {
-      // We're not inlining invoke-interface at the moment.
+    static void $noinline$someStaticMethod(Iterable<?> it) {
       it.iterator();
+      // We're not inlining throw at the moment.
+      if (doThrow) { throw new Error(""); }
     }
   }
 
   /*
    * Verify that LoadClass from a fully-inlined invoke-static is not merged
-   * with InvokeStaticOrDirect from a later invoke-static to the same method.
+   * with InvokeStaticOrDirect from a later invoke-static to similar method.
    */
 
   /// CHECK-START: void Main.inlinedInvokeStaticViaNonStatic(java.lang.Iterable) liveness (before)
@@ -407,11 +401,15 @@ public class Main {
 
   static void inlinedInvokeStaticViaNonStatic(Iterable<?> it) {
     inlinedInvokeStaticViaNonStaticHelper(null);
-    inlinedInvokeStaticViaNonStaticHelper(it);
+    inlinedInvokeStaticViaNonStaticHelper2(it);
   }
 
   static void inlinedInvokeStaticViaNonStaticHelper(Iterable<?> it) {
-    ClassWithClinit10.inlinedForNull(it);
+    ClassWithClinit10.inlinedForNull$inline$(it);
+  }
+
+  static void inlinedInvokeStaticViaNonStaticHelper2(Iterable<?> it) {
+    ClassWithClinit10.inlinedForNull$noinline$(it);
   }
 
   static class ClassWithClinit10 {
@@ -420,9 +418,14 @@ public class Main {
       System.out.println("Main$ClassWithClinit10's static initializer");
     }
 
-    static void inlinedForNull(Iterable<?> it) {
+    static void inlinedForNull$inline$(Iterable<?> it) {
       if (it != null) {
-        // We're not inlining invoke-interface at the moment.
+        it.iterator();
+      }
+    }
+
+    static void inlinedForNull$noinline$(Iterable<?> it) {
+      if (it != null) {
         it.iterator();
       }
     }
@@ -456,12 +459,15 @@ public class Main {
     }
 
     static void callInlinedForNull(Iterable<?> it) {
-      inlinedForNull(it);
+      inlinedForNull$noinline$(it);
     }
 
-    static void inlinedForNull(Iterable<?> it) {
-      // We're not inlining invoke-interface at the moment.
+    static void inlinedForNull$noinline$(Iterable<?> it) {
       it.iterator();
+      if (it != null) {
+        // We're not inlining throw at the moment.
+        if (doThrow) { throw new Error(""); }
+      }
     }
   }
 
@@ -489,13 +495,13 @@ public class Main {
     }
 
     static void callInlinedForNull(Iterable<?> it) {
-      inlinedForNull(it);
+      inlinedForNull$noinline$(it);
     }
 
-    static void inlinedForNull(Iterable<?> it) {
+    static void inlinedForNull$noinline$(Iterable<?> it) {
       if (it != null) {
-        // We're not inlining invoke-interface at the moment.
-        it.iterator();
+        // We're not inlining throw at the moment.
+        if (doThrow) { throw new Error(""); }
       }
     }
   }
@@ -510,8 +516,9 @@ public class Main {
     }
 
     public static void $noinline$getIterator(Iterable<?> it) {
-      // We're not inlining invoke-interface at the moment.
       it.iterator();
+      // We're not inlining throw at the moment.
+      if (doThrow) { throw new Error(""); }
     }
   }
 

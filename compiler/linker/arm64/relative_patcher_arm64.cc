@@ -83,7 +83,7 @@ uint32_t Arm64RelativePatcher::ReserveSpace(uint32_t offset,
 
   // Now that we have the actual offset where the code will be placed, locate the ADRP insns
   // that actually require the thunk.
-  uint32_t quick_code_offset = compiled_method->AlignCode(offset) + sizeof(OatQuickMethodHeader);
+  uint32_t quick_code_offset = compiled_method->AlignCode(offset + sizeof(OatQuickMethodHeader));
   ArrayRef<const uint8_t> code = compiled_method->GetQuickCode();
   uint32_t thunk_offset = compiled_method->AlignCode(quick_code_offset + code.size());
   DCHECK(compiled_method != nullptr);
@@ -210,7 +210,14 @@ void Arm64RelativePatcher::PatchPcRelativeReference(std::vector<uint8_t>* code,
   } else {
     if ((insn & 0xfffffc00) == 0x91000000) {
       // ADD immediate, 64-bit with imm12 == 0 (unset).
-      DCHECK(patch.GetType() == LinkerPatch::Type::kStringRelative) << patch.GetType();
+      if (!kEmitCompilerReadBarrier) {
+        DCHECK(patch.GetType() == LinkerPatch::Type::kStringRelative) << patch.GetType();
+      } else {
+        // With the read barrier (non-baker) enabled, it could be kDexCacheArray in the
+        // HLoadString::LoadKind::kDexCachePcRelative case of VisitLoadString().
+        DCHECK(patch.GetType() == LinkerPatch::Type::kStringRelative ||
+               patch.GetType() == LinkerPatch::Type::kDexCacheArray) << patch.GetType();
+      }
       shift = 0u;  // No shift for ADD.
     } else {
       // LDR 32-bit or 64-bit with imm12 == 0 (unset).

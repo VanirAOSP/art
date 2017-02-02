@@ -423,7 +423,7 @@ class WatchDog {
     CHECK_WATCH_DOG_PTHREAD_CALL(pthread_condattr_init, (&condattr_), reason);
 #if !defined(__APPLE__)
     // Apple doesn't have CLOCK_MONOTONIC or pthread_condattr_setclock.
-    CHECK_WATCH_DOG_PTHREAD_CALL(pthread_condattr_setclock, (&condattr_, WATCHDOG_CLOCK), reason);
+    CHECK_WATCH_DOG_PTHREAD_CALL(pthread_condattr_setclock, (&condattr_, CLOCK_MONOTONIC), reason);
 #endif
     CHECK_WATCH_DOG_PTHREAD_CALL(pthread_cond_init, (&cond_, &condattr_), reason);
     CHECK_WATCH_DOG_PTHREAD_CALL(pthread_condattr_destroy, (&condattr_), reason);
@@ -443,6 +443,7 @@ class WatchDog {
 
     CHECK_WATCH_DOG_PTHREAD_CALL(pthread_join, (pthread_, nullptr), reason);
 
+    CHECK_WATCH_DOG_PTHREAD_CALL(pthread_condattr_destroy, (&condattr_), reason);
     CHECK_WATCH_DOG_PTHREAD_CALL(pthread_cond_destroy, (&cond_), reason);
     CHECK_WATCH_DOG_PTHREAD_CALL(pthread_mutex_destroy, (&mutex_), reason);
   }
@@ -469,7 +470,7 @@ class WatchDog {
     //       large.
     constexpr int64_t multiplier = kVerifyObjectSupport > kVerifyObjectModeFast ? 100 : 1;
     timespec timeout_ts;
-    InitTimeSpec(true, WATCHDOG_CLOCK, multiplier * kWatchDogTimeoutSeconds * 1000, 0, &timeout_ts);
+    InitTimeSpec(true, CLOCK_MONOTONIC, multiplier * kWatchDogTimeoutSeconds * 1000, 0, &timeout_ts);
     const char* reason = "dex2oat watch dog thread waiting";
     CHECK_WATCH_DOG_PTHREAD_CALL(pthread_mutex_lock, (&mutex_), reason);
     while (!shutting_down_) {
@@ -520,6 +521,7 @@ class Dex2Oat FINAL {
       runtime_(nullptr),
       thread_count_(sysconf(_SC_NPROCESSORS_CONF)),
       start_ns_(NanoTime()),
+      start_cputime_ns_(ProcessCpuNanoTime()),  // Should not really be necessary.
       oat_fd_(-1),
       zip_fd_(-1),
       image_base_(0U),
@@ -634,9 +636,8 @@ class Dex2Oat FINAL {
   void ParseInstructionSetVariant(const StringPiece& option, ParserOptions* parser_options) {
     DCHECK(option.starts_with("--instruction-set-variant="));
     StringPiece str = option.substr(strlen("--instruction-set-variant=")).data();
-    instruction_set_features_.reset(
-        InstructionSetFeatures::FromVariant(
-            instruction_set_, str.as_string(), &parser_options->error_msg));
+    instruction_set_features_ = InstructionSetFeatures::FromVariant(
+        instruction_set_, str.as_string(), &parser_options->error_msg);
     if (instruction_set_features_.get() == nullptr) {
       Usage("%s", parser_options->error_msg.c_str());
     }
@@ -645,19 +646,18 @@ class Dex2Oat FINAL {
   void ParseInstructionSetFeatures(const StringPiece& option, ParserOptions* parser_options) {
     DCHECK(option.starts_with("--instruction-set-features="));
     StringPiece str = option.substr(strlen("--instruction-set-features=")).data();
-    if (instruction_set_features_.get() == nullptr) {
-      instruction_set_features_.reset(
-          InstructionSetFeatures::FromVariant(
-              instruction_set_, "default", &parser_options->error_msg));
+    if (instruction_set_features_ == nullptr) {
+      instruction_set_features_ = InstructionSetFeatures::FromVariant(
+          instruction_set_, "default", &parser_options->error_msg);
       if (instruction_set_features_.get() == nullptr) {
         Usage("Problem initializing default instruction set features variant: %s",
               parser_options->error_msg.c_str());
       }
     }
-    instruction_set_features_.reset(
+    instruction_set_features_ =
         instruction_set_features_->AddFeaturesFromString(str.as_string(),
-                                                         &parser_options->error_msg));
-    if (instruction_set_features_.get() == nullptr) {
+                                                         &parser_options->error_msg);
+    if (instruction_set_features_ == nullptr) {
       Usage("Error parsing '%s': %s", option.data(), parser_options->error_msg.c_str());
     }
   }
@@ -822,9 +822,8 @@ class Dex2Oat FINAL {
     // If no instruction set feature was given, use the default one for the target
     // instruction set.
     if (instruction_set_features_.get() == nullptr) {
-      instruction_set_features_.reset(
-          InstructionSetFeatures::FromVariant(
-              instruction_set_, "default", &parser_options->error_msg));
+      instruction_set_features_ = InstructionSetFeatures::FromVariant(
+         instruction_set_, "default", &parser_options->error_msg);
       if (instruction_set_features_.get() == nullptr) {
         Usage("Problem initializing default instruction set features variant: %s",
               parser_options->error_msg.c_str());
@@ -1830,15 +1829,14 @@ class Dex2Oat FINAL {
         TimingLogger::ScopedTiming t("dex2oat OatFile copy", timings_);
         std::unique_ptr<File> in(OS::OpenFileForReading(oat_filenames_[i]));
         std::unique_ptr<File> out(OS::CreateEmptyFile(oat_unstripped_[i]));
-        size_t buffer_size = 8192;
-        std::unique_ptr<uint8_t[]> buffer(new uint8_t[buffer_size]);
-        while (true) {
-          int bytes_read = TEMP_FAILURE_RETRY(read(in->Fd(), buffer.get(), buffer_size));
-          if (bytes_read <= 0) {
-            break;
-          }
-          bool write_ok = out->WriteFully(buffer.get(), bytes_read);
-          CHECK(write_ok);
+        int64_t in_length = in->GetLength();
+        if (in_length < 0) {
+          PLOG(ERROR) << "Failed to get the length of oat file: " << in->GetPath();
+          return false;
+        }
+        if (!out->Copy(in.get(), 0, in_length)) {
+          PLOG(ERROR) << "Failed to copy oat file to file: " << out->GetPath();
+          return false;
         }
         if (out->FlushCloseOrErase() != 0) {
           PLOG(ERROR) << "Failed to flush and close copied oat file: " << oat_unstripped_[i];
@@ -2408,7 +2406,9 @@ class Dex2Oat FINAL {
     // Note: when creation of a runtime fails, e.g., when trying to compile an app but when there
     //       is no image, there won't be a Runtime::Current().
     // Note: driver creation can fail when loading an invalid dex file.
-    LOG(INFO) << "dex2oat took " << PrettyDuration(NanoTime() - start_ns_)
+    LOG(INFO) << "dex2oat took "
+              << PrettyDuration(NanoTime() - start_ns_)
+              << "(" << PrettyDuration(ProcessCpuNanoTime() - start_cputime_ns_) << ")"
               << " (threads: " << thread_count_ << ") "
               << ((Runtime::Current() != nullptr && driver_ != nullptr) ?
                   driver_->GetMemoryUsageString(kIsDebugBuild || VLOG_IS_ON(compiler)) :
@@ -2457,6 +2457,7 @@ class Dex2Oat FINAL {
 
   size_t thread_count_;
   uint64_t start_ns_;
+  uint64_t start_cputime_ns_;
   std::unique_ptr<WatchDog> watchdog_;
   std::vector<std::unique_ptr<File>> oat_files_;
   std::string oat_location_;

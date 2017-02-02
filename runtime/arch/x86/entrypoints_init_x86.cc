@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include <math.h>
+
 #include "entrypoints/jni/jni_entrypoints.h"
 #include "entrypoints/quick/quick_alloc_entrypoints.h"
 #include "entrypoints/quick/quick_default_externs.h"
@@ -25,8 +27,8 @@
 namespace art {
 
 // Cast entrypoints.
-extern "C" uint32_t art_quick_is_assignable(const mirror::Class* klass,
-                                            const mirror::Class* ref_class);
+extern "C" size_t art_quick_is_assignable(const mirror::Class* klass,
+                                          const mirror::Class* ref_class);
 
 // Read barrier entrypoints.
 extern "C" mirror::Object* art_quick_read_barrier_mark(mirror::Object*);
