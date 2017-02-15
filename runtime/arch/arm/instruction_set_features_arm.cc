@@ -84,7 +84,17 @@ ArmFeaturesUniquePtr ArmInstructionSetFeatures::FromVariant(
         "cortex-a9",
         "cortex-a9-mp",
         "default",
-        "generic"
+        "arm7", "arm7m", "arm7d", "arm7dm", "arm7di", "arm7dmi", "arm70", "arm700", "arm700i",
+        "arm710", "arm710c", "arm7100", "arm720", "arm7500", "arm7500fe", "arm7tdmi", "arm7tdmi-s",
+        "arm710t", "arm720t", "arm740t",
+        "arm8", "arm810",
+        "arm9", "arm9e", "arm920", "arm920t", "arm922t", "arm946e-s", "arm966e-s", "arm968e-s",
+        "arm926ej-s", "arm940t", "arm9tdmi",
+        "arm10tdmi", "arm1020t", "arm1026ej-s", "arm10e", "arm1020e", "arm1022e",
+        "arm1136j-s", "arm1136jf-s",
+        "arm1156t2-s", "arm1156t2f-s", "arm1176jz-s", "arm1176jzf-s",
+        "cortex-a5", "cortex-a8", "cortex-a9", "cortex-a9-mp", "cortex-r4f",
+        "marvell-pj4", "mpcore", "mpcorenovfp", "scorpion"
     };
     if (!FindVariantInArray(arm_variants_with_default_features,
                             arraysize(arm_variants_with_default_features),
