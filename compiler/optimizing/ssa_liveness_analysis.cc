@@ -23,9 +23,83 @@
 namespace art {
 
 void SsaLivenessAnalysis::Analyze() {
-  graph_->Linearize();
+  LinearizeGraph();
   NumberInstructions();
   ComputeLiveness();
+}
+
+static bool IsLoop(HLoopInformation* info) {
+  return info != nullptr;
+}
+
+static bool InSameLoop(HLoopInformation* first_loop, HLoopInformation* second_loop) {
+  return first_loop == second_loop;
+}
+
+static bool IsInnerLoop(HLoopInformation* outer, HLoopInformation* inner) {
+  return (inner != outer)
+      && (inner != nullptr)
+      && (outer != nullptr)
+      && inner->IsIn(*outer);
+}
+
+static void AddToListForLinearization(ArenaVector<HBasicBlock*>* worklist, HBasicBlock* block) {
+  HLoopInformation* block_loop = block->GetLoopInformation();
+  auto insert_pos = worklist->rbegin();  // insert_pos.base() will be the actual position.
+  for (auto end = worklist->rend(); insert_pos != end; ++insert_pos) {
+    HBasicBlock* current = *insert_pos;
+    HLoopInformation* current_loop = current->GetLoopInformation();
+    if (InSameLoop(block_loop, current_loop)
+        || !IsLoop(current_loop)
+        || IsInnerLoop(current_loop, block_loop)) {
+      // The block can be processed immediately.
+      break;
+    }
+  }
+  worklist->insert(insert_pos.base(), block);
+}
+
+void SsaLivenessAnalysis::LinearizeGraph() {
+  // Create a reverse post ordering with the following properties:
+  // - Blocks in a loop are consecutive,
+  // - Back-edge is the last block before loop exits.
+
+  // (1): Record the number of forward predecessors for each block. This is to
+  //      ensure the resulting order is reverse post order. We could use the
+  //      current reverse post order in the graph, but it would require making
+  //      order queries to a GrowableArray, which is not the best data structure
+  //      for it.
+  ArenaVector<uint32_t> forward_predecessors(graph_->GetBlocks().size(),
+                                             graph_->GetArena()->Adapter(kArenaAllocSsaLiveness));
+  for (HReversePostOrderIterator it(*graph_); !it.Done(); it.Advance()) {
+    HBasicBlock* block = it.Current();
+    size_t number_of_forward_predecessors = block->GetPredecessors().size();
+    if (block->IsLoopHeader()) {
+      number_of_forward_predecessors -= block->GetLoopInformation()->NumberOfBackEdges();
+    }
+    forward_predecessors[block->GetBlockId()] = number_of_forward_predecessors;
+  }
+
+  // (2): Following a worklist approach, first start with the entry block, and
+  //      iterate over the successors. When all non-back edge predecessors of a
+  //      successor block are visited, the successor block is added in the worklist
+  //      following an order that satisfies the requirements to build our linear graph.
+  graph_->linear_order_.reserve(graph_->GetReversePostOrder().size());
+  ArenaVector<HBasicBlock*> worklist(graph_->GetArena()->Adapter(kArenaAllocSsaLiveness));
+  worklist.push_back(graph_->GetEntryBlock());
+  do {
+    HBasicBlock* current = worklist.back();
+    worklist.pop_back();
+    graph_->linear_order_.push_back(current);
+    for (HBasicBlock* successor : current->GetSuccessors()) {
+      int block_id = successor->GetBlockId();
+      size_t number_of_remaining_predecessors = forward_predecessors[block_id];
+      if (number_of_remaining_predecessors == 1) {
+        AddToListForLinearization(&worklist, successor);
+      }
+      forward_predecessors[block_id] = number_of_remaining_predecessors - 1;
+    }
+  } while (!worklist.empty());
 }
 
 void SsaLivenessAnalysis::NumberInstructions() {
@@ -103,9 +177,8 @@ void SsaLivenessAnalysis::ComputeLiveness() {
 static void RecursivelyProcessInputs(HInstruction* current,
                                      HInstruction* actual_user,
                                      BitVector* live_in) {
-  HInputsRef inputs = current->GetInputs();
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    HInstruction* input = inputs[i];
+  for (size_t i = 0, e = current->InputCount(); i < e; ++i) {
+    HInstruction* input = current->InputAt(i);
     bool has_in_location = current->GetLocations()->InAt(i).IsValid();
     bool has_out_location = input->GetLocations()->Out().IsValid();
 
@@ -357,12 +430,12 @@ int LiveInterval::FindFirstRegisterHint(size_t* free_until,
         // If the instruction dies at the phi assignment, we can try having the
         // same register.
         if (end == user->GetBlock()->GetPredecessors()[input_index]->GetLifetimeEnd()) {
-          HInputsRef inputs = user->GetInputs();
-          for (size_t i = 0; i < inputs.size(); ++i) {
+          for (size_t i = 0, e = user->InputCount(); i < e; ++i) {
             if (i == input_index) {
               continue;
             }
-            Location location = inputs[i]->GetLiveInterval()->GetLocationAt(
+            HInstruction* input = user->InputAt(i);
+            Location location = input->GetLiveInterval()->GetLocationAt(
                 user->GetBlock()->GetPredecessors()[i]->GetLifetimeEnd() - 1);
             if (location.IsRegisterKind()) {
               int reg = RegisterOrLowRegister(location);
@@ -398,10 +471,10 @@ int LiveInterval::FindHintAtDefinition() const {
   if (defined_by_->IsPhi()) {
     // Try to use the same register as one of the inputs.
     const ArenaVector<HBasicBlock*>& predecessors = defined_by_->GetBlock()->GetPredecessors();
-    HInputsRef inputs = defined_by_->GetInputs();
-    for (size_t i = 0; i < inputs.size(); ++i) {
+    for (size_t i = 0, e = defined_by_->InputCount(); i < e; ++i) {
+      HInstruction* input = defined_by_->InputAt(i);
       size_t end = predecessors[i]->GetLifetimeEnd();
-      LiveInterval* input_interval = inputs[i]->GetLiveInterval()->GetSiblingAt(end - 1);
+      LiveInterval* input_interval = input->GetLiveInterval()->GetSiblingAt(end - 1);
       if (input_interval->GetEnd() == end) {
         // If the input dies at the end of the predecessor, we know its register can
         // be reused.

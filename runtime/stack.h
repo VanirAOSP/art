@@ -25,9 +25,9 @@
 #include "base/mutex.h"
 #include "dex_file.h"
 #include "gc_root.h"
+#include "mirror/object_reference.h"
 #include "quick/quick_method_frame_info.h"
 #include "read_barrier.h"
-#include "stack_reference.h"
 #include "verify_object.h"
 
 namespace art {
@@ -45,7 +45,6 @@ class ScopedObjectAccess;
 class ShadowFrame;
 class StackVisitor;
 class Thread;
-union JValue;
 
 // The kind of vreg being accessed in calls to Set/GetVReg.
 enum VRegKind {
@@ -61,6 +60,11 @@ enum VRegKind {
   kUndefined,
 };
 std::ostream& operator<<(std::ostream& os, const VRegKind& rhs);
+
+// A reference from the shadow stack to a MirrorType object within the Java heap.
+template<class MirrorType>
+class MANAGED StackReference : public mirror::CompressedReference<MirrorType> {
+};
 
 // Forward declaration. Just calls the destructor.
 struct ShadowFrameDeleter;
@@ -206,10 +210,6 @@ class ShadowFrame {
     code_item_ = code_item;
   }
 
-  const DexFile::CodeItem* GetCodeItem() const {
-    return code_item_;
-  }
-
   float GetVRegFloat(size_t i) const {
     DCHECK_LT(i, NumberOfVRegs());
     // NOTE: Strict-aliasing?
@@ -220,6 +220,7 @@ class ShadowFrame {
   int64_t GetVRegLong(size_t i) const {
     DCHECK_LT(i, NumberOfVRegs());
     const uint32_t* vreg = &vregs_[i];
+    // Alignment attribute required for GCC 4.8
     typedef const int64_t unaligned_int64 __attribute__ ((aligned (4)));
     return *reinterpret_cast<unaligned_int64*>(vreg);
   }
@@ -227,6 +228,7 @@ class ShadowFrame {
   double GetVRegDouble(size_t i) const {
     DCHECK_LT(i, NumberOfVRegs());
     const uint32_t* vreg = &vregs_[i];
+    // Alignment attribute required for GCC 4.8
     typedef const double unaligned_double __attribute__ ((aligned (4)));
     return *reinterpret_cast<unaligned_double*>(vreg);
   }
@@ -283,6 +285,7 @@ class ShadowFrame {
   void SetVRegLong(size_t i, int64_t val) {
     DCHECK_LT(i, NumberOfVRegs());
     uint32_t* vreg = &vregs_[i];
+    // Alignment attribute required for GCC 4.8
     typedef int64_t unaligned_int64 __attribute__ ((aligned (4)));
     *reinterpret_cast<unaligned_int64*>(vreg) = val;
     // This is needed for moving collectors since these can update the vreg references if they
@@ -296,6 +299,7 @@ class ShadowFrame {
   void SetVRegDouble(size_t i, double val) {
     DCHECK_LT(i, NumberOfVRegs());
     uint32_t* vreg = &vregs_[i];
+    // Alignment attribute required for GCC 4.8
     typedef double unaligned_double __attribute__ ((aligned (4)));
     *reinterpret_cast<unaligned_double*>(vreg) = val;
     // This is needed for moving collectors since these can update the vreg references if they
@@ -401,10 +405,6 @@ class ShadowFrame {
 
   const uint16_t* GetDexPCPtr() {
     return dex_pc_ptr_;
-  }
-
-  void SetDexPCPtr(uint16_t* dex_pc_ptr) {
-    dex_pc_ptr_ = dex_pc_ptr;
   }
 
   JValue* GetResultRegister() {

@@ -1923,7 +1923,7 @@ void IntrinsicCodeGeneratorMIPS::VisitStringCharAt(HInvoke* invoke) {
 // int java.lang.String.compareTo(String anotherString)
 void IntrinsicLocationsBuilderMIPS::VisitStringCompareTo(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainOnly,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -2067,12 +2067,11 @@ static void GenerateStringIndexOf(HInvoke* invoke,
   // Note that the null check must have been done earlier.
   DCHECK(!invoke->CanDoImplicitNullCheckOn(invoke->InputAt(0)));
 
-  // Check for code points > 0xFFFF. Either a slow-path check when we don't know statically,
-  // or directly dispatch for a large constant, or omit slow-path for a small constant or a char.
+  // Check for code points > 0xFFFF. Either a slow-path check when we
+  // don't know statically, or directly dispatch if we have a constant.
   SlowPathCodeMIPS* slow_path = nullptr;
-  HInstruction* code_point = invoke->InputAt(1);
-  if (code_point->IsIntConstant()) {
-    if (!IsUint<16>(code_point->AsIntConstant()->GetValue())) {
+  if (invoke->InputAt(1)->IsIntConstant()) {
+    if (!IsUint<16>(invoke->InputAt(1)->AsIntConstant()->GetValue())) {
       // Always needs the slow-path. We could directly dispatch to it,
       // but this case should be rare, so for simplicity just put the
       // full slow-path down and branch unconditionally.
@@ -2082,7 +2081,7 @@ static void GenerateStringIndexOf(HInvoke* invoke,
       __ Bind(slow_path->GetExitLabel());
       return;
     }
-  } else if (code_point->GetType() != Primitive::kPrimChar) {
+  } else {
     Register char_reg = locations->InAt(1).AsRegister<Register>();
     // The "bltu" conditional branch tests to see if the character value
     // fits in a valid 16-bit (MIPS halfword) value. If it doesn't then
@@ -2119,7 +2118,7 @@ static void GenerateStringIndexOf(HInvoke* invoke,
 // int java.lang.String.indexOf(int ch)
 void IntrinsicLocationsBuilderMIPS::VisitStringIndexOf(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainAndSlowPath,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   // We have a hand-crafted assembly stub that follows the runtime
   // calling convention. So it's best to align the inputs accordingly.
@@ -2144,7 +2143,7 @@ void IntrinsicCodeGeneratorMIPS::VisitStringIndexOf(HInvoke* invoke) {
 // int java.lang.String.indexOf(int ch, int fromIndex)
 void IntrinsicLocationsBuilderMIPS::VisitStringIndexOfAfter(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainAndSlowPath,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   // We have a hand-crafted assembly stub that follows the runtime
   // calling convention. So it's best to align the inputs accordingly.
@@ -2170,7 +2169,7 @@ void IntrinsicCodeGeneratorMIPS::VisitStringIndexOfAfter(HInvoke* invoke) {
 // java.lang.StringFactory.newStringFromBytes(byte[] data, int high, int offset, int byteCount)
 void IntrinsicLocationsBuilderMIPS::VisitStringNewStringFromBytes(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainAndSlowPath,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -2203,7 +2202,7 @@ void IntrinsicCodeGeneratorMIPS::VisitStringNewStringFromBytes(HInvoke* invoke) 
 // java.lang.StringFactory.newStringFromChars(int offset, int charCount, char[] data)
 void IntrinsicLocationsBuilderMIPS::VisitStringNewStringFromChars(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainOnly,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -2235,7 +2234,7 @@ void IntrinsicCodeGeneratorMIPS::VisitStringNewStringFromChars(HInvoke* invoke) 
 // java.lang.StringFactory.newStringFromString(String toCopy)
 void IntrinsicLocationsBuilderMIPS::VisitStringNewStringFromString(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainAndSlowPath,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -2284,10 +2283,10 @@ static void GenIsInfinite(LocationSummary* locations,
     // If one, or more, of the exponent bits is zero, then the number can't be infinite.
     if (type == Primitive::kPrimDouble) {
       __ MoveFromFpuHigh(TMP, in);
-      __ LoadConst32(AT, High32Bits(kPositiveInfinityDouble));
+      __ LoadConst32(AT, 0x7FF00000);
     } else {
       __ Mfc1(TMP, in);
-      __ LoadConst32(AT, kPositiveInfinityFloat);
+      __ LoadConst32(AT, 0x7F800000);
     }
     __ Xor(TMP, TMP, AT);
 

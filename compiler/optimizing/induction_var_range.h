@@ -57,18 +57,20 @@ class InductionVarRange {
   explicit InductionVarRange(HInductionVarAnalysis* induction);
 
   /**
-   * Given a context denoted by the first instruction, returns a possibly conservative lower
-   * and upper bound on the instruction's value in the output parameters min_val and max_val,
-   * respectively. The need_finite_test flag denotes if an additional finite-test is needed
-   * to protect the range evaluation inside its loop. The parameter chase_hint defines an
-   * instruction at which chasing may stop. Returns false on failure.
+   * Given a context denoted by the first instruction, returns a possibly conservative
+   * lower and upper bound on the instruction's value in the output parameters min_val
+   * and max_val, respectively. The need_finite_test flag denotes if an additional finite-test
+   * is needed to protect the range evaluation inside its loop. Returns false on failure.
    */
   bool GetInductionRange(HInstruction* context,
                          HInstruction* instruction,
-                         HInstruction* chase_hint,
                          /*out*/ Value* min_val,
                          /*out*/ Value* max_val,
                          /*out*/ bool* needs_finite_test);
+
+  /** Refines the values with induction of next outer loop. Returns true on change. */
+  bool RefineOuter(/*in-out*/ Value* min_val,
+                   /*in-out*/ Value* max_val) const;
 
   /**
    * Returns true if range analysis is able to generate code for the lower and upper
@@ -76,10 +78,10 @@ class InductionVarRange {
    * and need_taken test flags denote if an additional finite-test and/or taken-test
    * are needed to protect the range evaluation inside its loop.
    */
-  bool CanGenerateRange(HInstruction* context,
-                        HInstruction* instruction,
-                        /*out*/ bool* needs_finite_test,
-                        /*out*/ bool* needs_taken_test);
+  bool CanGenerateCode(HInstruction* context,
+                       HInstruction* instruction,
+                       /*out*/ bool* needs_finite_test,
+                       /*out*/ bool* needs_taken_test);
 
   /**
    * Generates the actual code in the HIR for the lower and upper bound expressions on the
@@ -94,42 +96,25 @@ class InductionVarRange {
    *   lower: add x, 0
    *   upper: add x, 5
    *
-   * Precondition: CanGenerateRange() returns true.
+   * Precondition: CanGenerateCode() returns true.
    */
-  void GenerateRange(HInstruction* context,
-                     HInstruction* instruction,
-                     HGraph* graph,
-                     HBasicBlock* block,
-                     /*out*/ HInstruction** lower,
-                     /*out*/ HInstruction** upper);
+  void GenerateRangeCode(HInstruction* context,
+                         HInstruction* instruction,
+                         HGraph* graph,
+                         HBasicBlock* block,
+                         /*out*/ HInstruction** lower,
+                         /*out*/ HInstruction** upper);
 
   /**
    * Generates explicit taken-test for the loop in the given context. Code is generated in
-   * given block and graph. Returns generated taken-test.
+   * given block and graph. The taken-test is returned in parameter test.
    *
-   * Precondition: CanGenerateRange() returns true and needs_taken_test is set.
+   * Precondition: CanGenerateCode() returns true and needs_taken_test is set.
    */
-  HInstruction* GenerateTakenTest(HInstruction* context, HGraph* graph, HBasicBlock* block);
-
-  /**
-   * Returns true if induction analysis is able to generate code for last value of
-   * the given instruction inside the closest enveloping loop.
-   */
-  bool CanGenerateLastValue(HInstruction* instruction);
-
-  /**
-   * Generates last value of the given instruction in the closest enveloping loop.
-   * Code is generated in given block and graph. Returns generated last value.
-   *
-   * Precondition: CanGenerateLastValue() returns true.
-   */
-  HInstruction* GenerateLastValue(HInstruction* instruction, HGraph* graph, HBasicBlock* block);
-
-  /**
-   * Updates all matching fetches with the given replacement in all induction information
-   * that is associated with the given instruction.
-   */
-  void Replace(HInstruction* instruction, HInstruction* fetch, HInstruction* replacement);
+  void GenerateTakenTest(HInstruction* context,
+                         HGraph* graph,
+                         HBasicBlock* block,
+                         /*out*/ HInstruction** taken_test);
 
  private:
   /*
@@ -147,21 +132,11 @@ class InductionVarRange {
    */
   bool IsConstant(HInductionVarAnalysis::InductionInfo* info,
                   ConstantRequest request,
-                  /*out*/ int64_t* value) const;
+                  /*out*/ int64_t *value) const;
 
-  /** Returns whether induction information can be obtained. */
-  bool HasInductionInfo(HInstruction* context,
-                        HInstruction* instruction,
-                        /*out*/ HLoopInformation** loop,
-                        /*out*/ HInductionVarAnalysis::InductionInfo** info,
-                        /*out*/ HInductionVarAnalysis::InductionInfo** trip) const;
-
-  bool HasFetchInLoop(HInductionVarAnalysis::InductionInfo* info) const;
-  bool NeedsTripCount(HInductionVarAnalysis::InductionInfo* info,
-                      /*out*/ int64_t* stride_value) const;
+  bool NeedsTripCount(HInductionVarAnalysis::InductionInfo* info) const;
   bool IsBodyTripCount(HInductionVarAnalysis::InductionInfo* trip) const;
   bool IsUnsafeTripCount(HInductionVarAnalysis::InductionInfo* trip) const;
-  bool IsWellBehavedTripCount(HInductionVarAnalysis::InductionInfo* trip) const;
 
   Value GetLinear(HInductionVarAnalysis::InductionInfo* info,
                   HInductionVarAnalysis::InductionInfo* trip,
@@ -185,19 +160,9 @@ class InductionVarRange {
                HInductionVarAnalysis::InductionInfo* trip,
                bool in_body,
                bool is_min) const;
-  Value GetXor(HInductionVarAnalysis::InductionInfo* info1,
-               HInductionVarAnalysis::InductionInfo* info2) const;
 
-  Value MulRangeAndConstant(int64_t value,
-                            HInductionVarAnalysis::InductionInfo* info,
-                            HInductionVarAnalysis::InductionInfo* trip,
-                            bool in_body,
-                            bool is_min) const;
-  Value DivRangeAndConstant(int64_t value,
-                            HInductionVarAnalysis::InductionInfo* info,
-                            HInductionVarAnalysis::InductionInfo* trip,
-                            bool in_body,
-                            bool is_min) const;
+  Value MulRangeAndConstant(Value v1, Value v2, Value c, bool is_min) const;
+  Value DivRangeAndConstant(Value v1, Value v2, Value c, bool is_min) const;
 
   Value AddValue(Value v1, Value v2) const;
   Value SubValue(Value v1, Value v2) const;
@@ -206,19 +171,23 @@ class InductionVarRange {
   Value MergeVal(Value v1, Value v2, bool is_min) const;
 
   /**
-   * Generates code for lower/upper/taken-test or last value in the HIR. Returns true on
-   * success. With values nullptr, the method can be used to determine if code generation
+   * Returns refined value using induction of next outer loop or the input value if no
+   * further refinement is possible.
+   */
+  Value RefineOuter(Value val, bool is_min) const;
+
+  /**
+   * Generates code for lower/upper/taken-test in the HIR. Returns true on success.
+   * With values nullptr, the method can be used to determine if code generation
    * would be successful without generating actual code yet.
    */
   bool GenerateCode(HInstruction* context,
                     HInstruction* instruction,
-                    bool is_last_val,
                     HGraph* graph,
                     HBasicBlock* block,
                     /*out*/ HInstruction** lower,
                     /*out*/ HInstruction** upper,
                     /*out*/ HInstruction** taken_test,
-                    /*out*/ int64_t* stride_value,
                     /*out*/ bool* needs_finite_test,
                     /*out*/ bool* needs_taken_test) const;
 
@@ -230,15 +199,8 @@ class InductionVarRange {
                     bool in_body,
                     bool is_min) const;
 
-  void ReplaceInduction(HInductionVarAnalysis::InductionInfo* info,
-                        HInstruction* fetch,
-                        HInstruction* replacement);
-
   /** Results of prior induction variable analysis. */
-  HInductionVarAnalysis* induction_analysis_;
-
-  /** Instruction at which chasing may stop. */
-  HInstruction* chase_hint_;
+  HInductionVarAnalysis *induction_analysis_;
 
   friend class HInductionVarAnalysis;
   friend class InductionVarRangeTest;

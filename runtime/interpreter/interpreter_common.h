@@ -979,13 +979,15 @@ NO_RETURN void UnexpectedOpcode(const Instruction* inst, const ShadowFrame& shad
   __attribute__((cold))
   SHARED_REQUIRES(Locks::mutator_lock_);
 
-// Set true if you want TraceExecution invocation before each bytecode execution.
-constexpr bool kTraceExecutionEnabled = false;
+static inline bool TraceExecutionEnabled() {
+  // Return true if you want TraceExecution invocation before each bytecode execution.
+  return false;
+}
 
 static inline void TraceExecution(const ShadowFrame& shadow_frame, const Instruction* inst,
                                   const uint32_t dex_pc)
     SHARED_REQUIRES(Locks::mutator_lock_) {
-  if (kTraceExecutionEnabled) {
+  if (TraceExecutionEnabled()) {
 #define TRACE_LOG std::cerr
     std::ostringstream oss;
     oss << PrettyMethod(shadow_frame.GetMethod())
@@ -997,7 +999,7 @@ static inline void TraceExecution(const ShadowFrame& shadow_frame, const Instruc
       oss << StringPrintf(" vreg%u=0x%08X", i, raw_value);
       if (ref_value != nullptr) {
         if (ref_value->GetClass()->IsStringClass() &&
-            !ref_value->AsString()->IsValueNull()) {
+            ref_value->AsString()->GetValue() != nullptr) {
           oss << "/java.lang.String \"" << ref_value->AsString()->ToModifiedUtf8() << "\"";
         } else {
           oss << "/" << PrettyTypeOf(ref_value);

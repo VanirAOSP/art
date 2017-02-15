@@ -21,42 +21,41 @@
 
 namespace art {
 
-class X86_64InstructionSetFeatures;
-using X86_64FeaturesUniquePtr = std::unique_ptr<const X86_64InstructionSetFeatures>;
-
 // Instruction set features relevant to the X86_64 architecture.
 class X86_64InstructionSetFeatures FINAL : public X86InstructionSetFeatures {
  public:
   // Process a CPU variant string like "atom" or "nehalem" and create InstructionSetFeatures.
-  static X86_64FeaturesUniquePtr FromVariant(const std::string& variant, std::string* error_msg) {
-    return Convert(X86InstructionSetFeatures::FromVariant(variant, error_msg, true));
+  static const X86_64InstructionSetFeatures* FromVariant(const std::string& variant,
+                                                         std::string* error_msg) {
+    return X86InstructionSetFeatures::FromVariant(variant, error_msg, true)
+        ->AsX86_64InstructionSetFeatures();
   }
 
   // Parse a bitmap and create an InstructionSetFeatures.
-  static X86_64FeaturesUniquePtr FromBitmap(uint32_t bitmap) {
-    return Convert(X86InstructionSetFeatures::FromBitmap(bitmap, true));
+  static const X86_64InstructionSetFeatures* FromBitmap(uint32_t bitmap) {
+    return X86InstructionSetFeatures::FromBitmap(bitmap, true)->AsX86_64InstructionSetFeatures();
   }
 
   // Turn C pre-processor #defines into the equivalent instruction set features.
-  static X86_64FeaturesUniquePtr FromCppDefines() {
-    return Convert(X86InstructionSetFeatures::FromCppDefines(true));
+  static const X86_64InstructionSetFeatures* FromCppDefines() {
+    return X86InstructionSetFeatures::FromCppDefines(true)->AsX86_64InstructionSetFeatures();
   }
 
   // Process /proc/cpuinfo and use kRuntimeISA to produce InstructionSetFeatures.
-  static X86_64FeaturesUniquePtr FromCpuInfo() {
-    return Convert(X86InstructionSetFeatures::FromCpuInfo(true));
+  static const X86_64InstructionSetFeatures* FromCpuInfo() {
+    return X86InstructionSetFeatures::FromCpuInfo(true)->AsX86_64InstructionSetFeatures();
   }
 
   // Process the auxiliary vector AT_HWCAP entry and use kRuntimeISA to produce
   // InstructionSetFeatures.
-  static X86_64FeaturesUniquePtr FromHwcap() {
-    return Convert(X86InstructionSetFeatures::FromHwcap(true));
+  static const X86_64InstructionSetFeatures* FromHwcap() {
+    return X86InstructionSetFeatures::FromHwcap(true)->AsX86_64InstructionSetFeatures();
   }
 
   // Use assembly tests of the current runtime (ie kRuntimeISA) to determine the
   // InstructionSetFeatures. This works around kernel bugs in AT_HWCAP and /proc/cpuinfo.
-  static X86_64FeaturesUniquePtr FromAssembly() {
-    return Convert(X86InstructionSetFeatures::FromAssembly(true));
+  static const X86_64InstructionSetFeatures* FromAssembly() {
+    return X86InstructionSetFeatures::FromAssembly(true)->AsX86_64InstructionSetFeatures();
   }
 
   InstructionSet GetInstructionSet() const OVERRIDE {
@@ -67,21 +66,18 @@ class X86_64InstructionSetFeatures FINAL : public X86InstructionSetFeatures {
 
  protected:
   // Parse a string of the form "ssse3" adding these to a new InstructionSetFeatures.
-  std::unique_ptr<const InstructionSetFeatures>
-      AddFeaturesFromSplitString(const std::vector<std::string>& features,
+  const InstructionSetFeatures*
+      AddFeaturesFromSplitString(const bool smp, const std::vector<std::string>& features,
                                  std::string* error_msg) const OVERRIDE {
-    return X86InstructionSetFeatures::AddFeaturesFromSplitString(features, true, error_msg);
+    return X86InstructionSetFeatures::AddFeaturesFromSplitString(smp, features, true, error_msg);
   }
 
  private:
-  X86_64InstructionSetFeatures(bool has_SSSE3, bool has_SSE4_1, bool has_SSE4_2,
-                               bool has_AVX, bool has_AVX2, bool has_POPCNT)
-      : X86InstructionSetFeatures(has_SSSE3, has_SSE4_1, has_SSE4_2, has_AVX,
-                                  has_AVX2, has_POPCNT) {
-  }
-
-  static X86_64FeaturesUniquePtr Convert(X86FeaturesUniquePtr&& in) {
-    return X86_64FeaturesUniquePtr(in.release()->AsX86_64InstructionSetFeatures());
+  X86_64InstructionSetFeatures(bool smp, bool has_SSSE3, bool has_SSE4_1, bool has_SSE4_2,
+                               bool has_AVX, bool has_AVX2, bool prefers_locked_add,
+                               bool has_POPCNT)
+      : X86InstructionSetFeatures(smp, has_SSSE3, has_SSE4_1, has_SSE4_2, has_AVX,
+                                  has_AVX2, prefers_locked_add, has_POPCNT) {
   }
 
   friend class X86InstructionSetFeatures;

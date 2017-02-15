@@ -21,10 +21,12 @@
 #include "jit/jit.h"
 #include "jit/jit_code_cache.h"
 #include "mirror/class-inl.h"
+#include "nth_caller_visitor.h"
 #include "oat_quick_method_header.h"
 #include "runtime.h"
 #include "scoped_thread_state_change.h"
 #include "ScopedUtfChars.h"
+#include "stack.h"
 #include "thread-inl.h"
 
 namespace art {
@@ -150,28 +152,6 @@ extern "C" JNIEXPORT void JNICALL Java_Main_ensureJitCompiled(JNIEnv* env,
       jit->CompileMethod(method, soa.Self(), /* osr */ false);
     }
   }
-}
-
-extern "C" JNIEXPORT int JNICALL Java_Main_getHotnessCounter(JNIEnv* env,
-                                                             jclass,
-                                                             jclass cls,
-                                                             jstring method_name) {
-  jit::Jit* jit = Runtime::Current()->GetJit();
-  if (jit == nullptr) {
-    return 0;
-  }
-
-  ArtMethod* method = nullptr;
-  {
-    ScopedObjectAccess soa(Thread::Current());
-
-    ScopedUtfChars chars(env, method_name);
-    CHECK(chars.c_str() != nullptr);
-    method = soa.Decode<mirror::Class>(cls)->FindDeclaredDirectMethodByName(
-        chars.c_str(), kRuntimePointerSize);
-  }
-
-  return method->GetCounter();
 }
 
 }  // namespace art

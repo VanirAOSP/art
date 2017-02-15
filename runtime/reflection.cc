@@ -28,7 +28,7 @@
 #include "mirror/object_array-inl.h"
 #include "nth_caller_visitor.h"
 #include "scoped_thread_state_change.h"
-#include "stack_reference.h"
+#include "stack.h"
 #include "well_known_classes.h"
 
 namespace art {

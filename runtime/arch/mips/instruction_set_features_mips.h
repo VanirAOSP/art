@@ -21,31 +21,29 @@
 
 namespace art {
 
-class MipsInstructionSetFeatures;
-using MipsFeaturesUniquePtr = std::unique_ptr<const MipsInstructionSetFeatures>;
-
 // Instruction set features relevant to the MIPS architecture.
 class MipsInstructionSetFeatures FINAL : public InstructionSetFeatures {
  public:
   // Process a CPU variant string like "r4000" and create InstructionSetFeatures.
-  static MipsFeaturesUniquePtr FromVariant(const std::string& variant, std::string* error_msg);
+  static const MipsInstructionSetFeatures* FromVariant(const std::string& variant,
+                                                        std::string* error_msg);
 
   // Parse a bitmap and create an InstructionSetFeatures.
-  static MipsFeaturesUniquePtr FromBitmap(uint32_t bitmap);
+  static const MipsInstructionSetFeatures* FromBitmap(uint32_t bitmap);
 
   // Turn C pre-processor #defines into the equivalent instruction set features.
-  static MipsFeaturesUniquePtr FromCppDefines();
+  static const MipsInstructionSetFeatures* FromCppDefines();
 
   // Process /proc/cpuinfo and use kRuntimeISA to produce InstructionSetFeatures.
-  static MipsFeaturesUniquePtr FromCpuInfo();
+  static const MipsInstructionSetFeatures* FromCpuInfo();
 
   // Process the auxiliary vector AT_HWCAP entry and use kRuntimeISA to produce
   // InstructionSetFeatures.
-  static MipsFeaturesUniquePtr FromHwcap();
+  static const MipsInstructionSetFeatures* FromHwcap();
 
   // Use assembly tests of the current runtime (ie kRuntimeISA) to determine the
   // InstructionSetFeatures. This works around kernel bugs in AT_HWCAP and /proc/cpuinfo.
-  static MipsFeaturesUniquePtr FromAssembly();
+  static const MipsInstructionSetFeatures* FromAssembly();
 
   bool Equals(const InstructionSetFeatures* other) const OVERRIDE;
 
@@ -77,31 +75,21 @@ class MipsInstructionSetFeatures FINAL : public InstructionSetFeatures {
 
  protected:
   // Parse a vector of the form "fpu32", "mips2" adding these to a new MipsInstructionSetFeatures.
-  std::unique_ptr<const InstructionSetFeatures>
-      AddFeaturesFromSplitString(const std::vector<std::string>& features,
+  virtual const InstructionSetFeatures*
+      AddFeaturesFromSplitString(const bool smp, const std::vector<std::string>& features,
                                  std::string* error_msg) const OVERRIDE;
 
  private:
-  MipsInstructionSetFeatures(bool fpu_32bit, bool mips_isa_gte2, bool r6)
-      : InstructionSetFeatures(),
-        fpu_32bit_(fpu_32bit),
-        mips_isa_gte2_(mips_isa_gte2),
-        r6_(r6) {
-    // Sanity checks.
-    if (r6) {
-      CHECK(mips_isa_gte2);
-      CHECK(!fpu_32bit);
-    }
-    if (!mips_isa_gte2) {
-      CHECK(fpu_32bit);
-    }
-  }
+  MipsInstructionSetFeatures(bool smp, bool fpu_32bit, bool mips_isa_gte2, bool r6)
+      : InstructionSetFeatures(smp), fpu_32bit_(fpu_32bit),  mips_isa_gte2_(mips_isa_gte2), r6_(r6)
+  {}
 
   // Bitmap positions for encoding features as a bitmap.
   enum {
-    kFpu32Bitfield = 1 << 0,
-    kIsaRevGte2Bitfield = 1 << 1,
-    kR6 = 1 << 2,
+    kSmpBitfield = 1,
+    kFpu32Bitfield = 2,
+    kIsaRevGte2Bitfield = 4,
+    kR6 = 8,
   };
 
   const bool fpu_32bit_;

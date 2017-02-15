@@ -14,9 +14,6 @@
  * limitations under the License.
  */
 
-#include <math.h>
-#include <string.h>
-
 #include "entrypoints/jni/jni_entrypoints.h"
 #include "entrypoints/quick/quick_alloc_entrypoints.h"
 #include "entrypoints/quick/quick_default_externs.h"
@@ -30,8 +27,8 @@
 namespace art {
 
 // Cast entrypoints.
-extern "C" size_t artIsAssignableFromCode(const mirror::Class* klass,
-                                          const mirror::Class* ref_class);
+extern "C" uint32_t artIsAssignableFromCode(const mirror::Class* klass,
+                                            const mirror::Class* ref_class);
 
 
 // Used by soft float.
@@ -100,8 +97,7 @@ void InitEntryPoints(JniEntryPoints* jpoints, QuickEntryPoints* qpoints) {
 
   // Intrinsics
   qpoints->pIndexOf = art_quick_indexof;
-  // The ARM StringCompareTo intrinsic does not call the runtime.
-  qpoints->pStringCompareTo = nullptr;
+  qpoints->pStringCompareTo = art_quick_string_compareto;
   qpoints->pMemcpy = memcpy;
 
   // Read barrier.

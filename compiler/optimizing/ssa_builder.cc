@@ -123,7 +123,8 @@ static void AddDependentInstructionsToWorklist(HInstruction* instruction,
 static bool TypePhiFromInputs(HPhi* phi) {
   Primitive::Type common_type = phi->GetType();
 
-  for (HInstruction* input : phi->GetInputs()) {
+  for (HInputIterator it(phi); !it.Done(); it.Advance()) {
+    HInstruction* input = it.Current();
     if (input->IsPhi() && input->AsPhi()->IsDead()) {
       // Phis are constructed live so if an input is a dead phi, it must have
       // been made dead due to type conflict. Mark this phi conflicting too.
@@ -168,7 +169,8 @@ bool SsaBuilder::TypeInputsOfPhi(HPhi* phi, ArenaVector<HPhi*>* worklist) {
     // or `common_type` is integral and we do not need to retype ambiguous inputs
     // because they are always constructed with the integral type candidate.
     if (kIsDebugBuild) {
-      for (HInstruction* input : phi->GetInputs()) {
+      for (size_t i = 0, e = phi->InputCount(); i < e; ++i) {
+        HInstruction* input = phi->InputAt(i);
         if (common_type == Primitive::kPrimVoid) {
           DCHECK(input->IsPhi() && input->GetType() == Primitive::kPrimVoid);
         } else {
@@ -181,9 +183,8 @@ bool SsaBuilder::TypeInputsOfPhi(HPhi* phi, ArenaVector<HPhi*>* worklist) {
     return true;
   } else {
     DCHECK(common_type == Primitive::kPrimNot || Primitive::IsFloatingPointType(common_type));
-    HInputsRef inputs = phi->GetInputs();
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      HInstruction* input = inputs[i];
+    for (size_t i = 0, e = phi->InputCount(); i < e; ++i) {
+      HInstruction* input = phi->InputAt(i);
       if (input->GetType() != common_type) {
         // Input type does not match phi's type. Try to retype the input or
         // generate a suitably typed equivalent.
@@ -614,14 +615,11 @@ HPhi* SsaBuilder::GetFloatDoubleOrReferenceEquivalentOfPhi(HPhi* phi, Primitive:
       || (next->AsPhi()->GetRegNumber() != phi->GetRegNumber())
       || (next->GetType() != type)) {
     ArenaAllocator* allocator = graph_->GetArena();
-    HInputsRef inputs = phi->GetInputs();
-    HPhi* new_phi =
-        new (allocator) HPhi(allocator, phi->GetRegNumber(), inputs.size(), type);
-    // Copy the inputs. Note that the graph may not be correctly typed
-    // by doing this copy, but the type propagation phase will fix it.
-    ArrayRef<HUserRecord<HInstruction*>> new_input_records = new_phi->GetInputRecords();
-    for (size_t i = 0; i < inputs.size(); ++i) {
-      new_input_records[i] = HUserRecord<HInstruction*>(inputs[i]);
+    HPhi* new_phi = new (allocator) HPhi(allocator, phi->GetRegNumber(), phi->InputCount(), type);
+    for (size_t i = 0, e = phi->InputCount(); i < e; ++i) {
+      // Copy the inputs. Note that the graph may not be correctly typed
+      // by doing this copy, but the type propagation phase will fix it.
+      new_phi->SetRawInputAt(i, phi->InputAt(i));
     }
     phi->GetBlock()->InsertPhiAfter(new_phi, phi);
     DCHECK(new_phi->IsLive());

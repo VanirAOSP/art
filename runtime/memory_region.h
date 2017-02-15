@@ -124,35 +124,11 @@ class MemoryRegion FINAL : public ValueObject {
   // The bit at the smallest offset is the least significant bit in the
   // loaded value.  `length` must not be larger than the number of bits
   // contained in the return value (32).
-  ALWAYS_INLINE uint32_t LoadBits(uintptr_t bit_offset, size_t length) const {
-    DCHECK_LE(length, BitSizeOf<uint32_t>());
-    DCHECK_LE(bit_offset + length, size_in_bits());
-    if (UNLIKELY(length == 0)) {
-      // Do not touch any memory if the range is empty.
-      return 0;
-    }
-    const uint8_t* address = start() + bit_offset / kBitsPerByte;
-    const uint32_t shift = bit_offset & (kBitsPerByte - 1);
-    // Load the value (reading only the strictly needed bytes).
-    const uint32_t load_bit_count = shift + length;
-    uint32_t value = address[0] >> shift;
-    if (load_bit_count > 8) {
-      value |= static_cast<uint32_t>(address[1]) << (8 - shift);
-      if (load_bit_count > 16) {
-        value |= static_cast<uint32_t>(address[2]) << (16 - shift);
-        if (load_bit_count > 24) {
-          value |= static_cast<uint32_t>(address[3]) << (24 - shift);
-          if (load_bit_count > 32) {
-            value |= static_cast<uint32_t>(address[4]) << (32 - shift);
-          }
-        }
-      }
-    }
-    // Clear unwanted most significant bits.
-    uint32_t clear_bit_count = BitSizeOf(value) - length;
-    value = (value << clear_bit_count) >> clear_bit_count;
+  uint32_t LoadBits(uintptr_t bit_offset, size_t length) const {
+    CHECK_LE(length, sizeof(uint32_t) * kBitsPerByte);
+    uint32_t value = 0u;
     for (size_t i = 0; i < length; ++i) {
-      DCHECK_EQ((value >> i) & 1, LoadBit(bit_offset + i));
+      value |= LoadBit(bit_offset + i) << i;
     }
     return value;
   }
@@ -161,7 +137,13 @@ class MemoryRegion FINAL : public ValueObject {
   // `bit_offset`.  The bit at the smallest offset is the least significant
   // bit of the stored `value`.  `value` must not be larger than `length`
   // bits.
-  void StoreBits(uintptr_t bit_offset, uint32_t value, size_t length);
+  void StoreBits(uintptr_t bit_offset, uint32_t value, size_t length) {
+    CHECK_LE(value, MaxInt<uint32_t>(length));
+    for (size_t i = 0; i < length; ++i) {
+      bool ith_bit = value & (1 << i);
+      StoreBit(bit_offset + i, ith_bit);
+    }
+  }
 
   void CopyFrom(size_t offset, const MemoryRegion& from) const;
 
@@ -181,8 +163,8 @@ class MemoryRegion FINAL : public ValueObject {
  private:
   template<typename T>
   ALWAYS_INLINE T* ComputeInternalPointer(size_t offset) const {
-    DCHECK_GE(size(), sizeof(T));
-    CHECK_LE(offset + sizeof(T), size());
+    CHECK_GE(size(), sizeof(T));
+    CHECK_LE(offset, size() - sizeof(T));
     return reinterpret_cast<T*>(start() + offset);
   }
 

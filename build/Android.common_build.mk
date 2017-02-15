@@ -76,6 +76,18 @@ ifeq ($(ART_TEST_DEBUG_GC),true)
 endif
 
 #
+# Used to enable JIT
+#
+ART_JIT := false
+ifneq ($(wildcard art/JIT_ART),)
+$(info Enabling ART_JIT because of existence of art/JIT_ART)
+ART_JIT := true
+endif
+ifeq ($(WITH_ART_JIT), true)
+ART_JIT := true
+endif
+
+#
 # Used to change the default GC. Valid values are CMS, SS, GSS. The default is CMS.
 #
 ART_DEFAULT_GC_TYPE ?= CMS
@@ -288,9 +300,10 @@ else
   art_cflags += -DIMT_SIZE=64
 endif
 
-ART_HEAP_POISONING := true
-art_cflags += -DART_HEAP_POISONING=1
-art_asflags += -DART_HEAP_POISONING=1
+ifeq ($(ART_HEAP_POISONING),true)
+  art_cflags += -DART_HEAP_POISONING=1
+  art_asflags += -DART_HEAP_POISONING=1
+endif
 
 #
 # Used to change the read barrier type. Valid values are BAKER, BROOKS, TABLELOOKUP.

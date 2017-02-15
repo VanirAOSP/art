@@ -21,35 +21,31 @@
 
 namespace art {
 
-class ArmInstructionSetFeatures;
-using ArmFeaturesUniquePtr = std::unique_ptr<const ArmInstructionSetFeatures>;
-
 // Instruction set features relevant to the ARM architecture.
 class ArmInstructionSetFeatures FINAL : public InstructionSetFeatures {
  public:
   // Process a CPU variant string like "krait" or "cortex-a15" and create InstructionSetFeatures.
-  static ArmFeaturesUniquePtr FromVariant(const std::string& variant, std::string* error_msg);
+  static const ArmInstructionSetFeatures* FromVariant(const std::string& variant,
+                                                      std::string* error_msg);
 
   // Parse a bitmap and create an InstructionSetFeatures.
-  static ArmFeaturesUniquePtr FromBitmap(uint32_t bitmap);
+  static const ArmInstructionSetFeatures* FromBitmap(uint32_t bitmap);
 
   // Turn C pre-processor #defines into the equivalent instruction set features.
-  static ArmFeaturesUniquePtr FromCppDefines();
+  static const ArmInstructionSetFeatures* FromCppDefines();
 
   // Process /proc/cpuinfo and use kRuntimeISA to produce InstructionSetFeatures.
-  static ArmFeaturesUniquePtr FromCpuInfo();
+  static const ArmInstructionSetFeatures* FromCpuInfo();
 
   // Process the auxiliary vector AT_HWCAP entry and use kRuntimeISA to produce
   // InstructionSetFeatures.
-  static ArmFeaturesUniquePtr FromHwcap();
+  static const ArmInstructionSetFeatures* FromHwcap();
 
   // Use assembly tests of the current runtime (ie kRuntimeISA) to determine the
   // InstructionSetFeatures. This works around kernel bugs in AT_HWCAP and /proc/cpuinfo.
-  static ArmFeaturesUniquePtr FromAssembly();
+  static const ArmInstructionSetFeatures* FromAssembly();
 
   bool Equals(const InstructionSetFeatures* other) const OVERRIDE;
-
-  bool HasAtLeast(const InstructionSetFeatures* other) const OVERRIDE;
 
   InstructionSet GetInstructionSet() const OVERRIDE {
     return kArm;
@@ -71,38 +67,29 @@ class ArmInstructionSetFeatures FINAL : public InstructionSetFeatures {
     return has_atomic_ldrd_strd_;
   }
 
-  // Are ARMv8-A instructions available?
-  bool HasARMv8AInstructions() const {
-    return has_armv8a_;
-  }
-
   virtual ~ArmInstructionSetFeatures() {}
 
  protected:
   // Parse a vector of the form "div", "lpae" adding these to a new ArmInstructionSetFeatures.
-  std::unique_ptr<const InstructionSetFeatures>
-      AddFeaturesFromSplitString(const std::vector<std::string>& features,
+  const InstructionSetFeatures*
+      AddFeaturesFromSplitString(const bool smp, const std::vector<std::string>& features,
                                  std::string* error_msg) const OVERRIDE;
 
  private:
-  ArmInstructionSetFeatures(bool has_div,
-                            bool has_atomic_ldrd_strd,
-                            bool has_armv8a)
-      : InstructionSetFeatures(),
-        has_div_(has_div),
-        has_atomic_ldrd_strd_(has_atomic_ldrd_strd),
-        has_armv8a_(has_armv8a) {}
+  ArmInstructionSetFeatures(bool smp, bool has_div, bool has_atomic_ldrd_strd)
+      : InstructionSetFeatures(smp),
+        has_div_(has_div), has_atomic_ldrd_strd_(has_atomic_ldrd_strd) {
+  }
 
   // Bitmap positions for encoding features as a bitmap.
   enum {
-    kDivBitfield = 1 << 0,
-    kAtomicLdrdStrdBitfield = 1 << 1,
-    kARMv8A = 1 << 2,
+    kSmpBitfield = 1,
+    kDivBitfield = 2,
+    kAtomicLdrdStrdBitfield = 4,
   };
 
   const bool has_div_;
   const bool has_atomic_ldrd_strd_;
-  const bool has_armv8a_;
 
   DISALLOW_COPY_AND_ASSIGN(ArmInstructionSetFeatures);
 };

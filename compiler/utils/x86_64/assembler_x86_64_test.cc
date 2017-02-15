@@ -1498,11 +1498,9 @@ std::string buildframe_test_fn(AssemblerX86_64Test::Base* assembler_test ATTRIBU
   // TODO: more interesting spill registers / entry spills.
 
   // Two random spill regs.
-  const ManagedRegister raw_spill_regs[] = {
-      ManagedFromCpu(x86_64::R10),
-      ManagedFromCpu(x86_64::RSI)
-  };
-  ArrayRef<const ManagedRegister> spill_regs(raw_spill_regs);
+  std::vector<ManagedRegister> spill_regs;
+  spill_regs.push_back(ManagedFromCpu(x86_64::R10));
+  spill_regs.push_back(ManagedFromCpu(x86_64::RSI));
 
   // Three random entry spills.
   ManagedRegisterEntrySpills entry_spills;
@@ -1545,11 +1543,9 @@ std::string removeframe_test_fn(AssemblerX86_64Test::Base* assembler_test ATTRIB
   // TODO: more interesting spill registers / entry spills.
 
   // Two random spill regs.
-  const ManagedRegister raw_spill_regs[] = {
-      ManagedFromCpu(x86_64::R10),
-      ManagedFromCpu(x86_64::RSI)
-  };
-  ArrayRef<const ManagedRegister> spill_regs(raw_spill_regs);
+  std::vector<ManagedRegister> spill_regs;
+  spill_regs.push_back(ManagedFromCpu(x86_64::R10));
+  spill_regs.push_back(ManagedFromCpu(x86_64::RSI));
 
   size_t frame_size = 10 * kStackAlignment;
   assembler->RemoveFrame(10 * kStackAlignment, spill_regs);

@@ -1106,18 +1106,6 @@ void Arm32Assembler::vpopd(DRegister reg, int nregs, Condition cond) {
 }
 
 
-void Arm32Assembler::vldmiad(Register, DRegister, int, Condition) {
-  LOG(FATAL) << "Unimplemented.";
-  UNREACHABLE();
-}
-
-
-void Arm32Assembler::vstmiad(Register, DRegister, int, Condition) {
-  LOG(FATAL) << "Unimplemented.";
-  UNREACHABLE();
-}
-
-
 void Arm32Assembler::EmitVPushPop(uint32_t reg, int nregs, bool push, bool dbl, Condition cond) {
   CHECK_NE(cond, kNoCondition);
   CHECK_GT(nregs, 0);
@@ -1273,31 +1261,6 @@ void Arm32Assembler::vmstat(Condition cond) {  // VMRS APSR_nzcv, FPSCR
       B27 | B26 | B25 | B23 | B22 | B21 | B20 | B16 |
       (static_cast<int32_t>(PC)*B12) |
       B11 | B9 | B4;
-  Emit(encoding);
-}
-
-void Arm32Assembler::vcntd(DRegister dd, DRegister dm) {
-  uint32_t encoding = (B31 | B30 | B29 | B28 | B25 | B24 | B23 | B21 | B20) |
-    ((static_cast<int32_t>(dd) >> 4) * B22) |
-    ((static_cast<uint32_t>(dd) & 0xf) * B12) |
-    (B10 | B8) |
-    ((static_cast<int32_t>(dm) >> 4) * B5) |
-    (static_cast<uint32_t>(dm) & 0xf);
-
-  Emit(encoding);
-}
-
-void Arm32Assembler::vpaddld(DRegister dd, DRegister dm, int32_t size, bool is_unsigned) {
-  CHECK(size == 8 || size == 16 || size == 32) << size;
-  uint32_t encoding = (B31 | B30 | B29 | B28 | B25 | B24 | B23 | B21 | B20) |
-    ((static_cast<uint32_t>(size >> 4) & 0x3) * B18) |
-    ((static_cast<int32_t>(dd) >> 4) * B22) |
-    ((static_cast<uint32_t>(dd) & 0xf) * B12) |
-    (B9) |
-    (is_unsigned ? B7 : 0) |
-    ((static_cast<int32_t>(dm) >> 4) * B5) |
-    (static_cast<uint32_t>(dm) & 0xf);
-
   Emit(encoding);
 }
 
@@ -1498,34 +1461,6 @@ void Arm32Assembler::LoadImmediate(Register rd, int32_t value, Condition cond) {
   }
 }
 
-void Arm32Assembler::LoadDImmediate(DRegister dd, double value, Condition cond) {
-  if (!vmovd(dd, value, cond)) {
-    uint64_t int_value = bit_cast<uint64_t, double>(value);
-    if (int_value == bit_cast<uint64_t, double>(0.0)) {
-      // 0.0 is quite common, so we special case it by loading
-      // 2.0 in `dd` and then subtracting it.
-      bool success = vmovd(dd, 2.0, cond);
-      CHECK(success);
-      vsubd(dd, dd, dd, cond);
-    } else {
-      if (dd < 16) {
-        // Note: Depending on the particular CPU, this may cause register
-        // forwarding hazard, negatively impacting the performance.
-        SRegister low = static_cast<SRegister>(dd << 1);
-        SRegister high = static_cast<SRegister>(low + 1);
-        LoadSImmediate(low, bit_cast<float, uint32_t>(Low32Bits(int_value)), cond);
-        if (High32Bits(int_value) == Low32Bits(int_value)) {
-          vmovs(high, low);
-        } else {
-          LoadSImmediate(high, bit_cast<float, uint32_t>(High32Bits(int_value)), cond);
-        }
-      } else {
-        LOG(FATAL) << "Unimplemented loading of double into a D register "
-                   << "that cannot be split into two S registers";
-      }
-    }
-  }
-}
 
 // Implementation note: this method must emit at most one instruction when
 // Address::CanHoldLoadOffsetArm.

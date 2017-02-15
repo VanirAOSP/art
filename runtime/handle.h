@@ -20,10 +20,8 @@
 #include "base/casts.h"
 #include "base/logging.h"
 #include "base/macros.h"
-#include "base/mutex.h"
 #include "base/value_object.h"
-#include "jni.h"
-#include "stack_reference.h"
+#include "stack.h"
 
 namespace art {
 

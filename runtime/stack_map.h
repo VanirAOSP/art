@@ -94,20 +94,31 @@ class DexRegisterLocation {
     // Entries with no location are not stored and do not need own marker.
     kNone = static_cast<uint8_t>(-1),
 
-    kLastLocationKind = kConstantLargeValue,
-
-    // Ordering of the enum matters, all locations less or equal to
-    // kLastShortLocationKind have IsShortLocationKind return true.
-    kLastShortLocationKind = kConstant,
+    kLastLocationKind = kConstantLargeValue
   };
 
   static_assert(
       sizeof(Kind) == 1u,
       "art::DexRegisterLocation::Kind has a size different from one byte.");
 
-  ALWAYS_INLINE static bool IsShortLocationKind(Kind kind) {
-    DCHECK(kind != Kind::kNone);
-    return kind <= Kind::kLastShortLocationKind;
+  static bool IsShortLocationKind(Kind kind) {
+    switch (kind) {
+      case Kind::kInStack:
+      case Kind::kInRegister:
+      case Kind::kInRegisterHigh:
+      case Kind::kInFpuRegister:
+      case Kind::kInFpuRegisterHigh:
+      case Kind::kConstant:
+        return true;
+
+      case Kind::kInStackLargeOffset:
+      case Kind::kConstantLargeValue:
+        return false;
+
+      case Kind::kNone:
+        LOG(FATAL) << "Unexpected location kind";
+    }
+    UNREACHABLE();
   }
 
   // Convert `kind` to a "surface" kind, i.e. one that doesn't include
@@ -653,7 +664,32 @@ struct FieldEncoding {
 
   ALWAYS_INLINE int32_t Load(const MemoryRegion& region) const {
     DCHECK_LE(end_offset_, region.size_in_bits());
-    return static_cast<int32_t>(region.LoadBits(start_offset_, BitSize())) + min_value_;
+    const size_t bit_count = BitSize();
+    if (bit_count == 0) {
+      // Do not touch any memory if the range is empty.
+      return min_value_;
+    }
+    uint8_t* address = region.start() + start_offset_ / kBitsPerByte;
+    const uint32_t shift = start_offset_ & (kBitsPerByte - 1);
+    // Load the value (reading only the strictly needed bytes).
+    const uint32_t load_bit_count = shift + bit_count;
+    uint32_t value = *address++ >> shift;
+    if (load_bit_count > 8) {
+      value |= static_cast<uint32_t>(*address++) << (8 - shift);
+      if (load_bit_count > 16) {
+        value |= static_cast<uint32_t>(*address++) << (16 - shift);
+        if (load_bit_count > 24) {
+          value |= static_cast<uint32_t>(*address++) << (24 - shift);
+          if (load_bit_count > 32) {
+            value |= static_cast<uint32_t>(*address++) << (32 - shift);
+          }
+        }
+      }
+    }
+    // Clear unwanted most significant bits.
+    uint32_t clear_bit_count = 32 - bit_count;
+    value = (value << clear_bit_count) >> clear_bit_count;
+    return value + min_value_;
   }
 
   ALWAYS_INLINE void Store(MemoryRegion region, int32_t value) const {

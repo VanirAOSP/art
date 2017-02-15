@@ -488,7 +488,8 @@ JValue ExecuteSwitchImpl(Thread* self, const DexFile::CodeItem* code_item,
         if (LIKELY(c != nullptr)) {
           if (UNLIKELY(c->IsStringClass())) {
             gc::AllocatorType allocator_type = Runtime::Current()->GetHeap()->GetCurrentAllocator();
-            obj = mirror::String::AllocEmptyString<true>(self, allocator_type);
+            mirror::SetStringCountVisitor visitor(0);
+            obj = String::Alloc<true>(self, 0, allocator_type, visitor);
           } else {
             obj = AllocObjectFromCode<do_access_check, true>(
               inst->VRegB_21c(), shadow_frame.GetMethod(), self,
@@ -632,8 +633,10 @@ JValue ExecuteSwitchImpl(Thread* self, const DexFile::CodeItem* code_item,
         break;
       }
 
+#if defined(__clang__)
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wfloat-equal"
+#endif
 
       case Instruction::CMPL_FLOAT: {
         PREAMBLE();
@@ -701,7 +704,9 @@ JValue ExecuteSwitchImpl(Thread* self, const DexFile::CodeItem* code_item,
         break;
       }
 
+#if defined(__clang__)
 #pragma clang diagnostic pop
+#endif
 
       case Instruction::CMP_LONG: {
         PREAMBLE();

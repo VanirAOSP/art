@@ -357,7 +357,7 @@ class TypeCheckSlowPathMIPS64 : public SlowPathCodeMIPS64 {
                                     dex_pc,
                                     this);
       CheckEntrypointTypes<
-          kQuickInstanceofNonTrivial, size_t, const mirror::Class*, const mirror::Class*>();
+          kQuickInstanceofNonTrivial, uint32_t, const mirror::Class*, const mirror::Class*>();
       Primitive::Type ret_type = instruction_->GetType();
       Location ret_loc = calling_convention.GetReturnLocation(ret_type);
       mips64_codegen->MoveLocation(locations->Out(), ret_loc, ret_type);
@@ -1426,7 +1426,7 @@ void LocationsBuilderMIPS64::VisitArrayLength(HArrayLength* instruction) {
 
 void InstructionCodeGeneratorMIPS64::VisitArrayLength(HArrayLength* instruction) {
   LocationSummary* locations = instruction->GetLocations();
-  uint32_t offset = CodeGenerator::GetArrayLengthOffset(instruction);
+  uint32_t offset = mirror::Array::LengthOffset().Uint32Value();
   GpuRegister obj = locations->InAt(0).AsRegister<GpuRegister>();
   GpuRegister out = locations->Out().AsRegister<GpuRegister>();
   __ LoadFromOffset(kLoadWord, out, obj, offset);
@@ -1437,7 +1437,7 @@ void LocationsBuilderMIPS64::VisitArraySet(HArraySet* instruction) {
   bool needs_runtime_call = instruction->NeedsTypeCheck();
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(
       instruction,
-      needs_runtime_call ? LocationSummary::kCallOnMainOnly : LocationSummary::kNoCall);
+      needs_runtime_call ? LocationSummary::kCall : LocationSummary::kNoCall);
   if (needs_runtime_call) {
     InvokeRuntimeCallingConvention calling_convention;
     locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -3299,7 +3299,7 @@ void InstructionCodeGeneratorMIPS64::VisitLongConstant(HLongConstant* constant A
 
 void LocationsBuilderMIPS64::VisitMonitorOperation(HMonitorOperation* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
 }
@@ -3426,7 +3426,7 @@ void InstructionCodeGeneratorMIPS64::VisitNeg(HNeg* instruction) {
 
 void LocationsBuilderMIPS64::VisitNewArray(HNewArray* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->AddTemp(Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
   locations->SetOut(calling_convention.GetReturnLocation(Primitive::kPrimNot));
@@ -3447,7 +3447,7 @@ void InstructionCodeGeneratorMIPS64::VisitNewArray(HNewArray* instruction) {
 
 void LocationsBuilderMIPS64::VisitNewInstance(HNewInstance* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   if (instruction->IsStringAlloc()) {
     locations->AddTemp(Location::RegisterLocation(kMethodRegisterArgument));
@@ -3594,7 +3594,7 @@ void InstructionCodeGeneratorMIPS64::VisitCurrentMethod(HCurrentMethod* instruct
 
 void LocationsBuilderMIPS64::VisitPhi(HPhi* instruction) {
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(instruction);
-  for (size_t i = 0, e = locations->GetInputCount(); i < e; ++i) {
+  for (size_t i = 0, e = instruction->InputCount(); i < e; ++i) {
     locations->SetInAt(i, Location::Any());
   }
   locations->SetOut(Location::Any());
@@ -3607,8 +3607,7 @@ void InstructionCodeGeneratorMIPS64::VisitPhi(HPhi* instruction ATTRIBUTE_UNUSED
 void LocationsBuilderMIPS64::VisitRem(HRem* rem) {
   Primitive::Type type = rem->GetResultType();
   LocationSummary::CallKind call_kind =
-      Primitive::IsFloatingPointType(type) ? LocationSummary::kCallOnMainOnly
-                                           : LocationSummary::kNoCall;
+      Primitive::IsFloatingPointType(type) ? LocationSummary::kCall : LocationSummary::kNoCall;
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(rem, call_kind);
 
   switch (type) {
@@ -3821,7 +3820,7 @@ void InstructionCodeGeneratorMIPS64::VisitSuspendCheck(HSuspendCheck* instructio
 
 void LocationsBuilderMIPS64::VisitThrow(HThrow* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
 }

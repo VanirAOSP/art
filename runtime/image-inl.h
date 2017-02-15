@@ -21,7 +21,6 @@
 
 #include "art_method.h"
 #include "imtable.h"
-#include "read_barrier-inl.h"
 
 namespace art {
 

@@ -54,6 +54,19 @@ bool IntrinsicLocationsBuilderX86_64::TryDispatch(HInvoke* invoke) {
   if (res == nullptr) {
     return false;
   }
+  if (kEmitCompilerReadBarrier && res->CanCall()) {
+    // Generating an intrinsic for this HInvoke may produce an
+    // IntrinsicSlowPathX86_64 slow path.  Currently this approach
+    // does not work when using read barriers, as the emitted
+    // calling sequence will make use of another slow path
+    // (ReadBarrierForRootSlowPathX86_64 for HInvokeStaticOrDirect,
+    // ReadBarrierSlowPathX86_64 for HInvokeVirtual).  So we bail
+    // out in this case.
+    //
+    // TODO: Find a way to have intrinsics work with read barriers.
+    invoke->SetLocations(nullptr);
+    return false;
+  }
   return res->Intrinsified();
 }
 
@@ -526,7 +539,7 @@ static void CreateSSE41FPToFPLocations(ArenaAllocator* arena,
 
   // We have to fall back to a call to the intrinsic.
   LocationSummary* locations = new (arena) LocationSummary(invoke,
-                                                           LocationSummary::kCallOnMainOnly);
+                                                           LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetFpuRegisterAt(0)));
   locations->SetOut(Location::FpuRegisterLocation(XMM0));
@@ -588,7 +601,7 @@ static void CreateSSE41FPToIntLocations(ArenaAllocator* arena,
 
   // We have to fall back to a call to the intrinsic.
   LocationSummary* locations = new (arena) LocationSummary(invoke,
-                                                           LocationSummary::kCallOnMainOnly);
+                                                           LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetFpuRegisterAt(0)));
   locations->SetOut(Location::RegisterLocation(RAX));
@@ -699,7 +712,7 @@ void IntrinsicCodeGeneratorX86_64::VisitMathRoundDouble(HInvoke* invoke) {
 static void CreateFPToFPCallLocations(ArenaAllocator* arena,
                                       HInvoke* invoke) {
   LocationSummary* locations = new (arena) LocationSummary(invoke,
-                                                           LocationSummary::kCallOnMainOnly,
+                                                           LocationSummary::kCall,
                                                            kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::FpuRegisterLocation(calling_convention.GetFpuRegisterAt(0)));
@@ -839,7 +852,7 @@ void IntrinsicCodeGeneratorX86_64::VisitMathTanh(HInvoke* invoke) {
 static void CreateFPFPToFPCallLocations(ArenaAllocator* arena,
                                         HInvoke* invoke) {
   LocationSummary* locations = new (arena) LocationSummary(invoke,
-                                                           LocationSummary::kCallOnMainOnly,
+                                                           LocationSummary::kCall,
                                                            kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::FpuRegisterLocation(calling_convention.GetFpuRegisterAt(0)));
@@ -1109,20 +1122,14 @@ void IntrinsicCodeGeneratorX86_64::VisitSystemArrayCopyChar(HInvoke* invoke) {
 
 
 void IntrinsicLocationsBuilderX86_64::VisitSystemArrayCopy(HInvoke* invoke) {
-  // TODO(rpl): Implement read barriers in the SystemArrayCopy
-  // intrinsic and re-enable it (b/29516905).
-  if (kEmitCompilerReadBarrier) {
-    return;
-  }
-
   CodeGenerator::CreateSystemArrayCopyLocationSummary(invoke);
 }
 
+// TODO: Implement read barriers in the SystemArrayCopy intrinsic.
+// Note that this code path is not used (yet) because we do not
+// intrinsify methods that can go into the IntrinsicSlowPathX86_64
+// slow path.
 void IntrinsicCodeGeneratorX86_64::VisitSystemArrayCopy(HInvoke* invoke) {
-  // TODO(rpl): Implement read barriers in the SystemArrayCopy
-  // intrinsic and re-enable it (b/29516905).
-  DCHECK(!kEmitCompilerReadBarrier);
-
   X86_64Assembler* assembler = GetAssembler();
   LocationSummary* locations = invoke->GetLocations();
 
@@ -1351,7 +1358,7 @@ void IntrinsicCodeGeneratorX86_64::VisitSystemArrayCopy(HInvoke* invoke) {
 
 void IntrinsicLocationsBuilderX86_64::VisitStringCompareTo(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainAndSlowPath,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -1412,22 +1419,17 @@ void IntrinsicCodeGeneratorX86_64::VisitStringEquals(HInvoke* invoke) {
   // Note that the null check must have been done earlier.
   DCHECK(!invoke->CanDoImplicitNullCheckOn(invoke->InputAt(0)));
 
-  StringEqualsOptimizations optimizations(invoke);
-  if (!optimizations.GetArgumentNotNull()) {
-    // Check if input is null, return false if it is.
-    __ testl(arg, arg);
-    __ j(kEqual, &return_false);
-  }
+  // Check if input is null, return false if it is.
+  __ testl(arg, arg);
+  __ j(kEqual, &return_false);
 
-  if (!optimizations.GetArgumentIsString()) {
-    // Instanceof check for the argument by comparing class fields.
-    // All string objects must have the same type since String cannot be subclassed.
-    // Receiver must be a string object, so its class field is equal to all strings' class fields.
-    // If the argument is a string object, its class field must be equal to receiver's class field.
-    __ movl(rcx, Address(str, class_offset));
-    __ cmpl(rcx, Address(arg, class_offset));
-    __ j(kNotEqual, &return_false);
-  }
+  // Instanceof check for the argument by comparing class fields.
+  // All string objects must have the same type since String cannot be subclassed.
+  // Receiver must be a string object, so its class field is equal to all strings' class fields.
+  // If the argument is a string object, its class field must be equal to receiver's class field.
+  __ movl(rcx, Address(str, class_offset));
+  __ cmpl(rcx, Address(arg, class_offset));
+  __ j(kNotEqual, &return_false);
 
   // Reference equality check, return true if same reference.
   __ cmpl(str, arg);
@@ -1518,11 +1520,10 @@ static void GenerateStringIndexOf(HInvoke* invoke,
   DCHECK_EQ(out.AsRegister(), RDI);
 
   // Check for code points > 0xFFFF. Either a slow-path check when we don't know statically,
-  // or directly dispatch for a large constant, or omit slow-path for a small constant or a char.
+  // or directly dispatch if we have a constant.
   SlowPathCode* slow_path = nullptr;
-  HInstruction* code_point = invoke->InputAt(1);
-  if (code_point->IsIntConstant()) {
-    if (static_cast<uint32_t>(code_point->AsIntConstant()->GetValue()) >
+  if (invoke->InputAt(1)->IsIntConstant()) {
+    if (static_cast<uint32_t>(invoke->InputAt(1)->AsIntConstant()->GetValue()) >
     std::numeric_limits<uint16_t>::max()) {
       // Always needs the slow-path. We could directly dispatch to it, but this case should be
       // rare, so for simplicity just put the full slow-path down and branch unconditionally.
@@ -1532,7 +1533,7 @@ static void GenerateStringIndexOf(HInvoke* invoke,
       __ Bind(slow_path->GetExitLabel());
       return;
     }
-  } else if (code_point->GetType() != Primitive::kPrimChar) {
+  } else {
     __ cmpl(search_value, Immediate(std::numeric_limits<uint16_t>::max()));
     slow_path = new (allocator) IntrinsicSlowPathX86_64(invoke);
     codegen->AddSlowPath(slow_path);
@@ -1625,7 +1626,7 @@ void IntrinsicCodeGeneratorX86_64::VisitStringIndexOfAfter(HInvoke* invoke) {
 
 void IntrinsicLocationsBuilderX86_64::VisitStringNewStringFromBytes(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainAndSlowPath,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -1654,7 +1655,7 @@ void IntrinsicCodeGeneratorX86_64::VisitStringNewStringFromBytes(HInvoke* invoke
 
 void IntrinsicLocationsBuilderX86_64::VisitStringNewStringFromChars(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainOnly,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -1680,7 +1681,7 @@ void IntrinsicCodeGeneratorX86_64::VisitStringNewStringFromChars(HInvoke* invoke
 
 void IntrinsicLocationsBuilderX86_64::VisitStringNewStringFromString(HInvoke* invoke) {
   LocationSummary* locations = new (arena_) LocationSummary(invoke,
-                                                            LocationSummary::kCallOnMainAndSlowPath,
+                                                            LocationSummary::kCall,
                                                             kIntrinsified);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
@@ -1987,8 +1988,7 @@ static void CreateIntIntIntToIntLocations(ArenaAllocator* arena,
   locations->SetInAt(0, Location::NoLocation());        // Unused receiver.
   locations->SetInAt(1, Location::RequiresRegister());
   locations->SetInAt(2, Location::RequiresRegister());
-  locations->SetOut(Location::RequiresRegister(),
-                    can_call ? Location::kOutputOverlap : Location::kNoOutputOverlap);
+  locations->SetOut(Location::RequiresRegister());
   if (type == Primitive::kPrimNot && kEmitCompilerReadBarrier && kUseBakerReadBarrier) {
     // We need a temporary register for the read barrier marking slow
     // path in InstructionCodeGeneratorX86_64::GenerateArrayLoadWithBakerReadBarrier.
@@ -2175,9 +2175,9 @@ void IntrinsicLocationsBuilderX86_64::VisitUnsafeCASObject(HInvoke* invoke) {
   // The UnsafeCASObject intrinsic is missing a read barrier, and
   // therefore sometimes does not work as expected (b/25883050).
   // Turn it off temporarily as a quick fix, until the read barrier is
-  // implemented (see TODO in GenCAS).
+  // implemented.
   //
-  // TODO(rpl): Implement read barrier support in GenCAS and re-enable
+  // TODO(rpl): Implement a read barrier in GenCAS below and re-enable
   // this intrinsic.
   if (kEmitCompilerReadBarrier) {
     return;
@@ -2293,15 +2293,6 @@ void IntrinsicCodeGeneratorX86_64::VisitUnsafeCASLong(HInvoke* invoke) {
 }
 
 void IntrinsicCodeGeneratorX86_64::VisitUnsafeCASObject(HInvoke* invoke) {
-  // The UnsafeCASObject intrinsic is missing a read barrier, and
-  // therefore sometimes does not work as expected (b/25883050).
-  // Turn it off temporarily as a quick fix, until the read barrier is
-  // implemented (see TODO in GenCAS).
-  //
-  // TODO(rpl): Implement read barrier support in GenCAS and re-enable
-  // this intrinsic.
-  DCHECK(!kEmitCompilerReadBarrier);
-
   GenCAS(Primitive::kPrimNot, invoke, codegen_);
 }
 

@@ -44,9 +44,7 @@ void ReferenceQueue::EnqueueReference(mirror::Reference* ref) {
     // 1 element cyclic queue, ie: Reference ref = ..; ref.pendingNext = ref;
     list_ = ref;
   } else {
-    // The list is owned by the GC, everything that has been inserted must already be at least
-    // gray.
-    mirror::Reference* head = list_->GetPendingNext<kWithoutReadBarrier>();
+    mirror::Reference* head = list_->GetPendingNext();
     DCHECK(head != nullptr);
     ref->SetPendingNext(head);
   }
@@ -56,14 +54,14 @@ void ReferenceQueue::EnqueueReference(mirror::Reference* ref) {
 
 mirror::Reference* ReferenceQueue::DequeuePendingReference() {
   DCHECK(!IsEmpty());
-  mirror::Reference* ref = list_->GetPendingNext<kWithoutReadBarrier>();
+  mirror::Reference* ref = list_->GetPendingNext();
   DCHECK(ref != nullptr);
   // Note: the following code is thread-safe because it is only called from ProcessReferences which
   // is single threaded.
   if (list_ == ref) {
     list_ = nullptr;
   } else {
-    mirror::Reference* next = ref->GetPendingNext<kWithoutReadBarrier>();
+    mirror::Reference* next = ref->GetPendingNext();
     list_->SetPendingNext(next);
   }
   ref->SetPendingNext(nullptr);

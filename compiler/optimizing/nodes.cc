@@ -101,7 +101,10 @@ static void RemoveEnvironmentUses(HInstruction* instruction) {
 }
 
 static void RemoveAsUser(HInstruction* instruction) {
-  instruction->RemoveAsUserOfAllInputs();
+  for (size_t i = 0; i < instruction->InputCount(); i++) {
+    instruction->RemoveAsUserOfInput(i);
+  }
+
   RemoveEnvironmentUses(instruction);
 }
 
@@ -460,116 +463,6 @@ GraphAnalysisResult HGraph::AnalyzeLoops() const {
   return kAnalysisSuccess;
 }
 
-static bool InSameLoop(HLoopInformation* first_loop, HLoopInformation* second_loop) {
-  return first_loop == second_loop;
-}
-
-static bool IsLoop(HLoopInformation* info) {
-  return info != nullptr;
-}
-
-static bool IsInnerLoop(HLoopInformation* outer, HLoopInformation* inner) {
-  return (inner != outer)
-      && (inner != nullptr)
-      && (outer != nullptr)
-      && inner->IsIn(*outer);
-}
-
-// Helper method to update work list for linear order.
-static void AddToListForLinearization(ArenaVector<HBasicBlock*>* worklist, HBasicBlock* block) {
-  HLoopInformation* block_loop = block->GetLoopInformation();
-  auto insert_pos = worklist->rbegin();  // insert_pos.base() will be the actual position.
-  for (auto end = worklist->rend(); insert_pos != end; ++insert_pos) {
-    HBasicBlock* current = *insert_pos;
-    HLoopInformation* current_loop = current->GetLoopInformation();
-    if (InSameLoop(block_loop, current_loop)
-        || !IsLoop(current_loop)
-        || IsInnerLoop(current_loop, block_loop)) {
-      // The block can be processed immediately.
-      break;
-    }
-  }
-  worklist->insert(insert_pos.base(), block);
-}
-
-// Helper method to validate linear order.
-static bool IsLinearOrderWellFormed(const HGraph& graph) {
-  for (HBasicBlock* header : graph.GetBlocks()) {
-    if (header == nullptr || !header->IsLoopHeader()) {
-      continue;
-    }
-    HLoopInformation* loop = header->GetLoopInformation();
-    size_t num_blocks = loop->GetBlocks().NumSetBits();
-    size_t found_blocks = 0u;
-    for (HLinearOrderIterator it(graph); !it.Done(); it.Advance()) {
-      HBasicBlock* current = it.Current();
-      if (loop->Contains(*current)) {
-        found_blocks++;
-        if (found_blocks == 1u && current != header) {
-          // First block is not the header.
-          return false;
-        } else if (found_blocks == num_blocks && !loop->IsBackEdge(*current)) {
-          // Last block is not a back edge.
-          return false;
-        }
-      } else if (found_blocks != 0u && found_blocks != num_blocks) {
-        // Blocks are not adjacent.
-        return false;
-      }
-    }
-    DCHECK_EQ(found_blocks, num_blocks);
-  }
-  return true;
-}
-
-// TODO: return order, and give only liveness analysis ownership of graph's linear_order_?
-void HGraph::Linearize() {
-  linear_order_.clear();
-
-  // Create a reverse post ordering with the following properties:
-  // - Blocks in a loop are consecutive,
-  // - Back-edge is the last block before loop exits.
-
-  // (1): Record the number of forward predecessors for each block. This is to
-  //      ensure the resulting order is reverse post order. We could use the
-  //      current reverse post order in the graph, but it would require making
-  //      order queries to a GrowableArray, which is not the best data structure
-  //      for it.
-  ArenaVector<uint32_t> forward_predecessors(blocks_.size(),
-                                             arena_->Adapter(kArenaAllocSsaLiveness));
-  for (HReversePostOrderIterator it(*this); !it.Done(); it.Advance()) {
-    HBasicBlock* block = it.Current();
-    size_t number_of_forward_predecessors = block->GetPredecessors().size();
-    if (block->IsLoopHeader()) {
-      number_of_forward_predecessors -= block->GetLoopInformation()->NumberOfBackEdges();
-    }
-    forward_predecessors[block->GetBlockId()] = number_of_forward_predecessors;
-  }
-
-  // (2): Following a worklist approach, first start with the entry block, and
-  //      iterate over the successors. When all non-back edge predecessors of a
-  //      successor block are visited, the successor block is added in the worklist
-  //      following an order that satisfies the requirements to build our linear graph.
-  linear_order_.reserve(GetReversePostOrder().size());
-  ArenaVector<HBasicBlock*> worklist(arena_->Adapter(kArenaAllocSsaLiveness));
-  worklist.push_back(GetEntryBlock());
-  do {
-    HBasicBlock* current = worklist.back();
-    worklist.pop_back();
-    linear_order_.push_back(current);
-    for (HBasicBlock* successor : current->GetSuccessors()) {
-      int block_id = successor->GetBlockId();
-      size_t number_of_remaining_predecessors = forward_predecessors[block_id];
-      if (number_of_remaining_predecessors == 1) {
-        AddToListForLinearization(&worklist, successor);
-      }
-      forward_predecessors[block_id] = number_of_remaining_predecessors - 1;
-    }
-  } while (!worklist.empty());
-
-  DCHECK(HasIrreducibleLoops() || IsLinearOrderWellFormed(*this));
-}
-
 void HLoopInformation::Dump(std::ostream& os) {
   os << "header: " << header_->GetBlockId() << std::endl;
   os << "pre header: " << GetPreHeader()->GetBlockId() << std::endl;
@@ -864,9 +757,8 @@ bool HBasicBlock::Dominates(HBasicBlock* other) const {
 }
 
 static void UpdateInputsUsers(HInstruction* instruction) {
-  HInputsRef inputs = instruction->GetInputs();
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    inputs[i]->AddUseAt(instruction, i);
+  for (size_t i = 0, e = instruction->InputCount(); i < e; ++i) {
+    instruction->InputAt(i)->AddUseAt(instruction, i);
   }
   // Environment should be created later.
   DCHECK(!instruction->HasEnvironment());
@@ -893,6 +785,22 @@ void HBasicBlock::ReplaceAndRemoveInstructionWith(HInstruction* initial,
     initial->ReplaceWith(replacement);
   }
   RemoveInstruction(initial);
+}
+
+void HBasicBlock::MoveInstructionBefore(HInstruction* insn, HInstruction* cursor) {
+  DCHECK(!cursor->IsPhi());
+  DCHECK(!insn->IsPhi());
+  DCHECK(!insn->IsControlFlow());
+  DCHECK(insn->CanBeMoved());
+  DCHECK(!insn->HasSideEffects());
+
+  HBasicBlock* from_block = insn->GetBlock();
+  HBasicBlock* to_block = cursor->GetBlock();
+  DCHECK(from_block != to_block);
+
+  from_block->RemoveInstruction(insn, /* ensure_safety */ false);
+  insn->SetBlock(to_block);
+  to_block->instructions_.InsertInstructionBefore(insn, cursor);
 }
 
 static void Add(HInstructionList* instruction_list,
@@ -1218,10 +1126,9 @@ void HPhi::AddInput(HInstruction* input) {
 void HPhi::RemoveInputAt(size_t index) {
   RemoveAsUserOfInput(index);
   inputs_.erase(inputs_.begin() + index);
-  // Update indexes in use nodes of inputs that have been pulled forward by the erase().
-  for (size_t i = index, e = inputs_.size(); i < e; ++i) {
-    DCHECK_EQ(inputs_[i].GetUseNode()->GetIndex(), i + 1u);
-    inputs_[i].GetUseNode()->SetIndex(i);
+  for (size_t i = index, e = InputCount(); i < e; ++i) {
+    DCHECK_EQ(InputRecordAt(i).GetUseNode()->GetIndex(), i + 1u);
+    InputRecordAt(i).GetUseNode()->SetIndex(i);
   }
 }
 
@@ -1417,18 +1324,16 @@ bool HCondition::IsBeforeWhenDisregardMoves(HInstruction* instruction) const {
   return this == instruction->GetPreviousDisregardingMoves();
 }
 
-bool HInstruction::Equals(const HInstruction* other) const {
+bool HInstruction::Equals(HInstruction* other) const {
   if (!InstructionTypeEquals(other)) return false;
   DCHECK_EQ(GetKind(), other->GetKind());
   if (!InstructionDataEquals(other)) return false;
   if (GetType() != other->GetType()) return false;
-  HConstInputsRef inputs = GetInputs();
-  HConstInputsRef other_inputs = other->GetInputs();
-  if (inputs.size() != other_inputs.size()) return false;
-  for (size_t i = 0; i != inputs.size(); ++i) {
-    if (inputs[i] != other_inputs[i]) return false;
-  }
+  if (InputCount() != other->InputCount()) return false;
 
+  for (size_t i = 0, e = InputCount(); i < e; ++i) {
+    if (InputAt(i) != other->InputAt(i)) return false;
+  }
   DCHECK_EQ(ComputeHashCode(), other->ComputeHashCode());
   return true;
 }
@@ -1446,11 +1351,6 @@ std::ostream& operator<<(std::ostream& os, const HInstruction::InstructionKind& 
 }
 
 void HInstruction::MoveBefore(HInstruction* cursor) {
-  DCHECK(!IsPhi());
-  DCHECK(!IsControlFlow());
-  DCHECK(CanBeMoved());
-  DCHECK(!cursor->IsPhi());
-
   next_->previous_ = previous_;
   if (previous_ != nullptr) {
     previous_->next_ = next_;
@@ -2118,7 +2018,7 @@ HInstruction* HGraph::InlineInto(HGraph* outer_graph, HInvoke* invoke) {
   }
 
   HInstruction* return_value = nullptr;
-  if (GetBlocks().size() == 3 && !GetBlocks()[1]->GetLastInstruction()->IsThrow()) {
+  if (GetBlocks().size() == 3) {
     // Simple case of an entry block, a body block, and an exit block.
     // Put the body block's instruction into `invoke`'s block.
     HBasicBlock* body = GetBlocks()[1];
@@ -2202,66 +2102,31 @@ HInstruction* HGraph::InlineInto(HGraph* outer_graph, HInvoke* invoke) {
 
     // Update all predecessors of the exit block (now the `to` block)
     // to not `HReturn` but `HGoto` instead.
-    // Connect HThrow to the outer graph's HExit
-    HPhi* return_value_phi = nullptr;
-    bool rebuild_dominance = false;
-    bool rebuild_loop_info = false;
-    for (size_t pred = 0; pred < to->GetPredecessors().size(); ++pred) {
-      HBasicBlock* predecessor = to->GetPredecessors()[pred];
+    bool returns_void = to->GetPredecessors()[0]->GetLastInstruction()->IsReturnVoid();
+    if (to->GetPredecessors().size() == 1) {
+      HBasicBlock* predecessor = to->GetPredecessors()[0];
       HInstruction* last = predecessor->GetLastInstruction();
-      if (last->IsThrow()) {
-        // TODO If the outer graph has an exception handler
-        // then we have to create a TryBoundary and link to
-        // the catch block. This case is disabled by the inliner.
-        DCHECK(!at->IsTryBlock());
-        predecessor->ReplaceSuccessor(to, outer_graph->GetExitBlock());
-        --pred;
-        rebuild_dominance = true;
-        if (predecessor->GetLoopInformation() != nullptr) {
-          rebuild_loop_info = true;
-        }
-        continue;
-      }
-
-      if (last->IsReturnVoid()) {
-        DCHECK(return_value == nullptr);
-      } else if (return_value_phi != nullptr) {
-        DCHECK(last->IsReturn());
-        // More than two non-void returns: add to the new phi.
-        return_value_phi->AddInput(last->InputAt(0));
-      } else if (return_value == nullptr) {
-        DCHECK(last->IsReturn());
+      if (!returns_void) {
         return_value = last->InputAt(0);
-      } else {
-        DCHECK(last->IsReturn());
-        // More than one non-void return: create a phi node.
-        return_value_phi = new (allocator) HPhi(
-            allocator, kNoRegNumber, 0, HPhi::ToPhiType(invoke->GetType()), to->GetDexPc());
-        to->AddPhi(return_value_phi);
-        return_value_phi->AddInput(return_value);
-        return_value_phi->AddInput(last->InputAt(0));
-        return_value = return_value_phi;
       }
       predecessor->AddInstruction(new (allocator) HGoto(last->GetDexPc()));
       predecessor->RemoveInstruction(last);
-    }
-
-    if (rebuild_loop_info) {
-      // TODO Instead of rebuilding the loop information it is faster to just
-      // remove the loop info from the throwing blocks and their postdominated blocks.
-      outer_graph->ClearLoopInformation();
-      outer_graph->ClearDominanceInformation();
-      outer_graph->BuildDominatorTree();
-    } else if (rebuild_dominance) {
-      // TODO There could be a way to update the dominators
-      // without rebuilding them from scratch.
-      outer_graph->ClearDominanceInformation();
-      outer_graph->ComputeDominanceInformation();
-    }
-
-    if (rebuild_loop_info || rebuild_dominance) {
-      // The split tail must be reachable.
-      DCHECK_NE(to->GetPredecessors().size(), 0u) << "Must stay reachable.";
+    } else {
+      if (!returns_void) {
+        // There will be multiple returns.
+        return_value = new (allocator) HPhi(
+            allocator, kNoRegNumber, 0, HPhi::ToPhiType(invoke->GetType()), to->GetDexPc());
+        to->AddPhi(return_value->AsPhi());
+      }
+      for (HBasicBlock* predecessor : to->GetPredecessors()) {
+        HInstruction* last = predecessor->GetLastInstruction();
+        if (!returns_void) {
+          DCHECK(last->IsReturn());
+          return_value->AsPhi()->AddInput(last->InputAt(0));
+        }
+        predecessor->AddInstruction(new (allocator) HGoto(last->GetDexPc()));
+        predecessor->RemoveInstruction(last);
+      }
     }
   }
 
@@ -2489,7 +2354,6 @@ void HInvoke::SetIntrinsic(Intrinsics intrinsic,
   if (needs_env_or_cache == kNoEnvironmentOrCache) {
     opt.SetDoesNotNeedDexCache();
     opt.SetDoesNotNeedEnvironment();
-    RemoveEnvironment();
   } else {
     // If we need an environment, that means there will be a call, which can trigger GC.
     SetSideEffects(GetSideEffects().Union(SideEffects::CanTriggerGC()));
@@ -2526,9 +2390,9 @@ void HInvokeStaticOrDirect::InsertInputAt(size_t index, HInstruction* input) {
   inputs_.insert(inputs_.begin() + index, HUserRecord<HInstruction*>(input));
   input->AddUseAt(this, index);
   // Update indexes in use nodes of inputs that have been pushed further back by the insert().
-  for (size_t i = index + 1u, e = inputs_.size(); i < e; ++i) {
-    DCHECK_EQ(inputs_[i].GetUseNode()->GetIndex(), i - 1u);
-    inputs_[i].GetUseNode()->SetIndex(i);
+  for (size_t i = index + 1u, size = inputs_.size(); i != size; ++i) {
+    DCHECK_EQ(InputRecordAt(i).GetUseNode()->GetIndex(), i - 1u);
+    InputRecordAt(i).GetUseNode()->SetIndex(i);
   }
 }
 
@@ -2536,9 +2400,9 @@ void HInvokeStaticOrDirect::RemoveInputAt(size_t index) {
   RemoveAsUserOfInput(index);
   inputs_.erase(inputs_.begin() + index);
   // Update indexes in use nodes of inputs that have been pulled forward by the erase().
-  for (size_t i = index, e = inputs_.size(); i < e; ++i) {
-    DCHECK_EQ(inputs_[i].GetUseNode()->GetIndex(), i + 1u);
-    inputs_[i].GetUseNode()->SetIndex(i);
+  for (size_t i = index, e = InputCount(); i < e; ++i) {
+    DCHECK_EQ(InputRecordAt(i).GetUseNode()->GetIndex(), i + 1u);
+    InputRecordAt(i).GetUseNode()->SetIndex(i);
   }
 }
 
@@ -2576,8 +2440,8 @@ std::ostream& operator<<(std::ostream& os, HInvokeStaticOrDirect::ClinitCheckReq
   }
 }
 
-bool HLoadString::InstructionDataEquals(const HInstruction* other) const {
-  const HLoadString* other_load_string = other->AsLoadString();
+bool HLoadString::InstructionDataEquals(HInstruction* other) const {
+  HLoadString* other_load_string = other->AsLoadString();
   if (string_index_ != other_load_string->string_index_ ||
       GetPackedFields() != other_load_string->GetPackedFields()) {
     return false;

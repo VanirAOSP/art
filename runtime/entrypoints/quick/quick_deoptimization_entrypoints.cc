@@ -23,6 +23,7 @@
 #include "mirror/object_array-inl.h"
 #include "mirror/object-inl.h"
 #include "quick_exception_handler.h"
+#include "stack.h"
 #include "thread.h"
 #include "verifier/method_verifier.h"
 

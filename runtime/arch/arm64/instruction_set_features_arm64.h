@@ -21,31 +21,29 @@
 
 namespace art {
 
-class Arm64InstructionSetFeatures;
-using Arm64FeaturesUniquePtr = std::unique_ptr<const Arm64InstructionSetFeatures>;
-
 // Instruction set features relevant to the ARM64 architecture.
 class Arm64InstructionSetFeatures FINAL : public InstructionSetFeatures {
  public:
   // Process a CPU variant string like "krait" or "cortex-a15" and create InstructionSetFeatures.
-  static Arm64FeaturesUniquePtr FromVariant(const std::string& variant, std::string* error_msg);
+  static const Arm64InstructionSetFeatures* FromVariant(const std::string& variant,
+                                                        std::string* error_msg);
 
   // Parse a bitmap and create an InstructionSetFeatures.
-  static Arm64FeaturesUniquePtr FromBitmap(uint32_t bitmap);
+  static const Arm64InstructionSetFeatures* FromBitmap(uint32_t bitmap);
 
   // Turn C pre-processor #defines into the equivalent instruction set features.
-  static Arm64FeaturesUniquePtr FromCppDefines();
+  static const Arm64InstructionSetFeatures* FromCppDefines();
 
   // Process /proc/cpuinfo and use kRuntimeISA to produce InstructionSetFeatures.
-  static Arm64FeaturesUniquePtr FromCpuInfo();
+  static const Arm64InstructionSetFeatures* FromCpuInfo();
 
   // Process the auxiliary vector AT_HWCAP entry and use kRuntimeISA to produce
   // InstructionSetFeatures.
-  static Arm64FeaturesUniquePtr FromHwcap();
+  static const Arm64InstructionSetFeatures* FromHwcap();
 
   // Use assembly tests of the current runtime (ie kRuntimeISA) to determine the
   // InstructionSetFeatures. This works around kernel bugs in AT_HWCAP and /proc/cpuinfo.
-  static Arm64FeaturesUniquePtr FromAssembly();
+  static const Arm64InstructionSetFeatures* FromAssembly();
 
   bool Equals(const InstructionSetFeatures* other) const OVERRIDE;
 
@@ -72,20 +70,21 @@ class Arm64InstructionSetFeatures FINAL : public InstructionSetFeatures {
 
  protected:
   // Parse a vector of the form "a53" adding these to a new ArmInstructionSetFeatures.
-  std::unique_ptr<const InstructionSetFeatures>
-      AddFeaturesFromSplitString(const std::vector<std::string>& features,
+  const InstructionSetFeatures*
+      AddFeaturesFromSplitString(const bool smp, const std::vector<std::string>& features,
                                  std::string* error_msg) const OVERRIDE;
 
  private:
-  Arm64InstructionSetFeatures(bool needs_a53_835769_fix, bool needs_a53_843419_fix)
-      : InstructionSetFeatures(),
+  Arm64InstructionSetFeatures(bool smp, bool needs_a53_835769_fix, bool needs_a53_843419_fix)
+      : InstructionSetFeatures(smp),
         fix_cortex_a53_835769_(needs_a53_835769_fix),
         fix_cortex_a53_843419_(needs_a53_843419_fix) {
   }
 
   // Bitmap positions for encoding features as a bitmap.
   enum {
-    kA53Bitfield = 1 << 0,
+    kSmpBitfield = 1,
+    kA53Bitfield = 2,
   };
 
   const bool fix_cortex_a53_835769_;

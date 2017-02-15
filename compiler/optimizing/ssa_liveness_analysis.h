@@ -797,8 +797,8 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
   bool IsUsingInputRegister() const {
     CHECK(kIsDebugBuild) << "Function should be used only for DCHECKs";
     if (defined_by_ != nullptr && !IsSplit()) {
-      for (const HInstruction* input : defined_by_->GetInputs()) {
-        LiveInterval* interval = input->GetLiveInterval();
+      for (HInputIterator it(defined_by_); !it.Done(); it.Advance()) {
+        LiveInterval* interval = it.Current()->GetLiveInterval();
 
         // Find the interval that covers `defined_by`_. Calls to this function
         // are made outside the linear scan, hence we need to use CoversSlow.
@@ -828,8 +828,8 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
       if (locations->OutputCanOverlapWithInputs()) {
         return false;
       }
-      for (const HInstruction* input : defined_by_->GetInputs()) {
-        LiveInterval* interval = input->GetLiveInterval();
+      for (HInputIterator it(defined_by_); !it.Done(); it.Advance()) {
+        LiveInterval* interval = it.Current()->GetLiveInterval();
 
         // Find the interval that covers `defined_by`_. Calls to this function
         // are made outside the linear scan, hence we need to use CoversSlow.
@@ -969,6 +969,38 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
     return false;
   }
 
+  bool IsLinearOrderWellFormed(const HGraph& graph) {
+    for (HBasicBlock* header : graph.GetBlocks()) {
+      if (header == nullptr || !header->IsLoopHeader()) {
+        continue;
+      }
+
+      HLoopInformation* loop = header->GetLoopInformation();
+      size_t num_blocks = loop->GetBlocks().NumSetBits();
+      size_t found_blocks = 0u;
+
+      for (HLinearOrderIterator it(graph); !it.Done(); it.Advance()) {
+        HBasicBlock* current = it.Current();
+        if (loop->Contains(*current)) {
+          found_blocks++;
+          if (found_blocks == 1u && current != header) {
+            // First block is not the header.
+            return false;
+          } else if (found_blocks == num_blocks && !loop->IsBackEdge(*current)) {
+            // Last block is not a back edge.
+            return false;
+          }
+        } else if (found_blocks != 0u && found_blocks != num_blocks) {
+          // Blocks are not adjacent.
+          return false;
+        }
+      }
+      DCHECK_EQ(found_blocks, num_blocks);
+    }
+
+    return true;
+  }
+
   void AddBackEdgeUses(const HBasicBlock& block_at_use) {
     DCHECK(block_at_use.IsInLoop());
     if (block_at_use.GetGraph()->HasIrreducibleLoops()) {
@@ -977,6 +1009,8 @@ class LiveInterval : public ArenaObject<kArenaAllocSsaLiveness> {
       // which violates assumptions made in this method.
       return;
     }
+
+    DCHECK(IsLinearOrderWellFormed(*block_at_use.GetGraph()));
 
     // Add synthesized uses at the back edge of loops to help the register allocator.
     // Note that this method is called in decreasing liveness order, to faciliate adding
@@ -1183,6 +1217,12 @@ class SsaLivenessAnalysis : public ValueObject {
   static constexpr const char* kLivenessPassName = "liveness";
 
  private:
+  // Linearize the graph so that:
+  // (1): a block is always after its dominator,
+  // (2): blocks of loops are contiguous.
+  // This creates a natural and efficient ordering when visualizing live ranges.
+  void LinearizeGraph();
+
   // Give an SSA number to each instruction that defines a value used by another instruction,
   // and setup the lifetime information of each instruction and block.
   void NumberInstructions();

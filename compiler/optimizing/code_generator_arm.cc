@@ -312,7 +312,7 @@ class TypeCheckSlowPathARM : public SlowPathCode {
                                  instruction_->GetDexPc(),
                                  this);
       CheckEntrypointTypes<
-          kQuickInstanceofNonTrivial, size_t, const mirror::Class*, const mirror::Class*>();
+          kQuickInstanceofNonTrivial, uint32_t, const mirror::Class*, const mirror::Class*>();
       arm_codegen->Move32(locations->Out(), Location::RegisterLocation(R0));
     } else {
       DCHECK(instruction_->IsCheckCast());
@@ -426,9 +426,7 @@ class ReadBarrierMarkSlowPathARM : public SlowPathCode {
            instruction_->IsLoadClass() ||
            instruction_->IsLoadString() ||
            instruction_->IsInstanceOf() ||
-           instruction_->IsCheckCast() ||
-           ((instruction_->IsInvokeStaticOrDirect() || instruction_->IsInvokeVirtual()) &&
-            instruction_->GetLocations()->Intrinsified()))
+           instruction_->IsCheckCast())
         << "Unexpected instruction in read barrier marking slow path: "
         << instruction_->DebugName();
 
@@ -491,12 +489,8 @@ class ReadBarrierForHeapReferenceSlowPathARM : public SlowPathCode {
     Register reg_out = out_.AsRegister<Register>();
     DCHECK(locations->CanCall());
     DCHECK(!locations->GetLiveRegisters()->ContainsCoreRegister(reg_out));
-    DCHECK(instruction_->IsInstanceFieldGet() ||
-           instruction_->IsStaticFieldGet() ||
-           instruction_->IsArrayGet() ||
-           instruction_->IsInstanceOf() ||
-           instruction_->IsCheckCast() ||
-           ((instruction_->IsInvokeStaticOrDirect() || instruction_->IsInvokeVirtual()) &&
+    DCHECK(!instruction_->IsInvoke() ||
+           (instruction_->IsInvokeStaticOrDirect() &&
             instruction_->GetLocations()->Intrinsified()))
         << "Unexpected instruction in read barrier for heap reference slow path: "
         << instruction_->DebugName();
@@ -509,7 +503,7 @@ class ReadBarrierForHeapReferenceSlowPathARM : public SlowPathCode {
     // introduce a copy of it, `index`.
     Location index = index_;
     if (index_.IsValid()) {
-      // Handle `index_` for HArrayGet and UnsafeGetObject/UnsafeGetObjectVolatile intrinsics.
+      // Handle `index_` for HArrayGet and intrinsic UnsafeGetObject.
       if (instruction_->IsArrayGet()) {
         // Compute the actual memory offset and store it in `index`.
         Register index_reg = index_.AsRegister<Register>();
@@ -557,11 +551,7 @@ class ReadBarrierForHeapReferenceSlowPathARM : public SlowPathCode {
             "art::mirror::HeapReference<art::mirror::Object> and int32_t have different sizes.");
         __ AddConstant(index_reg, index_reg, offset_);
       } else {
-        // In the case of the UnsafeGetObject/UnsafeGetObjectVolatile
-        // intrinsics, `index_` is not shifted by a scale factor of 2
-        // (as in the case of ArrayGet), as it is actually an offset
-        // to an object field within an object.
-        DCHECK(instruction_->IsInvoke()) << instruction_->DebugName();
+        DCHECK(instruction_->IsInvoke());
         DCHECK(instruction_->GetLocations()->Intrinsified());
         DCHECK((instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kUnsafeGetObject) ||
                (instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kUnsafeGetObjectVolatile))
@@ -1263,44 +1253,6 @@ void LocationsBuilderARM::VisitExit(HExit* exit) {
 void InstructionCodeGeneratorARM::VisitExit(HExit* exit ATTRIBUTE_UNUSED) {
 }
 
-void InstructionCodeGeneratorARM::GenerateVcmp(HInstruction* instruction) {
-  Primitive::Type type = instruction->InputAt(0)->GetType();
-  Location lhs_loc = instruction->GetLocations()->InAt(0);
-  Location rhs_loc = instruction->GetLocations()->InAt(1);
-  if (rhs_loc.IsConstant()) {
-    // 0.0 is the only immediate that can be encoded directly in
-    // a VCMP instruction.
-    //
-    // Both the JLS (section 15.20.1) and the JVMS (section 6.5)
-    // specify that in a floating-point comparison, positive zero
-    // and negative zero are considered equal, so we can use the
-    // literal 0.0 for both cases here.
-    //
-    // Note however that some methods (Float.equal, Float.compare,
-    // Float.compareTo, Double.equal, Double.compare,
-    // Double.compareTo, Math.max, Math.min, StrictMath.max,
-    // StrictMath.min) consider 0.0 to be (strictly) greater than
-    // -0.0. So if we ever translate calls to these methods into a
-    // HCompare instruction, we must handle the -0.0 case with
-    // care here.
-    DCHECK(rhs_loc.GetConstant()->IsArithmeticZero());
-    if (type == Primitive::kPrimFloat) {
-      __ vcmpsz(lhs_loc.AsFpuRegister<SRegister>());
-    } else {
-      DCHECK_EQ(type, Primitive::kPrimDouble);
-      __ vcmpdz(FromLowSToD(lhs_loc.AsFpuRegisterPairLow<SRegister>()));
-    }
-  } else {
-    if (type == Primitive::kPrimFloat) {
-      __ vcmps(lhs_loc.AsFpuRegister<SRegister>(), rhs_loc.AsFpuRegister<SRegister>());
-    } else {
-      DCHECK_EQ(type, Primitive::kPrimDouble);
-      __ vcmpd(FromLowSToD(lhs_loc.AsFpuRegisterPairLow<SRegister>()),
-               FromLowSToD(rhs_loc.AsFpuRegisterPairLow<SRegister>()));
-    }
-  }
-}
-
 void InstructionCodeGeneratorARM::GenerateFPJumps(HCondition* cond,
                                                   Label* true_label,
                                                   Label* false_label ATTRIBUTE_UNUSED) {
@@ -1401,14 +1353,22 @@ void InstructionCodeGeneratorARM::GenerateCompareTestAndBranch(HCondition* condi
   Label* true_target = true_target_in == nullptr ? &fallthrough_target : true_target_in;
   Label* false_target = false_target_in == nullptr ? &fallthrough_target : false_target_in;
 
+  LocationSummary* locations = condition->GetLocations();
+  Location left = locations->InAt(0);
+  Location right = locations->InAt(1);
+
   Primitive::Type type = condition->InputAt(0)->GetType();
   switch (type) {
     case Primitive::kPrimLong:
       GenerateLongComparesAndJumps(condition, true_target, false_target);
       break;
     case Primitive::kPrimFloat:
+      __ vcmps(left.AsFpuRegister<SRegister>(), right.AsFpuRegister<SRegister>());
+      GenerateFPJumps(condition, true_target, false_target);
+      break;
     case Primitive::kPrimDouble:
-      GenerateVcmp(condition);
+      __ vcmpd(FromLowSToD(left.AsFpuRegisterPairLow<SRegister>()),
+               FromLowSToD(right.AsFpuRegisterPairLow<SRegister>()));
       GenerateFPJumps(condition, true_target, false_target);
       break;
     default:
@@ -1589,7 +1549,7 @@ void LocationsBuilderARM::HandleCondition(HCondition* cond) {
     case Primitive::kPrimFloat:
     case Primitive::kPrimDouble:
       locations->SetInAt(0, Location::RequiresFpuRegister());
-      locations->SetInAt(1, ArithmeticZeroOrFpuRegister(cond->InputAt(1)));
+      locations->SetInAt(1, Location::RequiresFpuRegister());
       if (!cond->IsEmittedAtUseSite()) {
         locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
       }
@@ -1636,8 +1596,12 @@ void InstructionCodeGeneratorARM::HandleCondition(HCondition* cond) {
       GenerateLongComparesAndJumps(cond, &true_label, &false_label);
       break;
     case Primitive::kPrimFloat:
+      __ vcmps(left.AsFpuRegister<SRegister>(), right.AsFpuRegister<SRegister>());
+      GenerateFPJumps(cond, &true_label, &false_label);
+      break;
     case Primitive::kPrimDouble:
-      GenerateVcmp(cond);
+      __ vcmpd(FromLowSToD(left.AsFpuRegisterPairLow<SRegister>()),
+               FromLowSToD(right.AsFpuRegisterPairLow<SRegister>()));
       GenerateFPJumps(cond, &true_label, &false_label);
       break;
   }
@@ -2032,7 +1996,7 @@ void LocationsBuilderARM::VisitTypeConversion(HTypeConversion* conversion) {
       (((input_type == Primitive::kPrimFloat || input_type == Primitive::kPrimDouble)
         && result_type == Primitive::kPrimLong)
        || (input_type == Primitive::kPrimLong && result_type == Primitive::kPrimFloat))
-      ? LocationSummary::kCallOnMainOnly
+      ? LocationSummary::kCall
       : LocationSummary::kNoCall;
   LocationSummary* locations =
       new (GetGraph()->GetArena()) LocationSummary(conversion, call_kind);
@@ -2310,7 +2274,8 @@ void InstructionCodeGeneratorARM::VisitTypeConversion(HTypeConversion* conversio
         case Primitive::kPrimFloat: {
           // Processing a Dex `float-to-int' instruction.
           SRegister temp = locations->GetTemp(0).AsFpuRegisterPairLow<SRegister>();
-          __ vcvtis(temp, in.AsFpuRegister<SRegister>());
+          __ vmovs(temp, in.AsFpuRegister<SRegister>());
+          __ vcvtis(temp, temp);
           __ vmovrs(out.AsRegister<Register>(), temp);
           break;
         }
@@ -2318,7 +2283,9 @@ void InstructionCodeGeneratorARM::VisitTypeConversion(HTypeConversion* conversio
         case Primitive::kPrimDouble: {
           // Processing a Dex `double-to-int' instruction.
           SRegister temp_s = locations->GetTemp(0).AsFpuRegisterPairLow<SRegister>();
-          __ vcvtid(temp_s, FromLowSToD(in.AsFpuRegisterPairLow<SRegister>()));
+          DRegister temp_d = FromLowSToD(temp_s);
+          __ vmovd(temp_d, FromLowSToD(in.AsFpuRegisterPairLow<SRegister>()));
+          __ vcvtid(temp_s, temp_d);
           __ vmovrs(out.AsRegister<Register>(), temp_s);
           break;
         }
@@ -2497,7 +2464,7 @@ void LocationsBuilderARM::VisitAdd(HAdd* add) {
 
     case Primitive::kPrimLong: {
       locations->SetInAt(0, Location::RequiresRegister());
-      locations->SetInAt(1, ArmEncodableConstantOrRegister(add->InputAt(1), ADD));
+      locations->SetInAt(1, Location::RequiresRegister());
       locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
       break;
     }
@@ -2534,18 +2501,13 @@ void InstructionCodeGeneratorARM::VisitAdd(HAdd* add) {
       break;
 
     case Primitive::kPrimLong: {
-      if (second.IsConstant()) {
-        uint64_t value = static_cast<uint64_t>(Int64FromConstant(second.GetConstant()));
-        GenerateAddLongConst(out, first, value);
-      } else {
-        DCHECK(second.IsRegisterPair());
-        __ adds(out.AsRegisterPairLow<Register>(),
-                first.AsRegisterPairLow<Register>(),
-                ShifterOperand(second.AsRegisterPairLow<Register>()));
-        __ adc(out.AsRegisterPairHigh<Register>(),
-               first.AsRegisterPairHigh<Register>(),
-               ShifterOperand(second.AsRegisterPairHigh<Register>()));
-      }
+      DCHECK(second.IsRegisterPair());
+      __ adds(out.AsRegisterPairLow<Register>(),
+              first.AsRegisterPairLow<Register>(),
+              ShifterOperand(second.AsRegisterPairLow<Register>()));
+      __ adc(out.AsRegisterPairHigh<Register>(),
+             first.AsRegisterPairHigh<Register>(),
+             ShifterOperand(second.AsRegisterPairHigh<Register>()));
       break;
     }
 
@@ -2579,7 +2541,7 @@ void LocationsBuilderARM::VisitSub(HSub* sub) {
 
     case Primitive::kPrimLong: {
       locations->SetInAt(0, Location::RequiresRegister());
-      locations->SetInAt(1, ArmEncodableConstantOrRegister(sub->InputAt(1), SUB));
+      locations->SetInAt(1, Location::RequiresRegister());
       locations->SetOut(Location::RequiresRegister(), Location::kNoOutputOverlap);
       break;
     }
@@ -2615,18 +2577,13 @@ void InstructionCodeGeneratorARM::VisitSub(HSub* sub) {
     }
 
     case Primitive::kPrimLong: {
-      if (second.IsConstant()) {
-        uint64_t value = static_cast<uint64_t>(Int64FromConstant(second.GetConstant()));
-        GenerateAddLongConst(out, first, -value);
-      } else {
-        DCHECK(second.IsRegisterPair());
-        __ subs(out.AsRegisterPairLow<Register>(),
-                first.AsRegisterPairLow<Register>(),
-                ShifterOperand(second.AsRegisterPairLow<Register>()));
-        __ sbc(out.AsRegisterPairHigh<Register>(),
-               first.AsRegisterPairHigh<Register>(),
-               ShifterOperand(second.AsRegisterPairHigh<Register>()));
-      }
+      DCHECK(second.IsRegisterPair());
+      __ subs(out.AsRegisterPairLow<Register>(),
+              first.AsRegisterPairLow<Register>(),
+              ShifterOperand(second.AsRegisterPairLow<Register>()));
+      __ sbc(out.AsRegisterPairHigh<Register>(),
+             first.AsRegisterPairHigh<Register>(),
+             ShifterOperand(second.AsRegisterPairHigh<Register>()));
       break;
     }
 
@@ -2861,13 +2818,13 @@ void LocationsBuilderARM::VisitDiv(HDiv* div) {
   LocationSummary::CallKind call_kind = LocationSummary::kNoCall;
   if (div->GetResultType() == Primitive::kPrimLong) {
     // pLdiv runtime call.
-    call_kind = LocationSummary::kCallOnMainOnly;
+    call_kind = LocationSummary::kCall;
   } else if (div->GetResultType() == Primitive::kPrimInt && div->InputAt(1)->IsConstant()) {
     // sdiv will be replaced by other instruction sequence.
   } else if (div->GetResultType() == Primitive::kPrimInt &&
              !codegen_->GetInstructionSetFeatures().HasDivideInstruction()) {
     // pIdivmod runtime call.
-    call_kind = LocationSummary::kCallOnMainOnly;
+    call_kind = LocationSummary::kCall;
   }
 
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(div, call_kind);
@@ -2986,7 +2943,7 @@ void LocationsBuilderARM::VisitRem(HRem* rem) {
   Primitive::Type type = rem->GetResultType();
 
   // Most remainders are implemented in the runtime.
-  LocationSummary::CallKind call_kind = LocationSummary::kCallOnMainOnly;
+  LocationSummary::CallKind call_kind = LocationSummary::kCall;
   if (rem->GetResultType() == Primitive::kPrimInt && rem->InputAt(1)->IsConstant()) {
     // sdiv will be replaced by other instruction sequence.
     call_kind = LocationSummary::kNoCall;
@@ -3523,7 +3480,7 @@ void InstructionCodeGeneratorARM::VisitUShr(HUShr* ushr) {
 
 void LocationsBuilderARM::VisitNewInstance(HNewInstance* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   if (instruction->IsStringAlloc()) {
     locations->AddTemp(Location::RegisterLocation(kMethodRegisterArgument));
   } else {
@@ -3556,7 +3513,7 @@ void InstructionCodeGeneratorARM::VisitNewInstance(HNewInstance* instruction) {
 
 void LocationsBuilderARM::VisitNewArray(HNewArray* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->AddTemp(Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
   locations->SetOut(Location::RegisterLocation(R0));
@@ -3664,7 +3621,7 @@ void LocationsBuilderARM::VisitCompare(HCompare* compare) {
     case Primitive::kPrimFloat:
     case Primitive::kPrimDouble: {
       locations->SetInAt(0, Location::RequiresFpuRegister());
-      locations->SetInAt(1, ArithmeticZeroOrFpuRegister(compare->InputAt(1)));
+      locations->SetInAt(1, Location::RequiresFpuRegister());
       locations->SetOut(Location::RequiresRegister());
       break;
     }
@@ -3709,7 +3666,12 @@ void InstructionCodeGeneratorARM::VisitCompare(HCompare* compare) {
     case Primitive::kPrimFloat:
     case Primitive::kPrimDouble: {
       __ LoadImmediate(out, 0);
-      GenerateVcmp(compare);
+      if (type == Primitive::kPrimFloat) {
+        __ vcmps(left.AsFpuRegister<SRegister>(), right.AsFpuRegister<SRegister>());
+      } else {
+        __ vcmpd(FromLowSToD(left.AsFpuRegisterPairLow<SRegister>()),
+                 FromLowSToD(right.AsFpuRegisterPairLow<SRegister>()));
+      }
       __ vmstat();  // transfer FP status register to ARM APSR.
       less_cond = ARMFPCondition(kCondLT, compare->IsGtBias());
       break;
@@ -3735,7 +3697,7 @@ void InstructionCodeGeneratorARM::VisitCompare(HCompare* compare) {
 void LocationsBuilderARM::VisitPhi(HPhi* instruction) {
   LocationSummary* locations =
       new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kNoCall);
-  for (size_t i = 0, e = locations->GetInputCount(); i < e; ++i) {
+  for (size_t i = 0, e = instruction->InputCount(); i < e; ++i) {
     locations->SetInAt(i, Location::Any());
   }
   locations->SetOut(Location::Any());
@@ -4003,17 +3965,6 @@ void LocationsBuilderARM::HandleFieldGet(HInstruction* instruction, const FieldI
   }
 }
 
-Location LocationsBuilderARM::ArithmeticZeroOrFpuRegister(HInstruction* input) {
-  DCHECK(input->GetType() == Primitive::kPrimDouble || input->GetType() == Primitive::kPrimFloat)
-      << input->GetType();
-  if ((input->IsFloatConstant() && (input->AsFloatConstant()->IsArithmeticZero())) ||
-      (input->IsDoubleConstant() && (input->AsDoubleConstant()->IsArithmeticZero()))) {
-    return Location::ConstantLocation(input->AsConstant());
-  } else {
-    return Location::RequiresFpuRegister();
-  }
-}
-
 Location LocationsBuilderARM::ArmEncodableConstantOrRegister(HInstruction* constant,
                                                              Opcode opcode) {
   DCHECK(!Primitive::IsFloatingPointType(constant->GetType()));
@@ -4028,51 +3979,31 @@ bool LocationsBuilderARM::CanEncodeConstantAsImmediate(HConstant* input_cst,
                                                        Opcode opcode) {
   uint64_t value = static_cast<uint64_t>(Int64FromConstant(input_cst));
   if (Primitive::Is64BitType(input_cst->GetType())) {
-    Opcode high_opcode = opcode;
-    SetCc low_set_cc = kCcDontCare;
-    switch (opcode) {
-      case SUB:
-        // Flip the operation to an ADD.
-        value = -value;
-        opcode = ADD;
-        FALLTHROUGH_INTENDED;
-      case ADD:
-        if (Low32Bits(value) == 0u) {
-          return CanEncodeConstantAsImmediate(High32Bits(value), opcode, kCcDontCare);
-        }
-        high_opcode = ADC;
-        low_set_cc = kCcSet;
-        break;
-      default:
-        break;
-    }
-    return CanEncodeConstantAsImmediate(Low32Bits(value), opcode, low_set_cc) &&
-        CanEncodeConstantAsImmediate(High32Bits(value), high_opcode, kCcDontCare);
+    return CanEncodeConstantAsImmediate(Low32Bits(value), opcode) &&
+        CanEncodeConstantAsImmediate(High32Bits(value), opcode);
   } else {
     return CanEncodeConstantAsImmediate(Low32Bits(value), opcode);
   }
 }
 
-bool LocationsBuilderARM::CanEncodeConstantAsImmediate(uint32_t value,
-                                                       Opcode opcode,
-                                                       SetCc set_cc) {
+bool LocationsBuilderARM::CanEncodeConstantAsImmediate(uint32_t value, Opcode opcode) {
   ShifterOperand so;
   ArmAssembler* assembler = codegen_->GetAssembler();
-  if (assembler->ShifterOperandCanHold(kNoRegister, kNoRegister, opcode, value, set_cc, &so)) {
+  if (assembler->ShifterOperandCanHold(kNoRegister, kNoRegister, opcode, value, &so)) {
     return true;
   }
   Opcode neg_opcode = kNoOperand;
   switch (opcode) {
-    case AND: neg_opcode = BIC; value = ~value; break;
-    case ORR: neg_opcode = ORN; value = ~value; break;
-    case ADD: neg_opcode = SUB; value = -value; break;
-    case ADC: neg_opcode = SBC; value = ~value; break;
-    case SUB: neg_opcode = ADD; value = -value; break;
-    case SBC: neg_opcode = ADC; value = ~value; break;
+    case AND:
+      neg_opcode = BIC;
+      break;
+    case ORR:
+      neg_opcode = ORN;
+      break;
     default:
       return false;
   }
-  return assembler->ShifterOperandCanHold(kNoRegister, kNoRegister, neg_opcode, value, set_cc, &so);
+  return assembler->ShifterOperandCanHold(kNoRegister, kNoRegister, neg_opcode, ~value, &so);
 }
 
 void InstructionCodeGeneratorARM::HandleFieldGet(HInstruction* instruction,
@@ -4522,10 +4453,12 @@ void LocationsBuilderARM::VisitArraySet(HArraySet* instruction) {
   bool needs_write_barrier =
       CodeGenerator::StoreNeedsWriteBarrier(value_type, instruction->GetValue());
   bool may_need_runtime_call_for_type_check = instruction->NeedsTypeCheck();
+  bool object_array_set_with_read_barrier =
+      kEmitCompilerReadBarrier && (value_type == Primitive::kPrimNot);
 
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(
       instruction,
-      may_need_runtime_call_for_type_check ?
+      (may_need_runtime_call_for_type_check || object_array_set_with_read_barrier) ?
           LocationSummary::kCallOnSlowPath :
           LocationSummary::kNoCall);
 
@@ -4811,7 +4744,7 @@ void LocationsBuilderARM::VisitArrayLength(HArrayLength* instruction) {
 
 void InstructionCodeGeneratorARM::VisitArrayLength(HArrayLength* instruction) {
   LocationSummary* locations = instruction->GetLocations();
-  uint32_t offset = CodeGenerator::GetArrayLengthOffset(instruction);
+  uint32_t offset = mirror::Array::LengthOffset().Uint32Value();
   Register obj = locations->InAt(0).AsRegister<Register>();
   Register out = locations->Out().AsRegister<Register>();
   __ LoadFromOffset(kLoadWord, out, obj, offset);
@@ -5389,7 +5322,7 @@ void InstructionCodeGeneratorARM::VisitClearException(HClearException* clear ATT
 
 void LocationsBuilderARM::VisitThrow(HThrow* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
 }
@@ -5790,7 +5723,7 @@ void InstructionCodeGeneratorARM::VisitCheckCast(HCheckCast* instruction) {
 
 void LocationsBuilderARM::VisitMonitorOperation(HMonitorOperation* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
 }
@@ -5951,34 +5884,6 @@ void InstructionCodeGeneratorARM::GenerateEorConst(Register out, Register first,
     return;
   }
   __ eor(out, first, ShifterOperand(value));
-}
-
-void InstructionCodeGeneratorARM::GenerateAddLongConst(Location out,
-                                                       Location first,
-                                                       uint64_t value) {
-  Register out_low = out.AsRegisterPairLow<Register>();
-  Register out_high = out.AsRegisterPairHigh<Register>();
-  Register first_low = first.AsRegisterPairLow<Register>();
-  Register first_high = first.AsRegisterPairHigh<Register>();
-  uint32_t value_low = Low32Bits(value);
-  uint32_t value_high = High32Bits(value);
-  if (value_low == 0u) {
-    if (out_low != first_low) {
-      __ mov(out_low, ShifterOperand(first_low));
-    }
-    __ AddConstant(out_high, first_high, value_high);
-    return;
-  }
-  __ AddConstantSetFlags(out_low, first_low, value_low);
-  ShifterOperand so;
-  if (__ ShifterOperandCanHold(out_high, first_high, ADC, value_high, kCcDontCare, &so)) {
-    __ adc(out_high, first_high, so);
-  } else if (__ ShifterOperandCanHold(out_low, first_low, SBC, ~value_high, kCcDontCare, &so)) {
-    __ sbc(out_high, first_high, so);
-  } else {
-    LOG(FATAL) << "Unexpected constant " << value_high;
-    UNREACHABLE();
-  }
 }
 
 void InstructionCodeGeneratorARM::HandleBitwiseOperation(HBinaryOperation* instruction) {
@@ -6239,12 +6144,21 @@ void CodeGeneratorARM::GenerateReferenceLoadWithBakerReadBarrier(HInstruction* i
   // /* LockWord */ lock_word = LockWord(monitor)
   static_assert(sizeof(LockWord) == sizeof(int32_t),
                 "art::LockWord and int32_t have different sizes.");
+  // /* uint32_t */ rb_state = lock_word.ReadBarrierState()
+  __ Lsr(temp_reg, temp_reg, LockWord::kReadBarrierStateShift);
+  __ and_(temp_reg, temp_reg, ShifterOperand(LockWord::kReadBarrierStateMask));
+  static_assert(
+      LockWord::kReadBarrierStateMask == ReadBarrier::rb_ptr_mask_,
+      "art::LockWord::kReadBarrierStateMask is not equal to art::ReadBarrier::rb_ptr_mask_.");
 
-  // Introduce a dependency on the lock_word including the rb_state,
-  // which shall prevent load-load reordering without using
+  // Introduce a dependency on the high bits of rb_state, which shall
+  // be all zeroes, to prevent load-load reordering, and without using
   // a memory barrier (which would be more expensive).
-  // obj is unchanged by this operation, but its value now depends on temp_reg.
-  __ add(obj, obj, ShifterOperand(temp_reg, LSR, 32));
+  // IP = rb_state & ~LockWord::kReadBarrierStateMask = 0
+  __ bic(IP, temp_reg, ShifterOperand(LockWord::kReadBarrierStateMask));
+  // obj is unchanged by this operation, but its value now depends on
+  // IP, which depends on temp_reg.
+  __ add(obj, obj, ShifterOperand(IP));
 
   // The actual reference load.
   if (index.IsValid()) {
@@ -6276,14 +6190,8 @@ void CodeGeneratorARM::GenerateReferenceLoadWithBakerReadBarrier(HInstruction* i
 
   // if (rb_state == ReadBarrier::gray_ptr_)
   //   ref = ReadBarrier::Mark(ref);
-  // Given the numeric representation, it's enough to check the low bit of the
-  // rb_state. We do that by shifting the bit out of the lock word with LSRS
-  // which can be a 16-bit instruction unlike the TST immediate.
-  static_assert(ReadBarrier::white_ptr_ == 0, "Expecting white to have value 0");
-  static_assert(ReadBarrier::gray_ptr_ == 1, "Expecting gray to have value 1");
-  static_assert(ReadBarrier::black_ptr_ == 2, "Expecting black to have value 2");
-  __ Lsrs(temp_reg, temp_reg, LockWord::kReadBarrierStateShift + 1);
-  __ b(slow_path->GetEntryLabel(), CS);  // Carry flag is the last bit shifted out by LSRS.
+  __ cmp(temp_reg, ShifterOperand(ReadBarrier::gray_ptr_));
+  __ b(slow_path->GetEntryLabel(), EQ);
   __ Bind(slow_path->GetExitLabel());
 }
 

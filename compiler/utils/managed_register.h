@@ -47,40 +47,40 @@ class ManagedRegister {
   // ManagedRegister is a value class. There exists no method to change the
   // internal state. We therefore allow a copy constructor and an
   // assignment-operator.
-  constexpr ManagedRegister(const ManagedRegister& other) : id_(other.id_) { }
+  ManagedRegister(const ManagedRegister& other) : id_(other.id_) { }
 
   ManagedRegister& operator=(const ManagedRegister& other) {
     id_ = other.id_;
     return *this;
   }
 
-  constexpr arm::ArmManagedRegister AsArm() const;
-  constexpr arm64::Arm64ManagedRegister AsArm64() const;
-  constexpr mips::MipsManagedRegister AsMips() const;
-  constexpr mips64::Mips64ManagedRegister AsMips64() const;
-  constexpr x86::X86ManagedRegister AsX86() const;
-  constexpr x86_64::X86_64ManagedRegister AsX86_64() const;
+  arm::ArmManagedRegister AsArm() const;
+  arm64::Arm64ManagedRegister AsArm64() const;
+  mips::MipsManagedRegister AsMips() const;
+  mips64::Mips64ManagedRegister AsMips64() const;
+  x86::X86ManagedRegister AsX86() const;
+  x86_64::X86_64ManagedRegister AsX86_64() const;
 
   // It is valid to invoke Equals on and with a NoRegister.
-  constexpr bool Equals(const ManagedRegister& other) const {
+  bool Equals(const ManagedRegister& other) const {
     return id_ == other.id_;
   }
 
-  constexpr bool IsNoRegister() const {
+  bool IsNoRegister() const {
     return id_ == kNoRegister;
   }
 
-  static constexpr ManagedRegister NoRegister() {
+  static ManagedRegister NoRegister() {
     return ManagedRegister();
   }
 
-  constexpr int RegId() const { return id_; }
-  explicit constexpr ManagedRegister(int reg_id) : id_(reg_id) { }
+  int RegId() const { return id_; }
+  explicit ManagedRegister(int reg_id) : id_(reg_id) { }
 
  protected:
   static const int kNoRegister = -1;
 
-  constexpr ManagedRegister() : id_(kNoRegister) { }
+  ManagedRegister() : id_(kNoRegister) { }
 
   int id_;
 };

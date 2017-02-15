@@ -19,7 +19,7 @@
 
 namespace art {
 
-class HMultiplyAccumulate FINAL : public HExpression<3> {
+class HMultiplyAccumulate : public HExpression<3> {
  public:
   HMultiplyAccumulate(Primitive::Type type,
                       InstructionKind op,
@@ -38,7 +38,7 @@ class HMultiplyAccumulate FINAL : public HExpression<3> {
   static constexpr int kInputMulRightIndex = 2;
 
   bool CanBeMoved() const OVERRIDE { return true; }
-  bool InstructionDataEquals(const HInstruction* other) const OVERRIDE {
+  bool InstructionDataEquals(HInstruction* other) const OVERRIDE {
     return op_kind_ == other->AsMultiplyAccumulate()->op_kind_;
   }
 
@@ -53,7 +53,7 @@ class HMultiplyAccumulate FINAL : public HExpression<3> {
   DISALLOW_COPY_AND_ASSIGN(HMultiplyAccumulate);
 };
 
-class HBitwiseNegatedRight FINAL : public HBinaryOperation {
+class HBitwiseNegatedRight : public HBinaryOperation {
  public:
   HBitwiseNegatedRight(Primitive::Type result_type,
                             InstructionKind op,

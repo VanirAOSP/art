@@ -388,8 +388,10 @@ static Intrinsics GetIntrinsic(InlineMethod method) {
     case kIntrinsicGetCharsNoCheck:
       return Intrinsics::kStringGetCharsNoCheck;
     case kIntrinsicIsEmptyOrLength:
-      return ((method.d.data & kIntrinsicFlagIsEmpty) == 0) ?
-          Intrinsics::kStringLength : Intrinsics::kStringIsEmpty;
+      // The inliner can handle these two cases - and this is the preferred approach
+      // since after inlining the call is no longer visible (as opposed to waiting
+      // until codegen to handle intrinsic).
+      return Intrinsics::kNone;
     case kIntrinsicIndexOf:
       return ((method.d.data & kIntrinsicFlagBase0) == 0) ?
           Intrinsics::kStringIndexOfAfter : Intrinsics::kStringIndexOf;

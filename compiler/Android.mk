@@ -60,7 +60,6 @@ LIBART_COMPILER_SRC_FILES := \
 	optimizing/licm.cc \
 	optimizing/load_store_elimination.cc \
 	optimizing/locations.cc \
-        optimizing/loop_optimization.cc \
 	optimizing/nodes.cc \
 	optimizing/nodes_arm64.cc \
 	optimizing/optimization.cc \
@@ -68,8 +67,7 @@ LIBART_COMPILER_SRC_FILES := \
 	optimizing/parallel_move_resolver.cc \
 	optimizing/prepare_for_register_allocation.cc \
 	optimizing/reference_type_propagation.cc \
-	optimizing/register_allocator_linear_scan.cc \
-	optimizing/register_allocation_resolver.cc \
+	optimizing/register_allocator.cc \
 	optimizing/select_generator.cc \
 	optimizing/sharpening.cc \
 	optimizing/side_effects_analysis.cc \

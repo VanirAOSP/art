@@ -18,7 +18,6 @@
 
 #include <inttypes.h>
 #include <pthread.h>
-#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>

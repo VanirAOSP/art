@@ -38,13 +38,7 @@ std::ostream& operator<<(std::ostream& os, const Location& location);
 class Location : public ValueObject {
  public:
   enum OutputOverlap {
-    // The liveness of the output overlaps the liveness of one or
-    // several input(s); the register allocator cannot reuse an
-    // input's location for the output's location.
     kOutputOverlap,
-    // The liveness of the output does not overlap the liveness of any
-    // input; the register allocator is allowed to reuse an input's
-    // location for the output's location.
     kNoOutputOverlap
   };
 
@@ -480,9 +474,8 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
  public:
   enum CallKind {
     kNoCall,
-    kCallOnMainAndSlowPath,
     kCallOnSlowPath,
-    kCallOnMainOnly
+    kCall
   };
 
   LocationSummary(HInstruction* instruction,
@@ -501,10 +494,6 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
     return inputs_.size();
   }
 
-  // Set the output location.  Argument `overlaps` tells whether the
-  // output overlaps any of the inputs (if so, it cannot share the
-  // same register as one of the inputs); it is set to
-  // `Location::kOutputOverlap` by default for safety.
   void SetOut(Location location, Location::OutputOverlap overlaps = Location::kOutputOverlap) {
     DCHECK(output_.IsInvalid());
     output_overlaps_ = overlaps;
@@ -541,29 +530,10 @@ class LocationSummary : public ArenaObject<kArenaAllocLocationSummary> {
 
   Location Out() const { return output_; }
 
-  bool CanCall() const {
-    return call_kind_ != kNoCall;
-  }
-
-  bool WillCall() const {
-    return call_kind_ == kCallOnMainOnly || call_kind_ == kCallOnMainAndSlowPath;
-  }
-
-  bool CallsOnSlowPath() const {
-    return call_kind_ == kCallOnSlowPath || call_kind_ == kCallOnMainAndSlowPath;
-  }
-
-  bool OnlyCallsOnSlowPath() const {
-    return call_kind_ == kCallOnSlowPath;
-  }
-
-  bool CallsOnMainAndSlowPath() const {
-    return call_kind_ == kCallOnMainAndSlowPath;
-  }
-
-  bool NeedsSafepoint() const {
-    return CanCall();
-  }
+  bool CanCall() const { return call_kind_ != kNoCall; }
+  bool WillCall() const { return call_kind_ == kCall; }
+  bool OnlyCallsOnSlowPath() const { return call_kind_ == kCallOnSlowPath; }
+  bool NeedsSafepoint() const { return CanCall(); }
 
   void SetStackBit(uint32_t index) {
     stack_mask_->SetBit(index);

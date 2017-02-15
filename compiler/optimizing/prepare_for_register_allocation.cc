@@ -173,7 +173,8 @@ void PrepareForRegisterAllocation::VisitCondition(HCondition* condition) {
 
 void PrepareForRegisterAllocation::VisitInvokeStaticOrDirect(HInvokeStaticOrDirect* invoke) {
   if (invoke->IsStaticWithExplicitClinitCheck()) {
-    HLoadClass* last_input = invoke->GetInputs().back()->AsLoadClass();
+    size_t last_input_index = invoke->InputCount() - 1;
+    HLoadClass* last_input = invoke->InputAt(last_input_index)->AsLoadClass();
     DCHECK(last_input != nullptr)
         << "Last input is not HLoadClass. It is " << last_input->DebugName();
 

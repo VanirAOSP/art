@@ -347,7 +347,7 @@ class TypeCheckSlowPathX86_64 : public SlowPathCode {
                                     dex_pc,
                                     this);
       CheckEntrypointTypes<
-          kQuickInstanceofNonTrivial, size_t, const mirror::Class*, const mirror::Class*>();
+          kQuickInstanceofNonTrivial, uint32_t, const mirror::Class*, const mirror::Class*>();
     } else {
       DCHECK(instruction_->IsCheckCast());
       x86_64_codegen->InvokeRuntime(QUICK_ENTRY_POINT(pCheckCast),
@@ -464,9 +464,7 @@ class ReadBarrierMarkSlowPathX86_64 : public SlowPathCode {
            instruction_->IsLoadClass() ||
            instruction_->IsLoadString() ||
            instruction_->IsInstanceOf() ||
-           instruction_->IsCheckCast() ||
-           ((instruction_->IsInvokeStaticOrDirect() || instruction_->IsInvokeVirtual()) &&
-            instruction_->GetLocations()->Intrinsified()))
+           instruction_->IsCheckCast())
         << "Unexpected instruction in read barrier marking slow path: "
         << instruction_->DebugName();
 
@@ -529,12 +527,8 @@ class ReadBarrierForHeapReferenceSlowPathX86_64 : public SlowPathCode {
     CpuRegister reg_out = out_.AsRegister<CpuRegister>();
     DCHECK(locations->CanCall());
     DCHECK(!locations->GetLiveRegisters()->ContainsCoreRegister(reg_out.AsRegister())) << out_;
-    DCHECK(instruction_->IsInstanceFieldGet() ||
-           instruction_->IsStaticFieldGet() ||
-           instruction_->IsArrayGet() ||
-           instruction_->IsInstanceOf() ||
-           instruction_->IsCheckCast() ||
-           ((instruction_->IsInvokeStaticOrDirect() || instruction_->IsInvokeVirtual()) &&
+    DCHECK(!instruction_->IsInvoke() ||
+           (instruction_->IsInvokeStaticOrDirect() &&
             instruction_->GetLocations()->Intrinsified()))
         << "Unexpected instruction in read barrier for heap reference slow path: "
         << instruction_->DebugName();
@@ -547,7 +541,7 @@ class ReadBarrierForHeapReferenceSlowPathX86_64 : public SlowPathCode {
     // introduce a copy of it, `index`.
     Location index = index_;
     if (index_.IsValid()) {
-      // Handle `index_` for HArrayGet and UnsafeGetObject/UnsafeGetObjectVolatile intrinsics.
+      // Handle `index_` for HArrayGet and intrinsic UnsafeGetObject.
       if (instruction_->IsArrayGet()) {
         // Compute real offset and store it in index_.
         Register index_reg = index_.AsRegister<CpuRegister>().AsRegister();
@@ -595,11 +589,7 @@ class ReadBarrierForHeapReferenceSlowPathX86_64 : public SlowPathCode {
             "art::mirror::HeapReference<art::mirror::Object> and int32_t have different sizes.");
         __ AddImmediate(CpuRegister(index_reg), Immediate(offset_));
       } else {
-        // In the case of the UnsafeGetObject/UnsafeGetObjectVolatile
-        // intrinsics, `index_` is not shifted by a scale factor of 2
-        // (as in the case of ArrayGet), as it is actually an offset
-        // to an object field within an object.
-        DCHECK(instruction_->IsInvoke()) << instruction_->DebugName();
+        DCHECK(instruction_->IsInvoke());
         DCHECK(instruction_->GetLocations()->Intrinsified());
         DCHECK((instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kUnsafeGetObject) ||
                (instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kUnsafeGetObjectVolatile))
@@ -3897,7 +3887,7 @@ void InstructionCodeGeneratorX86_64::VisitUShr(HUShr* ushr) {
 
 void LocationsBuilderX86_64::VisitNewInstance(HNewInstance* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   if (instruction->IsStringAlloc()) {
     locations->AddTemp(Location::RegisterLocation(kMethodRegisterArgument));
@@ -3930,7 +3920,7 @@ void InstructionCodeGeneratorX86_64::VisitNewInstance(HNewInstance* instruction)
 
 void LocationsBuilderX86_64::VisitNewArray(HNewArray* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->AddTemp(Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
   locations->SetOut(Location::RegisterLocation(RAX));
@@ -4050,7 +4040,7 @@ void InstructionCodeGeneratorX86_64::VisitBooleanNot(HBooleanNot* bool_not) {
 void LocationsBuilderX86_64::VisitPhi(HPhi* instruction) {
   LocationSummary* locations =
       new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kNoCall);
-  for (size_t i = 0, e = locations->GetInputCount(); i < e; ++i) {
+  for (size_t i = 0, e = instruction->InputCount(); i < e; ++i) {
     locations->SetInAt(i, Location::Any());
   }
   locations->SetOut(Location::Any());
@@ -4077,10 +4067,8 @@ void CodeGeneratorX86_64::GenerateMemoryBarrier(MemBarrierKind kind) {
       // nop
       break;
     }
-    case MemBarrierKind::kNTStoreStore:
-      // Non-Temporal Store/Store needs an explicit fence.
-      MemoryFence(/* non-temporal */ true);
-      break;
+    default:
+      LOG(FATAL) << "Unexpected memory barier " << kind;
   }
 }
 
@@ -4709,10 +4697,12 @@ void LocationsBuilderX86_64::VisitArraySet(HArraySet* instruction) {
   bool needs_write_barrier =
       CodeGenerator::StoreNeedsWriteBarrier(value_type, instruction->GetValue());
   bool may_need_runtime_call_for_type_check = instruction->NeedsTypeCheck();
+  bool object_array_set_with_read_barrier =
+      kEmitCompilerReadBarrier && (value_type == Primitive::kPrimNot);
 
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(
       instruction,
-      may_need_runtime_call_for_type_check ?
+      (may_need_runtime_call_for_type_check || object_array_set_with_read_barrier) ?
           LocationSummary::kCallOnSlowPath :
           LocationSummary::kNoCall);
 
@@ -4983,7 +4973,7 @@ void LocationsBuilderX86_64::VisitArrayLength(HArrayLength* instruction) {
 
 void InstructionCodeGeneratorX86_64::VisitArrayLength(HArrayLength* instruction) {
   LocationSummary* locations = instruction->GetLocations();
-  uint32_t offset = CodeGenerator::GetArrayLengthOffset(instruction);
+  uint32_t offset = mirror::Array::LengthOffset().Uint32Value();
   CpuRegister obj = locations->InAt(0).AsRegister<CpuRegister>();
   CpuRegister out = locations->Out().AsRegister<CpuRegister>();
   __ movl(out, Address(obj, offset));
@@ -5543,7 +5533,7 @@ void InstructionCodeGeneratorX86_64::VisitClearException(HClearException* clear 
 
 void LocationsBuilderX86_64::VisitThrow(HThrow* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
 }
@@ -6053,7 +6043,7 @@ void InstructionCodeGeneratorX86_64::VisitCheckCast(HCheckCast* instruction) {
 
 void LocationsBuilderX86_64::VisitMonitorOperation(HMonitorOperation* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, Location::RegisterLocation(calling_convention.GetRegisterAt(0)));
 }
@@ -6329,9 +6319,6 @@ void CodeGeneratorX86_64::GenerateArrayLoadWithBakerReadBarrier(HInstruction* in
   DCHECK(kEmitCompilerReadBarrier);
   DCHECK(kUseBakerReadBarrier);
 
-  static_assert(
-      sizeof(mirror::HeapReference<mirror::Object>) == sizeof(int32_t),
-      "art::mirror::HeapReference<art::mirror::Object> and int32_t have different sizes.");
   // /* HeapReference<Object> */ ref =
   //     *(obj + data_offset + index * sizeof(HeapReference<Object>))
   Address src = index.IsConstant() ?

@@ -41,11 +41,8 @@ class HDeadCodeElimination : public HOptimization {
 
  private:
   void MaybeRecordDeadBlock(HBasicBlock* block);
-  void MaybeRecordSimplifyIf();
-  bool RemoveDeadBlocks();
+  void RemoveDeadBlocks();
   void RemoveDeadInstructions();
-  bool SimplifyIfs();
-  void ConnectSuccessiveBlocks();
 
   DISALLOW_COPY_AND_ASSIGN(HDeadCodeElimination);
 };

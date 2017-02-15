@@ -31,7 +31,7 @@
 #include "nodes.h"
 #include "optimization.h"
 #include "reference_type_propagation.h"
-#include "register_allocator_linear_scan.h"
+#include "register_allocator.h"
 #include "ssa_liveness_analysis.h"
 #include "utils/assembler.h"
 
@@ -394,11 +394,6 @@ class HGraphVisualizerPrinter : public HGraphDelegateVisitor {
         << instance_of->MustDoNullCheck() << std::noboolalpha;
   }
 
-  void VisitArrayLength(HArrayLength* array_length) OVERRIDE {
-    StartAttributeStream("is_string_length") << std::boolalpha
-        << array_length->IsStringLength() << std::noboolalpha;
-  }
-
   void VisitArraySet(HArraySet* array_set) OVERRIDE {
     StartAttributeStream("value_can_be_null") << std::boolalpha
         << array_set->GetValueCanBeNull() << std::noboolalpha;
@@ -497,13 +492,12 @@ class HGraphVisualizerPrinter : public HGraphDelegateVisitor {
 
   void PrintInstruction(HInstruction* instruction) {
     output_ << instruction->DebugName();
-    HConstInputsRef inputs = instruction->GetInputs();
-    if (!inputs.empty()) {
-      StringList input_list;
-      for (const HInstruction* input : inputs) {
-        input_list.NewEntryStream() << GetTypeId(input->GetType()) << input->GetId();
+    if (instruction->InputCount() > 0) {
+      StringList inputs;
+      for (HInputIterator it(instruction); !it.Done(); it.Advance()) {
+        inputs.NewEntryStream() << GetTypeId(it.Current()->GetType()) << it.Current()->GetId();
       }
-      StartAttributeStream() << input_list;
+      StartAttributeStream() << inputs;
     }
     instruction->Accept(this);
     if (instruction->HasEnvironment()) {
@@ -545,12 +539,12 @@ class HGraphVisualizerPrinter : public HGraphDelegateVisitor {
       StartAttributeStream("liveness") << instruction->GetLifetimePosition();
       LocationSummary* locations = instruction->GetLocations();
       if (locations != nullptr) {
-        StringList input_list;
-        for (size_t i = 0, e = locations->GetInputCount(); i < e; ++i) {
-          DumpLocation(input_list.NewEntryStream(), locations->InAt(i));
+        StringList inputs;
+        for (size_t i = 0; i < instruction->InputCount(); ++i) {
+          DumpLocation(inputs.NewEntryStream(), locations->InAt(i));
         }
         std::ostream& attr = StartAttributeStream("locations");
-        attr << input_list << "->";
+        attr << inputs << "->";
         DumpLocation(attr, locations->Out());
       }
     }
@@ -740,8 +734,8 @@ class HGraphVisualizerPrinter : public HGraphDelegateVisitor {
       HInstruction* instruction = it.Current();
       output_ << instruction->GetId() << " " << GetTypeId(instruction->GetType())
               << instruction->GetId() << "[ ";
-      for (const HInstruction* input : instruction->GetInputs()) {
-        output_ << input->GetId() << " ";
+      for (HInputIterator inputs(instruction); !inputs.Done(); inputs.Advance()) {
+        output_ << inputs.Current()->GetId() << " ";
       }
       output_ << "]\n";
     }

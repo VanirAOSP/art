@@ -535,7 +535,7 @@ class Heap {
   void DumpForSigQuit(std::ostream& os) REQUIRES(!*gc_complete_lock_, !native_histogram_lock_);
 
   // Do a pending collector transition.
-  void DoPendingCollectorTransition() REQUIRES(!*gc_complete_lock_, !*pending_task_lock_);
+  void DoPendingCollectorTransition() REQUIRES(!*gc_complete_lock_);
 
   // Deflate monitors, ... and trim the spaces.
   void Trim(Thread* self) REQUIRES(!*gc_complete_lock_);
@@ -706,6 +706,8 @@ class Heap {
     if (IsGcConcurrent() && IsMovingGc(collector_type_)) {
       // Assume no transition when a concurrent moving collector is used.
       DCHECK_EQ(collector_type_, foreground_collector_type_);
+      DCHECK_EQ(foreground_collector_type_, background_collector_type_)
+          << "Assume no transition such that collector_type_ won't change";
       return true;
     }
     return false;
@@ -824,7 +826,6 @@ class Heap {
         collector_type == kCollectorTypeSS ||
         collector_type == kCollectorTypeGSS ||
         collector_type == kCollectorTypeCC ||
-        collector_type == kCollectorTypeCCBackground ||
         collector_type == kCollectorTypeMC ||
         collector_type == kCollectorTypeHomogeneousSpaceCompact;
   }
@@ -994,9 +995,7 @@ class Heap {
   // What kind of concurrency behavior is the runtime after? Currently true for concurrent mark
   // sweep GC, false for other GC types.
   bool IsGcConcurrent() const ALWAYS_INLINE {
-    return collector_type_ == kCollectorTypeCMS ||
-        collector_type_ == kCollectorTypeCC ||
-        collector_type_ == kCollectorTypeCCBackground;
+    return collector_type_ == kCollectorTypeCMS || collector_type_ == kCollectorTypeCC;
   }
 
   // Trim the managed and native spaces by releasing unused memory back to the OS.

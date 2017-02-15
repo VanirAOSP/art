@@ -30,10 +30,6 @@ class DexFile;
 // Temporary measure until we have caught up with the Java 7 definition of Math.round. b/26327751
 static constexpr bool kRoundIsPlusPointFive = false;
 
-// Positive floating-point infinities.
-static constexpr uint32_t kPositiveInfinityFloat = 0x7f800000U;
-static constexpr uint64_t kPositiveInfinityDouble = UINT64_C(0x7ff0000000000000);
-
 // Recognize intrinsics from HInvoke nodes.
 class IntrinsicsRecognizer : public HOptimization {
  public:
@@ -239,8 +235,6 @@ UNREACHABLE_INTRINSIC(Arch, IntegerCompare)         \
 UNREACHABLE_INTRINSIC(Arch, LongCompare)            \
 UNREACHABLE_INTRINSIC(Arch, IntegerSignum)          \
 UNREACHABLE_INTRINSIC(Arch, LongSignum)             \
-UNREACHABLE_INTRINSIC(Arch, StringIsEmpty)          \
-UNREACHABLE_INTRINSIC(Arch, StringLength)           \
 UNREACHABLE_INTRINSIC(Arch, UnsafeLoadFence)        \
 UNREACHABLE_INTRINSIC(Arch, UnsafeStoreFence)       \
 UNREACHABLE_INTRINSIC(Arch, UnsafeFullFence)

@@ -279,148 +279,6 @@ TEST_F(AssemblerThumb2Test, smull) {
   DriverStr(expected, "smull");
 }
 
-TEST_F(AssemblerThumb2Test, LoadByteFromThumbOffset) {
-  arm::LoadOperandType type = arm::kLoadUnsignedByte;
-
-  __ LoadFromOffset(type, arm::R0, arm::R7, 0);
-  __ LoadFromOffset(type, arm::R1, arm::R7, 31);
-  __ LoadFromOffset(type, arm::R2, arm::R7, 32);
-  __ LoadFromOffset(type, arm::R3, arm::R7, 4095);
-  __ LoadFromOffset(type, arm::R4, arm::SP, 0);
-
-  const char* expected =
-      "ldrb r0, [r7, #0]\n"
-      "ldrb r1, [r7, #31]\n"
-      "ldrb.w r2, [r7, #32]\n"
-      "ldrb.w r3, [r7, #4095]\n"
-      "ldrb.w r4, [sp, #0]\n";
-  DriverStr(expected, "LoadByteFromThumbOffset");
-}
-
-TEST_F(AssemblerThumb2Test, StoreByteToThumbOffset) {
-  arm::StoreOperandType type = arm::kStoreByte;
-
-  __ StoreToOffset(type, arm::R0, arm::R7, 0);
-  __ StoreToOffset(type, arm::R1, arm::R7, 31);
-  __ StoreToOffset(type, arm::R2, arm::R7, 32);
-  __ StoreToOffset(type, arm::R3, arm::R7, 4095);
-  __ StoreToOffset(type, arm::R4, arm::SP, 0);
-
-  const char* expected =
-      "strb r0, [r7, #0]\n"
-      "strb r1, [r7, #31]\n"
-      "strb.w r2, [r7, #32]\n"
-      "strb.w r3, [r7, #4095]\n"
-      "strb.w r4, [sp, #0]\n";
-  DriverStr(expected, "StoreByteToThumbOffset");
-}
-
-TEST_F(AssemblerThumb2Test, LoadHalfFromThumbOffset) {
-  arm::LoadOperandType type = arm::kLoadUnsignedHalfword;
-
-  __ LoadFromOffset(type, arm::R0, arm::R7, 0);
-  __ LoadFromOffset(type, arm::R1, arm::R7, 62);
-  __ LoadFromOffset(type, arm::R2, arm::R7, 64);
-  __ LoadFromOffset(type, arm::R3, arm::R7, 4094);
-  __ LoadFromOffset(type, arm::R4, arm::SP, 0);
-  __ LoadFromOffset(type, arm::R5, arm::R7, 1);  // Unaligned
-
-  const char* expected =
-      "ldrh r0, [r7, #0]\n"
-      "ldrh r1, [r7, #62]\n"
-      "ldrh.w r2, [r7, #64]\n"
-      "ldrh.w r3, [r7, #4094]\n"
-      "ldrh.w r4, [sp, #0]\n"
-      "ldrh.w r5, [r7, #1]\n";
-  DriverStr(expected, "LoadHalfFromThumbOffset");
-}
-
-TEST_F(AssemblerThumb2Test, StoreHalfToThumbOffset) {
-  arm::StoreOperandType type = arm::kStoreHalfword;
-
-  __ StoreToOffset(type, arm::R0, arm::R7, 0);
-  __ StoreToOffset(type, arm::R1, arm::R7, 62);
-  __ StoreToOffset(type, arm::R2, arm::R7, 64);
-  __ StoreToOffset(type, arm::R3, arm::R7, 4094);
-  __ StoreToOffset(type, arm::R4, arm::SP, 0);
-  __ StoreToOffset(type, arm::R5, arm::R7, 1);  // Unaligned
-
-  const char* expected =
-      "strh r0, [r7, #0]\n"
-      "strh r1, [r7, #62]\n"
-      "strh.w r2, [r7, #64]\n"
-      "strh.w r3, [r7, #4094]\n"
-      "strh.w r4, [sp, #0]\n"
-      "strh.w r5, [r7, #1]\n";
-  DriverStr(expected, "StoreHalfToThumbOffset");
-}
-
-TEST_F(AssemblerThumb2Test, LoadWordFromSpPlusOffset) {
-  arm::LoadOperandType type = arm::kLoadWord;
-
-  __ LoadFromOffset(type, arm::R0, arm::SP, 0);
-  __ LoadFromOffset(type, arm::R1, arm::SP, 124);
-  __ LoadFromOffset(type, arm::R2, arm::SP, 128);
-  __ LoadFromOffset(type, arm::R3, arm::SP, 1020);
-  __ LoadFromOffset(type, arm::R4, arm::SP, 1024);
-  __ LoadFromOffset(type, arm::R5, arm::SP, 4092);
-  __ LoadFromOffset(type, arm::R6, arm::SP, 1);  // Unaligned
-
-  const char* expected =
-      "ldr r0, [sp, #0]\n"
-      "ldr r1, [sp, #124]\n"
-      "ldr r2, [sp, #128]\n"
-      "ldr r3, [sp, #1020]\n"
-      "ldr.w r4, [sp, #1024]\n"
-      "ldr.w r5, [sp, #4092]\n"
-      "ldr.w r6, [sp, #1]\n";
-  DriverStr(expected, "LoadWordFromSpPlusOffset");
-}
-
-TEST_F(AssemblerThumb2Test, StoreWordToSpPlusOffset) {
-  arm::StoreOperandType type = arm::kStoreWord;
-
-  __ StoreToOffset(type, arm::R0, arm::SP, 0);
-  __ StoreToOffset(type, arm::R1, arm::SP, 124);
-  __ StoreToOffset(type, arm::R2, arm::SP, 128);
-  __ StoreToOffset(type, arm::R3, arm::SP, 1020);
-  __ StoreToOffset(type, arm::R4, arm::SP, 1024);
-  __ StoreToOffset(type, arm::R5, arm::SP, 4092);
-  __ StoreToOffset(type, arm::R6, arm::SP, 1);  // Unaligned
-
-  const char* expected =
-      "str r0, [sp, #0]\n"
-      "str r1, [sp, #124]\n"
-      "str r2, [sp, #128]\n"
-      "str r3, [sp, #1020]\n"
-      "str.w r4, [sp, #1024]\n"
-      "str.w r5, [sp, #4092]\n"
-      "str.w r6, [sp, #1]\n";
-  DriverStr(expected, "StoreWordToSpPlusOffset");
-}
-
-TEST_F(AssemblerThumb2Test, LoadWordFromPcPlusOffset) {
-  arm::LoadOperandType type = arm::kLoadWord;
-
-  __ LoadFromOffset(type, arm::R0, arm::PC, 0);
-  __ LoadFromOffset(type, arm::R1, arm::PC, 124);
-  __ LoadFromOffset(type, arm::R2, arm::PC, 128);
-  __ LoadFromOffset(type, arm::R3, arm::PC, 1020);
-  __ LoadFromOffset(type, arm::R4, arm::PC, 1024);
-  __ LoadFromOffset(type, arm::R5, arm::PC, 4092);
-  __ LoadFromOffset(type, arm::R6, arm::PC, 1);  // Unaligned
-
-  const char* expected =
-      "ldr r0, [pc, #0]\n"
-      "ldr r1, [pc, #124]\n"
-      "ldr r2, [pc, #128]\n"
-      "ldr r3, [pc, #1020]\n"
-      "ldr.w r4, [pc, #1024]\n"
-      "ldr.w r5, [pc, #4092]\n"
-      "ldr.w r6, [pc, #1]\n";
-  DriverStr(expected, "LoadWordFromPcPlusOffset");
-}
-
 TEST_F(AssemblerThumb2Test, StoreWordToThumbOffset) {
   arm::StoreOperandType type = arm::kStoreWord;
   int32_t offset = 4092;
@@ -1011,11 +869,10 @@ TEST_F(AssemblerThumb2Test, LoadLiteralWideBeyondMax1KiB) {
   }
 
   std::string expected =
-      // "as" does not consider ((2f - 1f - 4) & 0xffff) a constant expression for movw.
-      "movw ip, #(0x408 - 0x4 - 4)\n"
+      "mov.w ip, #((2f - 1f - 4) & ~0x3ff)\n"
       "1:\n"
       "add ip, pc\n"
-      "ldrd r1, r3, [ip, #0]\n" +
+      "ldrd r1, r3, [ip, #((2f - 1b - 4) & 0x3ff)]\n" +
       RepeatInsn(kLdrR0R0Count, "ldr r0, [r0]\n") +
       ".align 2, 0\n"
       "2:\n"
@@ -1027,78 +884,48 @@ TEST_F(AssemblerThumb2Test, LoadLiteralWideBeyondMax1KiB) {
             __ GetAdjustedPosition(label.Position()));
 }
 
-TEST_F(AssemblerThumb2Test, LoadLiteralSingleMax64KiB) {
+TEST_F(AssemblerThumb2Test, LoadLiteralSingleMax256KiB) {
   // The literal size must match but the type doesn't, so use an int32_t rather than float.
   arm::Literal* literal = __ NewLiteral<int32_t>(0x12345678);
   __ LoadLiteral(arm::S3, literal);
   Label label;
   __ Bind(&label);
-  constexpr size_t kLdrR0R0Count = (1 << 15) - 3u;
+  constexpr size_t kLdrR0R0Count = (1 << 17) - 3u;
   for (size_t i = 0; i != kLdrR0R0Count; ++i) {
     __ ldr(arm::R0, arm::Address(arm::R0));
   }
 
   std::string expected =
-      // "as" does not consider ((2f - 1f - 4) & 0xffff) a constant expression for movw.
-      "movw ip, #(0x10004 - 0x4 - 4)\n"
+      "mov.w ip, #((2f - 1f - 4) & ~0x3ff)\n"
       "1:\n"
       "add ip, pc\n"
-      "vldr s3, [ip, #0]\n" +
+      "vldr s3, [ip, #((2f - 1b - 4) & 0x3ff)]\n" +
       RepeatInsn(kLdrR0R0Count, "ldr r0, [r0]\n") +
       ".align 2, 0\n"
       "2:\n"
       ".word 0x12345678\n";
-  DriverStr(expected, "LoadLiteralSingleMax64KiB");
+  DriverStr(expected, "LoadLiteralSingleMax256KiB");
 
   EXPECT_EQ(static_cast<uint32_t>(label.Position()) + 6u,
             __ GetAdjustedPosition(label.Position()));
 }
 
-TEST_F(AssemblerThumb2Test, LoadLiteralSingleMax64KiB_UnalignedPC) {
-  // The literal size must match but the type doesn't, so use an int32_t rather than float.
-  arm::Literal* literal = __ NewLiteral<int32_t>(0x12345678);
-  __ ldr(arm::R0, arm::Address(arm::R0));
-  __ LoadLiteral(arm::S3, literal);
-  Label label;
-  __ Bind(&label);
-  constexpr size_t kLdrR0R0Count = (1 << 15) - 4u;
-  for (size_t i = 0; i != kLdrR0R0Count; ++i) {
-    __ ldr(arm::R0, arm::Address(arm::R0));
-  }
-
-  std::string expected =
-      "ldr r0, [r0]\n"
-      // "as" does not consider ((2f - 1f - 4) & 0xffff) a constant expression for movw.
-      "movw ip, #(0x10004 - 0x6 - 4)\n"
-      "1:\n"
-      "add ip, pc\n"
-      "vldr s3, [ip, #0]\n" +
-      RepeatInsn(kLdrR0R0Count, "ldr r0, [r0]\n") +
-      ".align 2, 0\n"
-      "2:\n"
-      ".word 0x12345678\n";
-  DriverStr(expected, "LoadLiteralSingleMax64KiB_UnalignedPC");
-
-  EXPECT_EQ(static_cast<uint32_t>(label.Position()) + 6u,
-            __ GetAdjustedPosition(label.Position()));
-}
-
-TEST_F(AssemblerThumb2Test, LoadLiteralDoubleBeyondMax64KiB) {
+TEST_F(AssemblerThumb2Test, LoadLiteralDoubleBeyondMax256KiB) {
   // The literal size must match but the type doesn't, so use an int64_t rather than double.
   arm::Literal* literal = __ NewLiteral<int64_t>(INT64_C(0x1234567887654321));
   __ LoadLiteral(arm::D3, literal);
   Label label;
   __ Bind(&label);
-  constexpr size_t kLdrR0R0Count = (1 << 15) - 2u;
+  constexpr size_t kLdrR0R0Count = (1 << 17) - 2u;
   for (size_t i = 0; i != kLdrR0R0Count; ++i) {
     __ ldr(arm::R0, arm::Address(arm::R0));
   }
 
   std::string expected =
       // "as" does not consider ((2f - 1f - 4) & 0xffff) a constant expression for movw.
-      "movw ip, #((0x1000c - 0x8 - 4) & 0xffff)\n"
+      "movw ip, #(0x40000 & 0xffff)\n"
       // "as" does not consider ((2f - 1f - 4) >> 16) a constant expression for movt.
-      "movt ip, #((0x1000c - 0x8 - 4) >> 16)\n"
+      "movt ip, #(0x40000 >> 16)\n"
       "1:\n"
       "add ip, pc\n"
       "vldr d3, [ip, #0]\n" +
@@ -1107,7 +934,7 @@ TEST_F(AssemblerThumb2Test, LoadLiteralDoubleBeyondMax64KiB) {
       "2:\n"
       ".word 0x87654321\n"
       ".word 0x12345678\n";
-  DriverStr(expected, "LoadLiteralDoubleBeyondMax64KiB");
+  DriverStr(expected, "LoadLiteralDoubleBeyondMax256KiB");
 
   EXPECT_EQ(static_cast<uint32_t>(label.Position()) + 10u,
             __ GetAdjustedPosition(label.Position()));
@@ -1119,16 +946,16 @@ TEST_F(AssemblerThumb2Test, LoadLiteralDoubleFar) {
   __ LoadLiteral(arm::D3, literal);
   Label label;
   __ Bind(&label);
-  constexpr size_t kLdrR0R0Count = (1 << 15) - 2u + 0x1234;
+  constexpr size_t kLdrR0R0Count = (1 << 17) - 2u + 0x1234;
   for (size_t i = 0; i != kLdrR0R0Count; ++i) {
     __ ldr(arm::R0, arm::Address(arm::R0));
   }
 
   std::string expected =
       // "as" does not consider ((2f - 1f - 4) & 0xffff) a constant expression for movw.
-      "movw ip, #((0x1000c + 2 * 0x1234 - 0x8 - 4) & 0xffff)\n"
+      "movw ip, #((0x40000 + 2 * 0x1234) & 0xffff)\n"
       // "as" does not consider ((2f - 1f - 4) >> 16) a constant expression for movt.
-      "movt ip, #((0x1000c + 2 * 0x1234 - 0x8 - 4) >> 16)\n"
+      "movt ip, #((0x40000 + 2 * 0x1234) >> 16)\n"
       "1:\n"
       "add ip, pc\n"
       "vldr d3, [ip, #0]\n" +
@@ -1551,106 +1378,6 @@ TEST_F(AssemblerThumb2Test, revsh) {
   const char* expected = "revsh r1, r0\n";
 
   DriverStr(expected, "revsh");
-}
-
-TEST_F(AssemblerThumb2Test, vcnt) {
-  // Different D register numbers are used here, to test register encoding.
-  // Source register number is encoded as M:Vm, destination register number is encoded as D:Vd,
-  // For source and destination registers which use D0..D15, the M bit and D bit should be 0.
-  // For source and destination registers which use D16..D32, the M bit and D bit should be 1.
-  __ vcntd(arm::D0, arm::D1);
-  __ vcntd(arm::D19, arm::D20);
-  __ vcntd(arm::D0, arm::D9);
-  __ vcntd(arm::D16, arm::D20);
-
-  std::string expected =
-      "vcnt.8 d0, d1\n"
-      "vcnt.8 d19, d20\n"
-      "vcnt.8 d0, d9\n"
-      "vcnt.8 d16, d20\n";
-
-  DriverStr(expected, "vcnt");
-}
-
-TEST_F(AssemblerThumb2Test, vpaddl) {
-  // Different D register numbers are used here, to test register encoding.
-  // Source register number is encoded as M:Vm, destination register number is encoded as D:Vd,
-  // For source and destination registers which use D0..D15, the M bit and D bit should be 0.
-  // For source and destination registers which use D16..D32, the M bit and D bit should be 1.
-  // Different data types (signed and unsigned) are also tested.
-  __ vpaddld(arm::D0, arm::D0, 8, true);
-  __ vpaddld(arm::D20, arm::D20, 8, false);
-  __ vpaddld(arm::D0, arm::D20, 16, false);
-  __ vpaddld(arm::D20, arm::D0, 32, true);
-
-  std::string expected =
-      "vpaddl.u8 d0, d0\n"
-      "vpaddl.s8 d20, d20\n"
-      "vpaddl.s16 d0, d20\n"
-      "vpaddl.u32 d20, d0\n";
-
-  DriverStr(expected, "vpaddl");
-}
-
-TEST_F(AssemblerThumb2Test, LoadFromShiftedRegOffset) {
-  arm::Address mem_address(arm::R0, arm::R1, arm::Shift::LSL, 2);
-
-  __ ldrsb(arm::R2, mem_address);
-  __ ldrb(arm::R2, mem_address);
-  __ ldrsh(arm::R2, mem_address);
-  __ ldrh(arm::R2, mem_address);
-  __ ldr(arm::R2, mem_address);
-
-  std::string expected =
-      "ldrsb r2, [r0, r1, LSL #2]\n"
-      "ldrb r2, [r0, r1, LSL #2]\n"
-      "ldrsh r2, [r0, r1, LSL #2]\n"
-      "ldrh r2, [r0, r1, LSL #2]\n"
-      "ldr r2, [r0, r1, LSL #2]\n";
-
-  DriverStr(expected, "LoadFromShiftedRegOffset");
-}
-
-TEST_F(AssemblerThumb2Test, VStmLdmPushPop) {
-  // Different D register numbers are used here, to test register encoding.
-  // Source register number is encoded as M:Vm, destination register number is encoded as D:Vd,
-  // For source and destination registers which use D0..D15, the M bit and D bit should be 0.
-  // For source and destination registers which use D16..D32, the M bit and D bit should be 1.
-  // Different data types (signed and unsigned) are also tested.
-  __ vstmiad(arm::R0, arm::D0, 4);
-  __ vldmiad(arm::R1, arm::D9, 5);
-  __ vpopd(arm::D0, 4);
-  __ vpushd(arm::D9, 5);
-  __ vpops(arm::S0, 4);
-  __ vpushs(arm::S9, 5);
-  __ vpushs(arm::S16, 5);
-  __ vpushd(arm::D0, 16);
-  __ vpushd(arm::D1, 15);
-  __ vpushd(arm::D8, 16);
-  __ vpushd(arm::D31, 1);
-  __ vpushs(arm::S0, 32);
-  __ vpushs(arm::S1, 31);
-  __ vpushs(arm::S16, 16);
-  __ vpushs(arm::S31, 1);
-
-  std::string expected =
-      "vstmia r0, {d0 - d3}\n"
-      "vldmia r1, {d9 - d13}\n"
-      "vpop {d0 - d3}\n"
-      "vpush {d9 - d13}\n"
-      "vpop {s0 - s3}\n"
-      "vpush {s9 - s13}\n"
-      "vpush {s16 - s20}\n"
-      "vpush {d0 - d15}\n"
-      "vpush {d1 - d15}\n"
-      "vpush {d8 - d23}\n"
-      "vpush {d31}\n"
-      "vpush {s0 - s31}\n"
-      "vpush {s1 - s31}\n"
-      "vpush {s16 - s31}\n"
-      "vpush {s31}\n";
-
-  DriverStr(expected, "VStmLdmPushPop");
 }
 
 }  // namespace art

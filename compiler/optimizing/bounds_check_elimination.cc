@@ -533,6 +533,9 @@ class BCEVisitor : public HGraphVisitor {
         first_index_bounds_check_map_(
             std::less<int>(),
             graph->GetArena()->Adapter(kArenaAllocBoundsCheckElimination)),
+        dynamic_bce_standby_(
+            graph->GetArena()->Adapter(kArenaAllocBoundsCheckElimination)),
+        record_dynamic_bce_standby_(true),
         early_exit_loop_(
             std::less<uint32_t>(),
             graph->GetArena()->Adapter(kArenaAllocBoundsCheckElimination)),
@@ -557,6 +560,14 @@ class BCEVisitor : public HGraphVisitor {
   }
 
   void Finish() {
+    // Retry dynamic bce candidates on standby that are still in the graph.
+    record_dynamic_bce_standby_ = false;
+    for (HBoundsCheck* bounds_check : dynamic_bce_standby_) {
+      if (bounds_check->IsInBlock()) {
+        TryDynamicBCE(bounds_check);
+      }
+    }
+
     // Preserve SSA structure which may have been broken by adding one or more
     // new taken-test structures (see TransformLoopForDeoptimizationIfNeeded()).
     InsertPhiNodes();
@@ -565,6 +576,7 @@ class BCEVisitor : public HGraphVisitor {
     early_exit_loop_.clear();
     taken_test_loop_.clear();
     finite_loop_.clear();
+    dynamic_bce_standby_.clear();
   }
 
  private:
@@ -792,9 +804,6 @@ class BCEVisitor : public HGraphVisitor {
   }
 
   void VisitBoundsCheck(HBoundsCheck* bounds_check) OVERRIDE {
-    if (!bounds_check->IsInBlock()) {
-      return;  // was forward deleted
-    }
     HBasicBlock* block = bounds_check->GetBlock();
     HInstruction* index = bounds_check->InputAt(0);
     HInstruction* array_length = bounds_check->InputAt(1);
@@ -802,6 +811,7 @@ class BCEVisitor : public HGraphVisitor {
            array_length->IsArrayLength() ||
            array_length->IsPhi());
     bool try_dynamic_bce = true;
+
     // Analyze index range.
     if (!index->IsIntConstant()) {
       // Non-constant index.
@@ -816,7 +826,7 @@ class BCEVisitor : public HGraphVisitor {
       }
       // Try index range obtained by induction variable analysis.
       // Disables dynamic bce if OOB is certain.
-      if (InductionRangeFitsIn(&array_range, bounds_check, &try_dynamic_bce)) {
+      if (InductionRangeFitsIn(&array_range, bounds_check, index, &try_dynamic_bce)) {
         ReplaceInstruction(bounds_check, index);
         return;
       }
@@ -865,20 +875,10 @@ class BCEVisitor : public HGraphVisitor {
     // If static analysis fails, and OOB is not certain, try dynamic elimination.
     if (try_dynamic_bce) {
       // Try loop-based dynamic elimination.
-      HLoopInformation* loop = bounds_check->GetBlock()->GetLoopInformation();
-      bool needs_finite_test = false;
-      bool needs_taken_test = false;
-      if (DynamicBCESeemsProfitable(loop, bounds_check->GetBlock()) &&
-          induction_range_.CanGenerateRange(
-              bounds_check, index, &needs_finite_test, &needs_taken_test) &&
-          CanHandleInfiniteLoop(loop, index, needs_finite_test) &&
-          // Do this test last, since it may generate code.
-          CanHandleLength(loop, array_length, needs_taken_test)) {
-        TransformLoopForDeoptimizationIfNeeded(loop, needs_taken_test);
-        TransformLoopForDynamicBCE(loop, bounds_check);
+      if (TryDynamicBCE(bounds_check)) {
         return;
       }
-      // Otherwise, prepare dominator-based dynamic elimination.
+      // Prepare dominator-based dynamic elimination.
       if (first_index_bounds_check_map_.find(array_length->GetId()) ==
           first_index_bounds_check_map_.end()) {
         // Remember the first bounds check against each array_length. That bounds check
@@ -891,15 +891,14 @@ class BCEVisitor : public HGraphVisitor {
 
   static bool HasSameInputAtBackEdges(HPhi* phi) {
     DCHECK(phi->IsLoopHeaderPhi());
-    HConstInputsRef inputs = phi->GetInputs();
     // Start with input 1. Input 0 is from the incoming block.
-    const HInstruction* input1 = inputs[1];
+    HInstruction* input1 = phi->InputAt(1);
     DCHECK(phi->GetBlock()->GetLoopInformation()->IsBackEdge(
         *phi->GetBlock()->GetPredecessors()[1]));
-    for (size_t i = 2; i < inputs.size(); ++i) {
+    for (size_t i = 2, e = phi->InputCount(); i < e; ++i) {
       DCHECK(phi->GetBlock()->GetLoopInformation()->IsBackEdge(
           *phi->GetBlock()->GetPredecessors()[i]));
-      if (input1 != inputs[i]) {
+      if (input1 != phi->InputAt(i)) {
         return false;
       }
     }
@@ -1165,7 +1164,7 @@ class BCEVisitor : public HGraphVisitor {
     }
   }
 
-  /** Performs dominator-based dynamic elimination on suitable set of bounds checks. */
+  // Perform dominator-based dynamic elimination on suitable set of bounds checks.
   void AddCompareWithDeoptimization(HBasicBlock* block,
                                     HInstruction* array_length,
                                     HInstruction* base,
@@ -1175,12 +1174,6 @@ class BCEVisitor : public HGraphVisitor {
     // Construct deoptimization on single or double bounds on range [base-min_c,base+max_c],
     // for example either for a[0]..a[3] just 3 or for a[base-1]..a[base+3] both base-1
     // and base+3, since we made the assumption any in between value may occur too.
-    // In code, using unsigned comparisons:
-    // (1) constants only
-    //       if (max_c >= a.length) deoptimize;
-    // (2) general case
-    //       if (base-min_c >  base+max_c) deoptimize;
-    //       if (base+max_c >= a.length  ) deoptimize;
     static_assert(kMaxLengthForAddingDeoptimize < std::numeric_limits<int32_t>::max(),
                   "Incorrect max length may be subject to arithmetic wrap-around");
     HInstruction* upper = GetGraph()->GetIntConstant(max_c);
@@ -1199,7 +1192,7 @@ class BCEVisitor : public HGraphVisitor {
     has_dom_based_dynamic_bce_ = true;
   }
 
-  /** Attempts dominator-based dynamic elimination on remaining candidates. */
+  // Attempt dominator-based dynamic elimination on remaining candidates.
   void AddComparesWithDeoptimization(HBasicBlock* block) {
     for (const auto& entry : first_index_bounds_check_map_) {
       HBoundsCheck* bounds_check = entry.second;
@@ -1263,19 +1256,17 @@ class BCEVisitor : public HGraphVisitor {
           candidates.push_back(other_bounds_check);
         }
       }
-      // Perform dominator-based deoptimization if it seems profitable, where we eliminate
-      // bounds checks and replace these with deopt checks that guard against any possible
-      // OOB. Note that we reject cases where the distance min_c:max_c range gets close to
-      // the maximum possible array length, since those cases are likely to always deopt
-      // (such situations do not necessarily go OOB, though, since the array could be really
-      // large, or the programmer could rely on arithmetic wrap-around from max to min).
+      // Perform dominator-based deoptimization if it seems profitable. Note that we reject cases
+      // where the distance min_c:max_c range gets close to the maximum possible array length,
+      // since those cases are likely to always deopt (such situations do not necessarily go
+      // OOB, though, since the programmer could rely on wrap-around from max to min).
       size_t threshold = kThresholdForAddingDeoptimize + (base == nullptr ? 0 : 1);  // extra test?
       uint32_t distance = static_cast<uint32_t>(max_c) - static_cast<uint32_t>(min_c);
       if (candidates.size() >= threshold &&
           (base != nullptr || min_c >= 0) &&  // reject certain OOB
            distance <= kMaxLengthForAddingDeoptimize) {  // reject likely/certain deopt
         AddCompareWithDeoptimization(block, array_length, base, min_c, max_c);
-        for (HBoundsCheck* other_bounds_check : candidates) {
+        for (HInstruction* other_bounds_check : candidates) {
           // Only replace if still in the graph. This avoids visiting the same
           // bounds check twice if it occurred multiple times in the use list.
           if (other_bounds_check->IsInBlock()) {
@@ -1292,156 +1283,77 @@ class BCEVisitor : public HGraphVisitor {
    * parameter try_dynamic_bce is set to false if OOB is certain.
    */
   bool InductionRangeFitsIn(ValueRange* array_range,
-                            HBoundsCheck* context,
+                            HInstruction* context,
+                            HInstruction* index,
                             bool* try_dynamic_bce) {
     InductionVarRange::Value v1;
     InductionVarRange::Value v2;
     bool needs_finite_test = false;
-    HInstruction* index = context->InputAt(0);
-    HInstruction* hint = ValueBound::HuntForDeclaration(context->InputAt(1));
-    if (induction_range_.GetInductionRange(context, index, hint, &v1, &v2, &needs_finite_test)) {
-      if (v1.is_known && (v1.a_constant == 0 || v1.a_constant == 1) &&
-          v2.is_known && (v2.a_constant == 0 || v2.a_constant == 1)) {
-        DCHECK(v1.a_constant == 1 || v1.instruction == nullptr);
-        DCHECK(v2.a_constant == 1 || v2.instruction == nullptr);
-        ValueRange index_range(GetGraph()->GetArena(),
-                               ValueBound(v1.instruction, v1.b_constant),
-                               ValueBound(v2.instruction, v2.b_constant));
-        // If analysis reveals a certain OOB, disable dynamic BCE. Otherwise,
-        // use analysis for static bce only if loop is finite.
-        if (index_range.GetLower().LessThan(array_range->GetLower()) ||
-            index_range.GetUpper().GreaterThan(array_range->GetUpper())) {
-          *try_dynamic_bce = false;
-        } else if (!needs_finite_test && index_range.FitsIn(array_range)) {
-          return true;
+    if (induction_range_.GetInductionRange(context, index, &v1, &v2, &needs_finite_test)) {
+      do {
+        if (v1.is_known && (v1.a_constant == 0 || v1.a_constant == 1) &&
+            v2.is_known && (v2.a_constant == 0 || v2.a_constant == 1)) {
+          DCHECK(v1.a_constant == 1 || v1.instruction == nullptr);
+          DCHECK(v2.a_constant == 1 || v2.instruction == nullptr);
+          ValueRange index_range(GetGraph()->GetArena(),
+                                 ValueBound(v1.instruction, v1.b_constant),
+                                 ValueBound(v2.instruction, v2.b_constant));
+          // If analysis reveals a certain OOB, disable dynamic BCE.
+          if (index_range.GetLower().LessThan(array_range->GetLower()) ||
+              index_range.GetUpper().GreaterThan(array_range->GetUpper())) {
+            *try_dynamic_bce = false;
+            return false;
+          }
+          // Use analysis for static bce only if loop is finite.
+          if (!needs_finite_test && index_range.FitsIn(array_range)) {
+            return true;
+          }
         }
-      }
+      } while (induction_range_.RefineOuter(&v1, &v2));
     }
     return false;
   }
 
   /**
-   * Performs loop-based dynamic elimination on a bounds check. In order to minimize the
-   * number of eventually generated tests, related bounds checks with tests that can be
-   * combined with tests for the given bounds check are collected first.
+   * When the compiler fails to remove a bounds check statically, we try to remove the bounds
+   * check dynamically by adding runtime tests that trigger a deoptimization in case bounds
+   * will go out of range (we want to be rather certain of that given the slowdown of
+   * deoptimization). If no deoptimization occurs, the loop is executed with all corresponding
+   * bounds checks and related null checks removed.
    */
-  void TransformLoopForDynamicBCE(HLoopInformation* loop, HBoundsCheck* bounds_check) {
-    HInstruction* index = bounds_check->InputAt(0);
-    HInstruction* array_length = bounds_check->InputAt(1);
-    DCHECK(loop->IsDefinedOutOfTheLoop(array_length));  // pre-checked
-    DCHECK(loop->DominatesAllBackEdges(bounds_check->GetBlock()));
-    // Collect all bounds checks in the same loop that are related as "a[base + constant]"
-    // for a base instruction (possibly absent) and various constants.
-    ValueBound value = ValueBound::AsValueBound(index);
-    HInstruction* base = value.GetInstruction();
-    int32_t min_c = base == nullptr ? 0 : value.GetConstant();
-    int32_t max_c = value.GetConstant();
-    ArenaVector<HBoundsCheck*> candidates(
-        GetGraph()->GetArena()->Adapter(kArenaAllocBoundsCheckElimination));
-    ArenaVector<HBoundsCheck*> standby(
-        GetGraph()->GetArena()->Adapter(kArenaAllocBoundsCheckElimination));
-    for (const HUseListNode<HInstruction*>& use : array_length->GetUses()) {
-      HInstruction* user = use.GetUser();
-      if (user->IsBoundsCheck() && loop == user->GetBlock()->GetLoopInformation()) {
-        HBoundsCheck* other_bounds_check = user->AsBoundsCheck();
-        HInstruction* other_index = other_bounds_check->InputAt(0);
-        HInstruction* other_array_length = other_bounds_check->InputAt(1);
-        ValueBound other_value = ValueBound::AsValueBound(other_index);
-        int32_t other_c = other_value.GetConstant();
-        if (array_length == other_array_length && base == other_value.GetInstruction()) {
-          // Does the current basic block dominate all back edges? If not,
-          // add this candidate later only if it falls into the range.
-          if (!loop->DominatesAllBackEdges(user->GetBlock())) {
-            standby.push_back(other_bounds_check);
-            continue;
-          }
-          min_c = std::min(min_c, other_c);
-          max_c = std::max(max_c, other_c);
-          candidates.push_back(other_bounds_check);
-        }
+  bool TryDynamicBCE(HBoundsCheck* instruction) {
+    HLoopInformation* loop = instruction->GetBlock()->GetLoopInformation();
+    HInstruction* index = instruction->InputAt(0);
+    HInstruction* length = instruction->InputAt(1);
+    // If dynamic bounds check elimination seems profitable and is possible, then proceed.
+    bool needs_finite_test = false;
+    bool needs_taken_test = false;
+    if (DynamicBCESeemsProfitable(loop, instruction->GetBlock()) &&
+        induction_range_.CanGenerateCode(
+            instruction, index, &needs_finite_test, &needs_taken_test) &&
+        CanHandleInfiniteLoop(loop, instruction, index, needs_finite_test) &&
+        CanHandleLength(loop, length, needs_taken_test)) {  // do this test last (may code gen)
+      HInstruction* lower = nullptr;
+      HInstruction* upper = nullptr;
+      // Generate the following unsigned comparisons
+      //     if (lower > upper)   deoptimize;
+      //     if (upper >= length) deoptimize;
+      // or, for a non-induction index, just the unsigned comparison on its 'upper' value
+      //     if (upper >= length) deoptimize;
+      // as runtime test. By restricting dynamic bce to unit strides (with a maximum of 32-bit
+      // iterations) and by not combining access (e.g. a[i], a[i-3], a[i+5] etc.), these tests
+      // correctly guard against any possible OOB (including arithmetic wrap-around cases).
+      TransformLoopForDeoptimizationIfNeeded(loop, needs_taken_test);
+      HBasicBlock* block = GetPreHeader(loop, instruction);
+      induction_range_.GenerateRangeCode(instruction, index, GetGraph(), block, &lower, &upper);
+      if (lower != nullptr) {
+        InsertDeoptInLoop(loop, block, new (GetGraph()->GetArena()) HAbove(lower, upper));
       }
+      InsertDeoptInLoop(loop, block, new (GetGraph()->GetArena()) HAboveOrEqual(upper, length));
+      ReplaceInstruction(instruction, index);
+      return true;
     }
-    // Add standby candidates that fall in selected range.
-    for (HBoundsCheck* other_bounds_check : standby) {
-      HInstruction* other_index = other_bounds_check->InputAt(0);
-      int32_t other_c = ValueBound::AsValueBound(other_index).GetConstant();
-      if (min_c <= other_c && other_c <= max_c) {
-        candidates.push_back(other_bounds_check);
-      }
-    }
-    // Perform loop-based deoptimization if it seems profitable, where we eliminate bounds
-    // checks and replace these with deopt checks that guard against any possible OOB.
-    DCHECK_LT(0u, candidates.size());
-    uint32_t distance = static_cast<uint32_t>(max_c) - static_cast<uint32_t>(min_c);
-    if ((base != nullptr || min_c >= 0) &&  // reject certain OOB
-        distance <= kMaxLengthForAddingDeoptimize) {  // reject likely/certain deopt
-      HBasicBlock* block = GetPreHeader(loop, bounds_check);
-      HInstruction* min_lower = nullptr;
-      HInstruction* min_upper = nullptr;
-      HInstruction* max_lower = nullptr;
-      HInstruction* max_upper = nullptr;
-      // Iterate over all bounds checks.
-      for (HBoundsCheck* other_bounds_check : candidates) {
-        // Only handle if still in the graph. This avoids visiting the same
-        // bounds check twice if it occurred multiple times in the use list.
-        if (other_bounds_check->IsInBlock()) {
-          HInstruction* other_index = other_bounds_check->InputAt(0);
-          int32_t other_c = ValueBound::AsValueBound(other_index).GetConstant();
-          // Generate code for either the maximum or minimum. Range analysis already was queried
-          // whether code generation on the original and, thus, related bounds check was possible.
-          // It handles either loop invariants (lower is not set) or unit strides.
-          if (other_c == max_c) {
-            induction_range_.GenerateRange(
-                other_bounds_check, other_index, GetGraph(), block, &max_lower, &max_upper);
-          } else if (other_c == min_c && base != nullptr) {
-            induction_range_.GenerateRange(
-                other_bounds_check, other_index, GetGraph(), block, &min_lower, &min_upper);
-          }
-          ReplaceInstruction(other_bounds_check, other_index);
-        }
-      }
-      // In code, using unsigned comparisons:
-      // (1) constants only
-      //       if (max_upper >= a.length ) deoptimize;
-      // (2) two symbolic invariants
-      //       if (min_upper >  max_upper) deoptimize;   unless min_c == max_c
-      //       if (max_upper >= a.length ) deoptimize;
-      // (3) general case, unit strides (where lower would exceed upper for arithmetic wrap-around)
-      //       if (min_lower >  max_lower) deoptimize;   unless min_c == max_c
-      //       if (max_lower >  max_upper) deoptimize;
-      //       if (max_upper >= a.length ) deoptimize;
-      if (base == nullptr) {
-        // Constants only.
-        DCHECK_GE(min_c, 0);
-        DCHECK(min_lower == nullptr && min_upper == nullptr &&
-               max_lower == nullptr && max_upper != nullptr);
-      } else if (max_lower == nullptr) {
-        // Two symbolic invariants.
-        if (min_c != max_c) {
-          DCHECK(min_lower == nullptr && min_upper != nullptr &&
-                 max_lower == nullptr && max_upper != nullptr);
-          InsertDeoptInLoop(loop, block, new (GetGraph()->GetArena()) HAbove(min_upper, max_upper));
-        } else {
-          DCHECK(min_lower == nullptr && min_upper == nullptr &&
-                 max_lower == nullptr && max_upper != nullptr);
-        }
-      } else {
-        // General case, unit strides.
-        if (min_c != max_c) {
-          DCHECK(min_lower != nullptr && min_upper != nullptr &&
-                 max_lower != nullptr && max_upper != nullptr);
-          InsertDeoptInLoop(loop, block, new (GetGraph()->GetArena()) HAbove(min_lower, max_lower));
-        } else {
-          DCHECK(min_lower == nullptr && min_upper == nullptr &&
-                 max_lower != nullptr && max_upper != nullptr);
-        }
-        InsertDeoptInLoop(loop, block, new (GetGraph()->GetArena()) HAbove(max_lower, max_upper));
-      }
-      InsertDeoptInLoop(
-          loop, block, new (GetGraph()->GetArena()) HAboveOrEqual(max_upper, array_length));
-    } else {
-      // TODO: if rejected, avoid doing this again for subsequent instructions in this set?
-    }
+    return false;
   }
 
   /**
@@ -1549,7 +1461,8 @@ class BCEVisitor : public HGraphVisitor {
    * of the loop to use, dynamic bce in such cases is only allowed if other tests
    * ensure the loop is finite.
    */
-  bool CanHandleInfiniteLoop(HLoopInformation* loop, HInstruction* index, bool needs_infinite_test) {
+  bool CanHandleInfiniteLoop(
+      HLoopInformation* loop, HBoundsCheck* check, HInstruction* index, bool needs_infinite_test) {
     if (needs_infinite_test) {
       // If we already forced the loop to be finite, allow directly.
       const uint32_t loop_id = loop->GetHeader()->GetBlockId();
@@ -1570,6 +1483,11 @@ class BCEVisitor : public HGraphVisitor {
             return true;
           }
         }
+      }
+      // If bounds check made it this far, it is worthwhile to check later if
+      // the loop was forced finite by another candidate.
+      if (record_dynamic_bce_standby_) {
+        dynamic_bce_standby_.push_back(check);
       }
       return false;
     }
@@ -1687,8 +1605,11 @@ class BCEVisitor : public HGraphVisitor {
     // Insert the taken-test to see if the loop body is entered. If the
     // loop isn't entered at all, it jumps around the deoptimization block.
     if_block->AddInstruction(new (GetGraph()->GetArena()) HGoto());  // placeholder
-    HInstruction* condition = induction_range_.GenerateTakenTest(
-        header->GetLastInstruction(), GetGraph(), if_block);
+    HInstruction* condition = nullptr;
+    induction_range_.GenerateTakenTest(header->GetLastInstruction(),
+                                       GetGraph(),
+                                       if_block,
+                                       &condition);
     DCHECK(condition != nullptr);
     if_block->RemoveInstruction(if_block->GetLastInstruction());
     if_block->AddInstruction(new (GetGraph()->GetArena()) HIf(condition));
@@ -1792,6 +1713,10 @@ class BCEVisitor : public HGraphVisitor {
   // Map an HArrayLength instruction's id to the first HBoundsCheck instruction
   // in a block that checks an index against that HArrayLength.
   ArenaSafeMap<int, HBoundsCheck*> first_index_bounds_check_map_;
+
+  // Stand by list for dynamic bce.
+  ArenaVector<HBoundsCheck*> dynamic_bce_standby_;
+  bool record_dynamic_bce_standby_;
 
   // Early-exit loop bookkeeping.
   ArenaSafeMap<uint32_t, bool> early_exit_loop_;

@@ -459,7 +459,7 @@ class TypeCheckSlowPathARM64 : public SlowPathCodeARM64 {
     if (instruction_->IsInstanceOf()) {
       arm64_codegen->InvokeRuntime(
           QUICK_ENTRY_POINT(pInstanceofNonTrivial), instruction_, dex_pc, this);
-      CheckEntrypointTypes<kQuickInstanceofNonTrivial, size_t,
+      CheckEntrypointTypes<kQuickInstanceofNonTrivial, uint32_t,
                            const mirror::Class*, const mirror::Class*>();
       Primitive::Type ret_type = instruction_->GetType();
       Location ret_loc = calling_convention.GetReturnLocation(ret_type);
@@ -594,9 +594,7 @@ class ReadBarrierMarkSlowPathARM64 : public SlowPathCodeARM64 {
            instruction_->IsLoadClass() ||
            instruction_->IsLoadString() ||
            instruction_->IsInstanceOf() ||
-           instruction_->IsCheckCast() ||
-           ((instruction_->IsInvokeStaticOrDirect() || instruction_->IsInvokeVirtual()) &&
-            instruction_->GetLocations()->Intrinsified()))
+           instruction_->IsCheckCast())
         << "Unexpected instruction in read barrier marking slow path: "
         << instruction_->DebugName();
 
@@ -659,12 +657,8 @@ class ReadBarrierForHeapReferenceSlowPathARM64 : public SlowPathCodeARM64 {
     Primitive::Type type = Primitive::kPrimNot;
     DCHECK(locations->CanCall());
     DCHECK(!locations->GetLiveRegisters()->ContainsCoreRegister(out_.reg()));
-    DCHECK(instruction_->IsInstanceFieldGet() ||
-           instruction_->IsStaticFieldGet() ||
-           instruction_->IsArrayGet() ||
-           instruction_->IsInstanceOf() ||
-           instruction_->IsCheckCast() ||
-           ((instruction_->IsInvokeStaticOrDirect() || instruction_->IsInvokeVirtual()) &&
+    DCHECK(!instruction_->IsInvoke() ||
+           (instruction_->IsInvokeStaticOrDirect() &&
             instruction_->GetLocations()->Intrinsified()))
         << "Unexpected instruction in read barrier for heap reference slow path: "
         << instruction_->DebugName();
@@ -682,7 +676,7 @@ class ReadBarrierForHeapReferenceSlowPathARM64 : public SlowPathCodeARM64 {
     // introduce a copy of it, `index`.
     Location index = index_;
     if (index_.IsValid()) {
-      // Handle `index_` for HArrayGet and UnsafeGetObject/UnsafeGetObjectVolatile intrinsics.
+      // Handle `index_` for HArrayGet and intrinsic UnsafeGetObject.
       if (instruction_->IsArrayGet()) {
         // Compute the actual memory offset and store it in `index`.
         Register index_reg = RegisterFrom(index_, Primitive::kPrimInt);
@@ -730,17 +724,16 @@ class ReadBarrierForHeapReferenceSlowPathARM64 : public SlowPathCodeARM64 {
             "art::mirror::HeapReference<art::mirror::Object> and int32_t have different sizes.");
         __ Add(index_reg, index_reg, Operand(offset_));
       } else {
-        // In the case of the UnsafeGetObject/UnsafeGetObjectVolatile
-        // intrinsics, `index_` is not shifted by a scale factor of 2
-        // (as in the case of ArrayGet), as it is actually an offset
-        // to an object field within an object.
-        DCHECK(instruction_->IsInvoke()) << instruction_->DebugName();
+        DCHECK(instruction_->IsInvoke());
         DCHECK(instruction_->GetLocations()->Intrinsified());
         DCHECK((instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kUnsafeGetObject) ||
                (instruction_->AsInvoke()->GetIntrinsic() == Intrinsics::kUnsafeGetObjectVolatile))
             << instruction_->AsInvoke()->GetIntrinsic();
         DCHECK_EQ(offset_, 0U);
-        DCHECK(index_.IsRegister());
+        DCHECK(index_.IsRegisterPair());
+        // UnsafeGet's offset location is a register pair, the low
+        // part contains the correct offset.
+        index = index_.ToLow();
       }
     }
 
@@ -1267,21 +1260,17 @@ void CodeGeneratorARM64::MoveLocation(Location destination,
       UseScratchRegisterScope temps(GetVIXLAssembler());
       HConstant* src_cst = source.GetConstant();
       CPURegister temp;
-      if (src_cst->IsZeroBitPattern()) {
-        temp = (src_cst->IsLongConstant() || src_cst->IsDoubleConstant()) ? xzr : wzr;
+      if (src_cst->IsIntConstant() || src_cst->IsNullConstant()) {
+        temp = temps.AcquireW();
+      } else if (src_cst->IsLongConstant()) {
+        temp = temps.AcquireX();
+      } else if (src_cst->IsFloatConstant()) {
+        temp = temps.AcquireS();
       } else {
-        if (src_cst->IsIntConstant()) {
-          temp = temps.AcquireW();
-        } else if (src_cst->IsLongConstant()) {
-          temp = temps.AcquireX();
-        } else if (src_cst->IsFloatConstant()) {
-          temp = temps.AcquireS();
-        } else {
-          DCHECK(src_cst->IsDoubleConstant());
-          temp = temps.AcquireD();
-        }
-        MoveConstant(temp, src_cst);
+        DCHECK(src_cst->IsDoubleConstant());
+        temp = temps.AcquireD();
       }
+      MoveConstant(temp, src_cst);
       __ Str(temp, StackOperandFrom(destination));
     } else {
       DCHECK(source.IsStackSlot() || source.IsDoubleStackSlot());
@@ -2129,9 +2118,9 @@ void LocationsBuilderARM64::VisitArrayLength(HArrayLength* instruction) {
 }
 
 void InstructionCodeGeneratorARM64::VisitArrayLength(HArrayLength* instruction) {
-  uint32_t offset = CodeGenerator::GetArrayLengthOffset(instruction);
   BlockPoolsScope block_pools(GetVIXLAssembler());
-  __ Ldr(OutputRegister(instruction), HeapOperand(InputRegisterAt(instruction, 0), offset));
+  __ Ldr(OutputRegister(instruction),
+         HeapOperand(InputRegisterAt(instruction, 0), mirror::Array::LengthOffset()));
   codegen_->MaybeRecordImplicitNullCheck(instruction);
 }
 
@@ -2139,9 +2128,11 @@ void LocationsBuilderARM64::VisitArraySet(HArraySet* instruction) {
   Primitive::Type value_type = instruction->GetComponentType();
 
   bool may_need_runtime_call_for_type_check = instruction->NeedsTypeCheck();
+  bool object_array_set_with_read_barrier =
+      kEmitCompilerReadBarrier && (value_type == Primitive::kPrimNot);
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(
       instruction,
-      may_need_runtime_call_for_type_check ?
+      (may_need_runtime_call_for_type_check  || object_array_set_with_read_barrier) ?
           LocationSummary::kCallOnSlowPath :
           LocationSummary::kNoCall);
   locations->SetInAt(0, Location::RequiresRegister());
@@ -4147,7 +4138,7 @@ void InstructionCodeGeneratorARM64::VisitLongConstant(HLongConstant* constant AT
 
 void LocationsBuilderARM64::VisitMonitorOperation(HMonitorOperation* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, LocationFrom(calling_convention.GetRegisterAt(0)));
 }
@@ -4245,7 +4236,7 @@ void InstructionCodeGeneratorARM64::VisitNeg(HNeg* neg) {
 
 void LocationsBuilderARM64::VisitNewArray(HNewArray* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->AddTemp(LocationFrom(calling_convention.GetRegisterAt(0)));
   locations->SetOut(LocationFrom(x0));
@@ -4270,7 +4261,7 @@ void InstructionCodeGeneratorARM64::VisitNewArray(HNewArray* instruction) {
 
 void LocationsBuilderARM64::VisitNewInstance(HNewInstance* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   if (instruction->IsStringAlloc()) {
     locations->AddTemp(LocationFrom(kArtMethodRegister));
@@ -4410,7 +4401,7 @@ void InstructionCodeGeneratorARM64::VisitCurrentMethod(
 
 void LocationsBuilderARM64::VisitPhi(HPhi* instruction) {
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(instruction);
-  for (size_t i = 0, e = locations->GetInputCount(); i < e; ++i) {
+  for (size_t i = 0, e = instruction->InputCount(); i < e; ++i) {
     locations->SetInAt(i, Location::Any());
   }
   locations->SetOut(Location::Any());
@@ -4423,8 +4414,7 @@ void InstructionCodeGeneratorARM64::VisitPhi(HPhi* instruction ATTRIBUTE_UNUSED)
 void LocationsBuilderARM64::VisitRem(HRem* rem) {
   Primitive::Type type = rem->GetResultType();
   LocationSummary::CallKind call_kind =
-      Primitive::IsFloatingPointType(type) ? LocationSummary::kCallOnMainOnly
-                                           : LocationSummary::kNoCall;
+      Primitive::IsFloatingPointType(type) ? LocationSummary::kCall : LocationSummary::kNoCall;
   LocationSummary* locations = new (GetGraph()->GetArena()) LocationSummary(rem, call_kind);
 
   switch (type) {
@@ -4641,7 +4631,7 @@ void InstructionCodeGeneratorARM64::VisitSuspendCheck(HSuspendCheck* instruction
 
 void LocationsBuilderARM64::VisitThrow(HThrow* instruction) {
   LocationSummary* locations =
-      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCallOnMainOnly);
+      new (GetGraph()->GetArena()) LocationSummary(instruction, LocationSummary::kCall);
   InvokeRuntimeCallingConvention calling_convention;
   locations->SetInAt(0, LocationFrom(calling_convention.GetRegisterAt(0)));
 }
@@ -5061,12 +5051,23 @@ void CodeGeneratorARM64::GenerateReferenceLoadWithBakerReadBarrier(HInstruction*
   // /* LockWord */ lock_word = LockWord(monitor)
   static_assert(sizeof(LockWord) == sizeof(int32_t),
                 "art::LockWord and int32_t have different sizes.");
+  // /* uint32_t */ rb_state = lock_word.ReadBarrierState()
+  __ Lsr(temp, temp, LockWord::kReadBarrierStateShift);
+  __ And(temp, temp, Operand(LockWord::kReadBarrierStateMask));
+  static_assert(
+      LockWord::kReadBarrierStateMask == ReadBarrier::rb_ptr_mask_,
+      "art::LockWord::kReadBarrierStateMask is not equal to art::ReadBarrier::rb_ptr_mask_.");
 
-  // Introduce a dependency on the lock_word including rb_state,
-  // to prevent load-load reordering, and without using
+  // Introduce a dependency on the high bits of rb_state, which shall
+  // be all zeroes, to prevent load-load reordering, and without using
   // a memory barrier (which would be more expensive).
-  // obj is unchanged by this operation, but its value now depends on temp.
-  __ Add(obj.X(), obj.X(), Operand(temp.X(), LSR, 32));
+  // temp2 = rb_state & ~LockWord::kReadBarrierStateMask = 0
+  Register temp2 = temps.AcquireW();
+  __ Bic(temp2, temp, Operand(LockWord::kReadBarrierStateMask));
+  // obj is unchanged by this operation, but its value now depends on
+  // temp2, which depends on temp.
+  __ Add(obj, obj, Operand(temp2));
+  temps.Release(temp2);
 
   // The actual reference load.
   if (index.IsValid()) {
@@ -5080,7 +5081,7 @@ void CodeGeneratorARM64::GenerateReferenceLoadWithBakerReadBarrier(HInstruction*
       uint32_t computed_offset = offset + (Int64ConstantFrom(index) << shift_amount);
       Load(type, ref_reg, HeapOperand(obj, computed_offset));
     } else {
-      Register temp2 = temps.AcquireW();
+      temp2 = temps.AcquireW();
       __ Add(temp2, obj, offset);
       Load(type, ref_reg, HeapOperand(temp2, XRegisterFrom(index), LSL, shift_amount));
       temps.Release(temp2);
@@ -5105,11 +5106,8 @@ void CodeGeneratorARM64::GenerateReferenceLoadWithBakerReadBarrier(HInstruction*
 
   // if (rb_state == ReadBarrier::gray_ptr_)
   //   ref = ReadBarrier::Mark(ref);
-  // Given the numeric representation, it's enough to check the low bit of the rb_state.
-  static_assert(ReadBarrier::white_ptr_ == 0, "Expecting white to have value 0");
-  static_assert(ReadBarrier::gray_ptr_ == 1, "Expecting gray to have value 1");
-  static_assert(ReadBarrier::black_ptr_ == 2, "Expecting black to have value 2");
-  __ Tbnz(temp, LockWord::kReadBarrierStateShift, slow_path->GetEntryLabel());
+  __ Cmp(temp, ReadBarrier::gray_ptr_);
+  __ B(eq, slow_path->GetEntryLabel());
   __ Bind(slow_path->GetExitLabel());
 }
 

@@ -21,7 +21,6 @@
 #include <stddef.h>
 
 #include "base/bit_utils.h"
-#include "base/dchecked_vector.h"
 #include "base/memory_tool.h"
 #include "debug_stack.h"
 #include "macros.h"
@@ -131,7 +130,8 @@ class ArenaAllocatorStatsImpl {
 
  private:
   size_t num_allocations_;
-  dchecked_vector<size_t> alloc_stats_;  // Bytes used by various allocation kinds.
+  // TODO: Use std::array<size_t, kNumArenaAllocKinds> from C++11 when we upgrade the STL.
+  size_t alloc_stats_[kNumArenaAllocKinds];  // Bytes used by various allocation kinds.
 
   static const char* const kAllocNames[];
 };

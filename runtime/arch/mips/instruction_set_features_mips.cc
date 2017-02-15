@@ -19,7 +19,6 @@
 #include <fstream>
 #include <sstream>
 
-#include "base/stl_util.h"
 #include "base/stringprintf.h"
 #include "utils.h"  // For Trim.
 
@@ -64,8 +63,10 @@ static void GetFlagsFromCppDefined(bool* mips_isa_gte2, bool* r6, bool* fpu_32bi
   }
 }
 
-MipsFeaturesUniquePtr MipsInstructionSetFeatures::FromVariant(
+const MipsInstructionSetFeatures* MipsInstructionSetFeatures::FromVariant(
     const std::string& variant, std::string* error_msg ATTRIBUTE_UNUSED) {
+
+  bool smp = true;  // Conservative default.
 
   // Override defaults based on compiler flags.
   // This is needed when running ART test where the variant is not defined.
@@ -75,61 +76,85 @@ MipsFeaturesUniquePtr MipsInstructionSetFeatures::FromVariant(
   GetFlagsFromCppDefined(&mips_isa_gte2, &r6, &fpu_32bit);
 
   // Override defaults based on variant string.
-  // Only care if it is R1, R2, R5 or R6 and we assume all CPUs will have a FP unit.
+  // Only care if it is R1, R2 or R6 and we assume all CPUs will have a FP unit.
   constexpr const char* kMips32Prefix = "mips32r";
   const size_t kPrefixLength = strlen(kMips32Prefix);
   if (variant.compare(0, kPrefixLength, kMips32Prefix, kPrefixLength) == 0 &&
       variant.size() > kPrefixLength) {
-    r6 = (variant[kPrefixLength] >= '6');
-    fpu_32bit = (variant[kPrefixLength] < '5');
-    mips_isa_gte2 = (variant[kPrefixLength] >= '2');
+    if (variant[kPrefixLength] >= '6') {
+      fpu_32bit = false;
+      r6 = true;
+    }
+    if (variant[kPrefixLength] >= '2') {
+      mips_isa_gte2 = true;
+    }
   } else if (variant == "default") {
-    // Default variant has FPU, is gte2. This is the traditional setting.
-    //
-    // Note, we get FPU bitness and R6-ness from the build (using cpp defines, see above)
-    // and don't override them because many things depend on the "default" variant being
-    // sufficient for most purposes. That is, "default" should work for both R2 and R6.
-    // Use "mips32r#" to get a specific configuration, possibly not matching the runtime
-    // ISA (e.g. for ISA-specific testing of dex2oat internals).
+    // Default variant is: smp = true, has fpu, is gte2, is not r6. This is the traditional
+    // setting.
     mips_isa_gte2 = true;
   } else {
     LOG(WARNING) << "Unexpected CPU variant for Mips32 using defaults: " << variant;
   }
 
-  return MipsFeaturesUniquePtr(new MipsInstructionSetFeatures(fpu_32bit, mips_isa_gte2, r6));
+  return new MipsInstructionSetFeatures(smp, fpu_32bit, mips_isa_gte2, r6);
 }
 
-MipsFeaturesUniquePtr MipsInstructionSetFeatures::FromBitmap(uint32_t bitmap) {
+const MipsInstructionSetFeatures* MipsInstructionSetFeatures::FromBitmap(uint32_t bitmap) {
+  bool smp = (bitmap & kSmpBitfield) != 0;
   bool fpu_32bit = (bitmap & kFpu32Bitfield) != 0;
   bool mips_isa_gte2 = (bitmap & kIsaRevGte2Bitfield) != 0;
   bool r6 = (bitmap & kR6) != 0;
-  return MipsFeaturesUniquePtr(new MipsInstructionSetFeatures(fpu_32bit, mips_isa_gte2, r6));
+  return new MipsInstructionSetFeatures(smp, fpu_32bit, mips_isa_gte2, r6);
 }
 
-MipsFeaturesUniquePtr MipsInstructionSetFeatures::FromCppDefines() {
+const MipsInstructionSetFeatures* MipsInstructionSetFeatures::FromCppDefines() {
+  // Assume conservative defaults.
+  const bool smp = true;
+
   bool fpu_32bit;
   bool mips_isa_gte2;
   bool r6;
   GetFlagsFromCppDefined(&mips_isa_gte2, &r6, &fpu_32bit);
 
-  return MipsFeaturesUniquePtr(new MipsInstructionSetFeatures(fpu_32bit, mips_isa_gte2, r6));
+  return new MipsInstructionSetFeatures(smp, fpu_32bit, mips_isa_gte2, r6);
 }
 
-MipsFeaturesUniquePtr MipsInstructionSetFeatures::FromCpuInfo() {
+const MipsInstructionSetFeatures* MipsInstructionSetFeatures::FromCpuInfo() {
+  // Look in /proc/cpuinfo for features we need.  Only use this when we can guarantee that
+  // the kernel puts the appropriate feature flags in here.  Sometimes it doesn't.
+  // Assume conservative defaults.
+  bool smp = false;
+
   bool fpu_32bit;
   bool mips_isa_gte2;
   bool r6;
   GetFlagsFromCppDefined(&mips_isa_gte2, &r6, &fpu_32bit);
 
-  return MipsFeaturesUniquePtr(new MipsInstructionSetFeatures(fpu_32bit, mips_isa_gte2, r6));
+  std::ifstream in("/proc/cpuinfo");
+  if (!in.fail()) {
+    while (!in.eof()) {
+      std::string line;
+      std::getline(in, line);
+      if (!in.eof()) {
+        LOG(INFO) << "cpuinfo line: " << line;
+        if (line.find("processor") != std::string::npos && line.find(": 1") != std::string::npos) {
+          smp = true;
+        }
+      }
+    }
+    in.close();
+  } else {
+    LOG(ERROR) << "Failed to open /proc/cpuinfo";
+  }
+  return new MipsInstructionSetFeatures(smp, fpu_32bit, mips_isa_gte2, r6);
 }
 
-MipsFeaturesUniquePtr MipsInstructionSetFeatures::FromHwcap() {
+const MipsInstructionSetFeatures* MipsInstructionSetFeatures::FromHwcap() {
   UNIMPLEMENTED(WARNING);
   return FromCppDefines();
 }
 
-MipsFeaturesUniquePtr MipsInstructionSetFeatures::FromAssembly() {
+const MipsInstructionSetFeatures* MipsInstructionSetFeatures::FromAssembly() {
   UNIMPLEMENTED(WARNING);
   return FromCppDefines();
 }
@@ -139,23 +164,30 @@ bool MipsInstructionSetFeatures::Equals(const InstructionSetFeatures* other) con
     return false;
   }
   const MipsInstructionSetFeatures* other_as_mips = other->AsMipsInstructionSetFeatures();
-  return (fpu_32bit_ == other_as_mips->fpu_32bit_) &&
+  return (IsSmp() == other->IsSmp()) &&
+      (fpu_32bit_ == other_as_mips->fpu_32bit_) &&
       (mips_isa_gte2_ == other_as_mips->mips_isa_gte2_) &&
       (r6_ == other_as_mips->r6_);
 }
 
 uint32_t MipsInstructionSetFeatures::AsBitmap() const {
-  return (fpu_32bit_ ? kFpu32Bitfield : 0) |
+  return (IsSmp() ? kSmpBitfield : 0) |
+      (fpu_32bit_ ? kFpu32Bitfield : 0) |
       (mips_isa_gte2_ ? kIsaRevGte2Bitfield : 0) |
       (r6_ ? kR6 : 0);
 }
 
 std::string MipsInstructionSetFeatures::GetFeatureString() const {
   std::string result;
-  if (fpu_32bit_) {
-    result += "fpu32";
+  if (IsSmp()) {
+    result += "smp";
   } else {
-    result += "-fpu32";
+    result += "-smp";
+  }
+  if (fpu_32bit_) {
+    result += ",fpu32";
+  } else {
+    result += ",-fpu32";
   }
   if (mips_isa_gte2_) {
     result += ",mips2";
@@ -168,9 +200,8 @@ std::string MipsInstructionSetFeatures::GetFeatureString() const {
   return result;
 }
 
-std::unique_ptr<const InstructionSetFeatures>
-MipsInstructionSetFeatures::AddFeaturesFromSplitString(
-    const std::vector<std::string>& features, std::string* error_msg) const {
+const InstructionSetFeatures* MipsInstructionSetFeatures::AddFeaturesFromSplitString(
+    const bool smp, const std::vector<std::string>& features, std::string* error_msg) const {
   bool fpu_32bit = fpu_32bit_;
   bool mips_isa_gte2 = mips_isa_gte2_;
   bool r6 = r6_;
@@ -193,8 +224,7 @@ MipsInstructionSetFeatures::AddFeaturesFromSplitString(
       return nullptr;
     }
   }
-  return std::unique_ptr<const InstructionSetFeatures>(
-      new MipsInstructionSetFeatures(fpu_32bit, mips_isa_gte2, r6));
+  return new MipsInstructionSetFeatures(smp, fpu_32bit, mips_isa_gte2, r6);
 }
 
 }  // namespace art

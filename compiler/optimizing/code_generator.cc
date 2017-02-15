@@ -50,7 +50,6 @@
 #include "mirror/array-inl.h"
 #include "mirror/object_array-inl.h"
 #include "mirror/object_reference.h"
-#include "mirror/string.h"
 #include "parallel_move_resolver.h"
 #include "ssa_liveness_analysis.h"
 #include "utils/assembler.h"
@@ -111,10 +110,10 @@ static bool CheckTypeConsistency(HInstruction* instruction) {
         << " " << locations->Out();
   }
 
-  HConstInputsRef inputs = instruction->GetInputs();
-  for (size_t i = 0; i < inputs.size(); ++i) {
-    DCHECK(CheckType(inputs[i]->GetType(), locations->InAt(i)))
-      << inputs[i]->GetType() << " " << locations->InAt(i);
+  for (size_t i = 0, e = instruction->InputCount(); i < e; ++i) {
+    DCHECK(CheckType(instruction->InputAt(i)->GetType(), locations->InAt(i)))
+      << instruction->InputAt(i)->GetType()
+      << " " << locations->InAt(i);
   }
 
   HEnvironment* environment = instruction->GetEnvironment();
@@ -138,12 +137,6 @@ size_t CodeGenerator::GetCacheOffset(uint32_t index) {
 size_t CodeGenerator::GetCachePointerOffset(uint32_t index) {
   auto pointer_size = InstructionSetPointerSize(GetInstructionSet());
   return pointer_size * index;
-}
-
-uint32_t CodeGenerator::GetArrayLengthOffset(HArrayLength* array_length) {
-  return array_length->IsStringLength()
-      ? mirror::String::CountOffset().Uint32Value()
-      : mirror::Array::LengthOffset().Uint32Value();
 }
 
 bool CodeGenerator::GoesToNextBlock(HBasicBlock* current, HBasicBlock* next) const {
@@ -284,8 +277,7 @@ void CodeGenerator::InitializeCodeGeneration(size_t number_of_spill_slots,
   DCHECK(!block_order.empty());
   DCHECK(block_order[0] == GetGraph()->GetEntryBlock());
   ComputeSpillMask();
-  first_register_slot_in_slow_path_ = RoundUp(
-      (number_of_out_slots + number_of_spill_slots) * kVRegSize, GetPreferredSlotsAlignment());
+  first_register_slot_in_slow_path_ = (number_of_out_slots + number_of_spill_slots) * kVRegSize;
 
   if (number_of_spill_slots == 0
       && !HasAllocatedCalleeSaveRegisters()
@@ -295,17 +287,9 @@ void CodeGenerator::InitializeCodeGeneration(size_t number_of_spill_slots,
     DCHECK_EQ(maximum_number_of_live_fpu_registers, 0u);
     SetFrameSize(CallPushesPC() ? GetWordSize() : 0);
   } else {
-#ifdef ART_ENABLE_CODEGEN_arm64
-    if (GetInstructionSet() == kArm64) {
-      // Adjust the offset to which we spill and restore registers for slow
-      // paths. We want to use the STP and LDP instructions, which can only
-      // encode offsets that are multiples of the register size accessed.
-      first_register_slot_in_slow_path_ =
-          RoundUp(first_register_slot_in_slow_path_, vixl::kXRegSizeInBytes);
-    }
-#endif
     SetFrameSize(RoundUp(
-        first_register_slot_in_slow_path_
+        number_of_spill_slots * kVRegSize
+        + number_of_out_slots * kVRegSize
         + maximum_number_of_live_core_registers * GetWordSize()
         + maximum_number_of_live_fpu_registers * GetFloatingPointSpillSlotSize()
         + FrameEntrySpillSize(),
@@ -316,8 +300,7 @@ void CodeGenerator::InitializeCodeGeneration(size_t number_of_spill_slots,
 void CodeGenerator::CreateCommonInvokeLocationSummary(
     HInvoke* invoke, InvokeDexCallingConventionVisitor* visitor) {
   ArenaAllocator* allocator = invoke->GetBlock()->GetGraph()->GetArena();
-  LocationSummary* locations = new (allocator) LocationSummary(invoke,
-                                                               LocationSummary::kCallOnMainOnly);
+  LocationSummary* locations = new (allocator) LocationSummary(invoke, LocationSummary::kCall);
 
   for (size_t i = 0; i < invoke->GetNumberOfArguments(); i++) {
     HInstruction* input = invoke->InputAt(i);
@@ -381,7 +364,7 @@ void CodeGenerator::CreateUnresolvedFieldLocationSummary(
 
   ArenaAllocator* allocator = field_access->GetBlock()->GetGraph()->GetArena();
   LocationSummary* locations =
-      new (allocator) LocationSummary(field_access, LocationSummary::kCallOnMainOnly);
+      new (allocator) LocationSummary(field_access, LocationSummary::kCall);
 
   locations->AddTemp(calling_convention.GetFieldIndexLocation());
 
@@ -502,7 +485,7 @@ void CodeGenerator::CreateLoadClassLocationSummary(HLoadClass* cls,
                                                    bool code_generator_supports_read_barrier) {
   ArenaAllocator* allocator = cls->GetBlock()->GetGraph()->GetArena();
   LocationSummary::CallKind call_kind = cls->NeedsAccessCheck()
-      ? LocationSummary::kCallOnMainOnly
+      ? LocationSummary::kCall
       : (((code_generator_supports_read_barrier && kEmitCompilerReadBarrier) ||
           cls->CanCallRuntime())
             ? LocationSummary::kCallOnSlowPath
@@ -754,9 +737,6 @@ void CodeGenerator::RecordPcInfo(HInstruction* instruction,
     }
   }
 
-  DCHECK(outer_environment_size == 0 ||
-         outer_environment_size == instruction->GetBlock()->GetGraph()->GetNumberOfVRegs());
-
   // Collect PC infos for the mapping table.
   uint32_t native_pc = GetAssembler()->CodeSize();
 
@@ -885,7 +865,7 @@ void CodeGenerator::RecordCatchBlockInfo() {
     }
 
       if (current_phi == nullptr || current_phi->AsPhi()->GetRegNumber() != vreg) {
-        stack_map_stream_.NextDexRegisterEntry();
+        stack_map_stream_.AddDexRegisterEntry(DexRegisterLocation::Kind::kNone, 0);
       } else {
         Location location = current_phi->GetLiveInterval()->ToLocation();
         switch (location.GetKind()) {
@@ -932,7 +912,7 @@ void CodeGenerator::EmitEnvironment(HEnvironment* environment, SlowPathCode* slo
   for (size_t i = 0, environment_size = environment->Size(); i < environment_size; ++i) {
     HInstruction* current = environment->GetInstructionAt(i);
     if (current == nullptr) {
-      stack_map_stream_.NextDexRegisterEntry();
+      stack_map_stream_.AddDexRegisterEntry(DexRegisterLocation::Kind::kNone, 0);
       continue;
     }
 
@@ -1072,7 +1052,7 @@ void CodeGenerator::EmitEnvironment(HEnvironment* environment, SlowPathCode* slo
       }
 
       case Location::kInvalid: {
-        stack_map_stream_.NextDexRegisterEntry();
+        stack_map_stream_.AddDexRegisterEntry(DexRegisterLocation::Kind::kNone, 0);
         break;
       }
 
@@ -1179,7 +1159,7 @@ void CodeGenerator::ValidateInvokeRuntime(HInstruction* instruction, SlowPathCod
         << "instruction->DebugName()=" << instruction->DebugName()
         << " instruction->GetSideEffects().ToString()=" << instruction->GetSideEffects().ToString();
   } else {
-    DCHECK(instruction->GetLocations()->CallsOnSlowPath() || slow_path->IsFatal())
+    DCHECK(instruction->GetLocations()->OnlyCallsOnSlowPath() || slow_path->IsFatal())
         << "instruction->DebugName()=" << instruction->DebugName()
         << " slow_path->GetDescription()=" << slow_path->GetDescription();
     DCHECK(instruction->GetSideEffects().Includes(SideEffects::CanTriggerGC()) ||

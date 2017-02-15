@@ -23,6 +23,7 @@
 #include "scoped_fast_native_object_access.h"
 #include "ScopedLocalRef.h"
 #include "ScopedPrimitiveArray.h"
+#include "stack.h"
 #include "thread_list.h"
 
 namespace art {

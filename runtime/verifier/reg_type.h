@@ -35,7 +35,6 @@
 namespace art {
 namespace mirror {
 class Class;
-class ClassLoader;
 }  // namespace mirror
 
 class ArenaBitVector;

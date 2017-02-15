@@ -24,32 +24,56 @@
 
 namespace art {
 
-Mips64FeaturesUniquePtr Mips64InstructionSetFeatures::FromVariant(
+const Mips64InstructionSetFeatures* Mips64InstructionSetFeatures::FromVariant(
     const std::string& variant, std::string* error_msg ATTRIBUTE_UNUSED) {
   if (variant != "default" && variant != "mips64r6") {
     LOG(WARNING) << "Unexpected CPU variant for Mips64 using defaults: " << variant;
   }
-  return Mips64FeaturesUniquePtr(new Mips64InstructionSetFeatures());
+  bool smp = true;  // Conservative default.
+  return new Mips64InstructionSetFeatures(smp);
 }
 
-Mips64FeaturesUniquePtr Mips64InstructionSetFeatures::FromBitmap(uint32_t bitmap ATTRIBUTE_UNUSED) {
-  return Mips64FeaturesUniquePtr(new Mips64InstructionSetFeatures());
+const Mips64InstructionSetFeatures* Mips64InstructionSetFeatures::FromBitmap(uint32_t bitmap) {
+  bool smp = (bitmap & kSmpBitfield) != 0;
+  return new Mips64InstructionSetFeatures(smp);
 }
 
-Mips64FeaturesUniquePtr Mips64InstructionSetFeatures::FromCppDefines() {
-  return Mips64FeaturesUniquePtr(new Mips64InstructionSetFeatures());
+const Mips64InstructionSetFeatures* Mips64InstructionSetFeatures::FromCppDefines() {
+  const bool smp = true;
+
+  return new Mips64InstructionSetFeatures(smp);
 }
 
-Mips64FeaturesUniquePtr Mips64InstructionSetFeatures::FromCpuInfo() {
-  return Mips64FeaturesUniquePtr(new Mips64InstructionSetFeatures());
+const Mips64InstructionSetFeatures* Mips64InstructionSetFeatures::FromCpuInfo() {
+  // Look in /proc/cpuinfo for features we need.  Only use this when we can guarantee that
+  // the kernel puts the appropriate feature flags in here.  Sometimes it doesn't.
+  bool smp = false;
+
+  std::ifstream in("/proc/cpuinfo");
+  if (!in.fail()) {
+    while (!in.eof()) {
+      std::string line;
+      std::getline(in, line);
+      if (!in.eof()) {
+        LOG(INFO) << "cpuinfo line: " << line;
+        if (line.find("processor") != std::string::npos && line.find(": 1") != std::string::npos) {
+          smp = true;
+        }
+      }
+    }
+    in.close();
+  } else {
+    LOG(ERROR) << "Failed to open /proc/cpuinfo";
+  }
+  return new Mips64InstructionSetFeatures(smp);
 }
 
-Mips64FeaturesUniquePtr Mips64InstructionSetFeatures::FromHwcap() {
+const Mips64InstructionSetFeatures* Mips64InstructionSetFeatures::FromHwcap() {
   UNIMPLEMENTED(WARNING);
   return FromCppDefines();
 }
 
-Mips64FeaturesUniquePtr Mips64InstructionSetFeatures::FromAssembly() {
+const Mips64InstructionSetFeatures* Mips64InstructionSetFeatures::FromAssembly() {
   UNIMPLEMENTED(WARNING);
   return FromCppDefines();
 }
@@ -58,20 +82,25 @@ bool Mips64InstructionSetFeatures::Equals(const InstructionSetFeatures* other) c
   if (kMips64 != other->GetInstructionSet()) {
     return false;
   }
-  return true;
+  return (IsSmp() == other->IsSmp());
 }
 
 uint32_t Mips64InstructionSetFeatures::AsBitmap() const {
-  return 0;
+  return (IsSmp() ? kSmpBitfield : 0);
 }
 
 std::string Mips64InstructionSetFeatures::GetFeatureString() const {
-  return "";
+  std::string result;
+  if (IsSmp()) {
+    result += "smp";
+  } else {
+    result += "-smp";
+  }
+  return result;
 }
 
-std::unique_ptr<const InstructionSetFeatures>
-Mips64InstructionSetFeatures::AddFeaturesFromSplitString(
-    const std::vector<std::string>& features, std::string* error_msg) const {
+const InstructionSetFeatures* Mips64InstructionSetFeatures::AddFeaturesFromSplitString(
+    const bool smp, const std::vector<std::string>& features, std::string* error_msg) const {
   auto i = features.begin();
   if (i != features.end()) {
     // We don't have any features.
@@ -79,7 +108,7 @@ Mips64InstructionSetFeatures::AddFeaturesFromSplitString(
     *error_msg = StringPrintf("Unknown instruction set feature: '%s'", feature.c_str());
     return nullptr;
   }
-  return std::unique_ptr<const InstructionSetFeatures>(new Mips64InstructionSetFeatures());
+  return new Mips64InstructionSetFeatures(smp);
 }
 
 }  // namespace art
