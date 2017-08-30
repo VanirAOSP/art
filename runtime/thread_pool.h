@@ -62,6 +62,8 @@ class ThreadPoolWorker {
   // Set the "nice" priorty for this worker.
   void SetPthreadPriority(int priority);
 
+  Thread* GetThread() const { return thread_; }
+
  protected:
   ThreadPoolWorker(ThreadPool* thread_pool, const std::string& name, size_t stack_size);
   static void* Callback(void* arg) REQUIRES(!Locks::mutator_lock_);
@@ -71,6 +73,7 @@ class ThreadPoolWorker {
   const std::string name_;
   std::unique_ptr<MemMap> stack_;
   pthread_t pthread_;
+  Thread* thread_;
 
  private:
   friend class ThreadPool;
@@ -83,6 +86,10 @@ class ThreadPool {
   // Returns the number of threads in the thread pool.
   size_t GetThreadCount() const {
     return threads_.size();
+  }
+
+  const std::vector<ThreadPoolWorker*>& GetWorkers() const {
+    return threads_;
   }
 
   // Broadcast to the workers and tell them to empty out the work queue.
@@ -106,7 +113,8 @@ class ThreadPool {
   ThreadPool(const char* name, size_t num_threads, bool create_peers = false);
   virtual ~ThreadPool();
 
-  // Wait for all tasks currently on queue to get completed.
+  // Wait for all tasks currently on queue to get completed. If the pool has been stopped, only
+  // wait till all already running tasks are done.
   // When the pool was created with peers for workers, do_work must not be true (see ThreadPool()).
   void Wait(Thread* self, bool do_work, bool may_hold_locks) REQUIRES(!task_queue_lock_);
 
@@ -135,6 +143,10 @@ class ThreadPool {
   // Are we shutting down?
   bool IsShuttingDown() const REQUIRES(task_queue_lock_) {
     return shutting_down_;
+  }
+
+  bool HasOutstandingTasks() const REQUIRES(task_queue_lock_) {
+    return started_ && !tasks_.empty();
   }
 
   const std::string name_;

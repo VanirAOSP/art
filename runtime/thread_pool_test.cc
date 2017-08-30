@@ -20,7 +20,7 @@
 
 #include "atomic.h"
 #include "common_runtime_test.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 #include "thread-inl.h"
 
 namespace art {
@@ -97,6 +97,29 @@ TEST_F(ThreadPoolTest, StopStart) {
   // Allow tasks to finish up and delete themselves.
   thread_pool.StartWorkers(self);
   thread_pool.Wait(self, false, false);
+}
+
+TEST_F(ThreadPoolTest, StopWait) {
+  Thread* self = Thread::Current();
+  ThreadPool thread_pool("Thread pool test thread pool", num_threads);
+
+  AtomicInteger count(0);
+  static const int32_t num_tasks = num_threads * 100;
+  for (int32_t i = 0; i < num_tasks; ++i) {
+    thread_pool.AddTask(self, new CountTask(&count));
+  }
+
+  // Signal the threads to start processing tasks.
+  thread_pool.StartWorkers(self);
+  usleep(200);
+  thread_pool.StopWorkers(self);
+
+  thread_pool.Wait(self, false, false);  // We should not deadlock here.
+
+  // Drain the task list. Note: we have to restart here, as no tasks will be finished when
+  // the pool is stopped.
+  thread_pool.StartWorkers(self);
+  thread_pool.Wait(self, /* do_work */ true, false);
 }
 
 class TreeTask : public Task {

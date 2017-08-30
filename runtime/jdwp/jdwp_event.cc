@@ -21,16 +21,17 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "android-base/stringprintf.h"
+
 #include "art_field-inl.h"
 #include "art_method-inl.h"
 #include "base/logging.h"
-#include "base/stringprintf.h"
 #include "debugger.h"
 #include "jdwp/jdwp_constants.h"
 #include "jdwp/jdwp_expand_buf.h"
 #include "jdwp/jdwp_priv.h"
 #include "jdwp/object_registry.h"
-#include "scoped_thread_state_change.h"
+#include "scoped_thread_state_change-inl.h"
 #include "thread-inl.h"
 
 #include "handle_scope-inl.h"
@@ -102,6 +103,8 @@ don't allow anyone else to interfere with us.
 namespace art {
 
 namespace JDWP {
+
+using android::base::StringPrintf;
 
 /*
  * Stuff to compare against when deciding if a mod matches.  Only the
@@ -246,6 +249,43 @@ JdwpError JdwpState::RegisterEvent(JdwpEvent* pEvent) {
   Dbg::ManageDeoptimization();
 
   return ERR_NONE;
+}
+
+void JdwpState::UnregisterLocationEventsOnClass(ObjPtr<mirror::Class> klass) {
+  VLOG(jdwp) << "Removing events within " << klass->PrettyClass();
+  StackHandleScope<1> hs(Thread::Current());
+  Handle<mirror::Class> h_klass(hs.NewHandle(klass));
+  std::vector<JdwpEvent*> to_remove;
+  MutexLock mu(Thread::Current(), event_list_lock_);
+  for (JdwpEvent* cur_event = event_list_; cur_event != nullptr; cur_event = cur_event->next) {
+    // Fill in the to_remove list
+    bool found_event = false;
+    for (int i = 0; i < cur_event->modCount && !found_event; i++) {
+      JdwpEventMod& mod = cur_event->mods[i];
+      switch (mod.modKind) {
+        case MK_LOCATION_ONLY: {
+          JdwpLocation& loc = mod.locationOnly.loc;
+          JdwpError error;
+          ObjPtr<mirror::Class> breakpoint_class(
+              Dbg::GetObjectRegistry()->Get<art::mirror::Class*>(loc.class_id, &error));
+          DCHECK_EQ(error, ERR_NONE);
+          if (breakpoint_class == h_klass.Get()) {
+            to_remove.push_back(cur_event);
+            found_event = true;
+          }
+          break;
+        }
+        default:
+          // TODO Investigate how we should handle non-locationOnly events.
+          break;
+      }
+    }
+  }
+
+  for (JdwpEvent* event : to_remove) {
+    UnregisterEvent(event);
+    EventFree(event);
+  }
 }
 
 /*
@@ -447,7 +487,7 @@ static bool PatternMatch(const char* pattern, const std::string& target) {
  * need to do this even if later mods cause us to ignore the event.
  */
 static bool ModsMatch(JdwpEvent* pEvent, const ModBasket& basket)
-    SHARED_REQUIRES(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   JdwpEventMod* pMod = pEvent->mods;
 
   for (int i = pEvent->modCount; i > 0; i--, pMod++) {
@@ -783,9 +823,9 @@ void JdwpState::PostVMStart() {
   SendRequestAndPossiblySuspend(pReq, suspend_policy, threadId);
 }
 
-static void LogMatchingEventsAndThread(const std::vector<JdwpEvent*> match_list,
+static void LogMatchingEventsAndThread(const std::vector<JdwpEvent*>& match_list,
                                        ObjectId thread_id)
-    SHARED_REQUIRES(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   for (size_t i = 0, e = match_list.size(); i < e; ++i) {
     JdwpEvent* pEvent = match_list[i];
     VLOG(jdwp) << "EVENT #" << i << ": " << pEvent->eventKind
@@ -801,7 +841,7 @@ static void LogMatchingEventsAndThread(const std::vector<JdwpEvent*> match_list,
 
 static void SetJdwpLocationFromEventLocation(const JDWP::EventLocation* event_location,
                                              JDWP::JdwpLocation* jdwp_location)
-    SHARED_REQUIRES(Locks::mutator_lock_) {
+    REQUIRES_SHARED(Locks::mutator_lock_) {
   DCHECK(event_location != nullptr);
   DCHECK(jdwp_location != nullptr);
   Dbg::SetJdwpLocation(jdwp_location, event_location->method, event_location->dex_pc);
@@ -1144,7 +1184,7 @@ void JdwpState::PostException(const EventLocation* pThrowLoc, mirror::Throwable*
   SetJdwpLocationFromEventLocation(pCatchLoc, &jdwp_catch_location);
 
   if (VLOG_IS_ON(jdwp)) {
-    std::string exceptionClassName(PrettyDescriptor(exception_object->GetClass()));
+    std::string exceptionClassName(mirror::Class::PrettyDescriptor(exception_object->GetClass()));
 
     LogMatchingEventsAndThread(match_list, thread_id);
     VLOG(jdwp) << "  throwLocation=" << jdwp_throw_location;
